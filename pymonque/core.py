@@ -279,5 +279,3 @@ class BaseQueue:
             kwargs=kwargs,
             distribution=distribution
         )
-
-        
