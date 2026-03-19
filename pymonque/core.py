@@ -12,14 +12,17 @@ from uuid import UUID, uuid4
 
 import random
 import math
+import time
+import traceback
 
 import inspect
 
 from .exceptions import TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
+from .mongo import MongoModel
 
 
-TASK_STATUS = Literal["pending", "success", "failed", "canceled", "outdated", "incompatible"]
-SCHEDULER_STATUS = Literal["enabled", "disabled"]
+TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
+SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
 
 OVERDUE_TASKS_POLICY = Literal["skip", "execute now"]
 OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
@@ -92,40 +95,45 @@ class Distributions:
         return timedelta(seconds=interval_sec)
 
 
-class Distribution(BaseModel):
-    name: str
-    kwargs: dict[str, Any]
+class Distribution(MongoModel):
+    name:           str
+    kwargs:         dict[str, Any]
 
 
-class Task(BaseModel):
-    functionName: str
-    kwargs: dict[str, Any]
-    status: TASK_STATUS = "pending"
-    deadline: datetime
-    factory: TaskFactory
+class Task(MongoModel):
+    uid:            UUID                = Field(default_factory=uuid4)
+    functionName:   str
+    kwargs:         dict[str, Any]
+    status:         TASK_STATUS         = "pending"
+    deadline:       datetime
+    factory:        TaskFactory
 
-    executionTime: timedelta | None = None
-    error: str | None = None
+    executionTime:  timedelta | None    = None
+    result:         Any | None          = None
+    error:          str | None          = None
 
 
-class TaskFactory(BaseModel):
-    uid: UUID = Field(default_factory=uuid4)
-    name: str
+class TaskFactory(MongoModel):
+    uid:    UUID    = Field(default_factory=uuid4)
+    name:   str
 
     def _emit(self, functionName: str, kwargs: dict[str, Any], deadline: datetime) -> Task:
         return Task(functionName=functionName, kwargs=kwargs, deadline=deadline, factory=self)
 
 
 class Scheduler(TaskFactory):
-    name: str = "Scheduler"
-    functionName: str
-    kwargs: dict[str, Any]
-    distribution: Distribution
-    deadline: datetime
-    status: SCHEDULER_STATUS = "enabled"
+    name:           str                 = "Scheduler"
+    functionName:   str
+    kwargs:         list[dict[str, Any]]  # all tasks are emited at once
+    distribution:   Distribution
+    deadline:       datetime
+    status:         SCHEDULER_STATUS    = "enabled"
 
-    def _emit(self, deadline: datetime) -> Task:
-        return super()._emit(self.functionName, self.kwargs, deadline)
+    def _emit(self, deadline: datetime) -> list[Task]:
+        return [
+            super()._emit(self.functionName, kwarg, deadline)
+            for kwarg in self.kwargs
+        ]
 
 
 def task(obj):
@@ -186,7 +194,6 @@ class BaseQueue:
 
         self.distributions: dict[str, Callable] = DistributionsClass._getDistributions()
 
-
         # build kwarg validators
         self.taskValidators: dict[str, type[BaseModel]] = {
             name: buildValidator(func)
@@ -197,7 +204,6 @@ class BaseQueue:
             name: buildValidator(func)
             for name, func in self.distributions.items()
         }
-
 
         # prepare DB
         self.tasksCollection: Collection = queueDB["pymonque_tasks"]
@@ -235,20 +241,60 @@ class BaseQueue:
         except KeyError:
             raise DistributionNotFound(f"Distribution {distribution.name} does not exist in this Queue")
 
-    def scheduleTask(self, functionName: str, kwargs: dict[str, Any], deadline: datetime, factory: TaskFactory | None = None):
+    def _executeTask(self, task: Task) -> Task:
+        func = self.tasks[task.functionName]
+
+        start = time.perf_counter()
+        try:
+            result = func(**task.kwargs)
+            task.status = "success"
+            task.result = result
+        except Exception:
+            task.status = "failed"
+            task.error = traceback.format_exc()
+        finally:
+            end = time.perf_counter()
+            task.executionTime = timedelta(seconds=(end - start))
+
+        return task
+
+    def scheduleTask(
+            self, 
+            functionName:   str, 
+            kwargs:         dict[str, Any] | list[dict[str, Any]], 
+            deadline:       datetime, 
+            factory:        TaskFactory | None = None
+        ):
+        
         factory = factory or self.defaultFactory
 
-        task = factory._emit(
-            functionName=functionName, 
-            kwargs=kwargs, 
-            deadline=deadline
-        )
+        if isinstance(kwargs, dict):
+            kwargs = [kwargs]
 
-        serialized = task.model_dump(mode="python", by_alias=True, exclude_none=True)
-        self.tasksCollection.insert_one(serialized)
+        serialized = [
+            factory._emit(
+                functionName=functionName, 
+                kwargs=kwarg, 
+                deadline=deadline
+            ).model_dump() 
+            for kwarg in kwargs
+        ]
 
-    def scheduleValidatedTask(self, functionName: str, kwargs: dict[str, Any], deadline: datetime, factory: TaskFactory | None = None):
-        self._validateTask(functionName, kwargs)
+        self.tasksCollection.insert_many(serialized)
+
+    def scheduleValidatedTask(
+            self, 
+            functionName:   str, 
+            kwargs:         dict[str, Any] | list[dict[str, Any]], 
+            deadline:       datetime, 
+            factory:        TaskFactory | None = None
+        ):
+
+        if isinstance(kwargs, dict):
+            kwargs = [kwargs]
+
+        for kwarg in kwargs:
+            self._validateTask(functionName, kwarg)
 
         self.scheduleTask(
             functionName=functionName, 
@@ -257,8 +303,18 @@ class BaseQueue:
             factory=factory
         )
 
-    def addSchedluer(self, functionName: str, kwargs: dict[str, Any], distribution: Distribution):
-        deadline = datetime.now() + self.distributions[distribution.name](**distribution.kwargs)
+    def addSchedluer(
+            self, 
+            functionName: str, 
+            kwargs: dict[str, Any] | list[dict[str, Any]], 
+            distribution: Distribution
+        ):
+        
+        distFunc = self.distributions[distribution.name]
+        deadline = datetime.now() + distFunc(**distribution.kwargs)
+
+        if isinstance(kwargs, dict):
+            kwargs = [kwargs]
 
         scheduler = Scheduler(
             functionName=functionName, 
@@ -267,15 +323,71 @@ class BaseQueue:
             deadline=deadline
         )
 
-        serialized = scheduler.model_dump(mode="python", by_alias=True, exclude_none=True)
-        self.schedulersCollection.insert_one(serialized)
+        self.schedulersCollection.insert_one(
+            scheduler.model_dump()
+        )
 
-    def addValidatedSchedluer(self, functionName: str, kwargs: dict[str, Any], distribution: Distribution):
+    def addValidatedSchedluer(
+            self, 
+            functionName: str, 
+            kwargs: dict[str, Any] | list[dict[str, Any]], 
+            distribution: Distribution
+        ):
+
         self._validateDistribution(distribution)
-        self._validateTask(functionName, kwargs)
+
+        if isinstance(kwargs, dict):
+            kwargs = [kwargs]
+
+        for kwarg in kwargs:
+            self._validateTask(functionName, kwarg)
 
         self.addSchedluer(
             functionName=functionName,
             kwargs=kwargs,
             distribution=distribution
         )
+
+    def _work(self):
+        now = datetime.now()
+        task = Task.model_validate(
+            self.tasksCollection.find_one_and_update(
+                {"status": "pending", "deadline": {"$lte": now}},
+                {"$set": {"status": "processing"}}
+            )
+        )
+
+        task = self._executeTask(task)
+
+        self.tasksCollection.replace_one(
+            {"uid": task.uid},
+            task.model_dump()
+        )
+
+    def _schedule(self):
+        now = datetime.now()
+        scheduler = Scheduler.model_validate(
+            self.schedulersCollection.find_one_and_update(
+                {"status": "enabled", "deadline": {"$lte": now}},
+                {"$set": {"status": "processing"}}
+            )
+        )
+
+        distFunc = self.distributions[scheduler.distribution.name]
+        deadline = scheduler.deadline + distFunc(**scheduler.distribution.kwargs)
+
+        serialized = [
+            task.model_dump()
+            for task in scheduler._emit(deadline=deadline)
+        ]
+
+        self.tasksCollection.insert_many(serialized)
+
+        self.schedulersCollection.update_one(
+            {"uid": scheduler.uid},
+            {"$set": {"status": "enabled", "deadline": deadline}}
+        )
+
+
+
+
