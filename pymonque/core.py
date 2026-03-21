@@ -327,6 +327,8 @@ class BaseQueue:
             scheduler.model_dump()
         )
 
+        
+
     def addValidatedSchedluer(
             self, 
             functionName: str, 
@@ -350,13 +352,15 @@ class BaseQueue:
 
     def _work(self):
         now = datetime.now()
-        task = Task.model_validate(
-            self.tasksCollection.find_one_and_update(
-                {"status": "pending", "deadline": {"$lte": now}},
-                {"$set": {"status": "processing"}}
-            )
+        raw = self.tasksCollection.find_one_and_update(
+            {"status": "pending", "deadline": {"$lte": now}},
+            {"$set": {"status": "processing"}}
         )
 
+        if not raw:
+            return
+
+        task = Task.model_validate(raw)
         task = self._executeTask(task)
 
         self.tasksCollection.replace_one(
@@ -366,12 +370,15 @@ class BaseQueue:
 
     def _schedule(self):
         now = datetime.now()
-        scheduler = Scheduler.model_validate(
-            self.schedulersCollection.find_one_and_update(
-                {"status": "enabled", "deadline": {"$lte": now}},
-                {"$set": {"status": "processing"}}
-            )
+        raw = self.schedulersCollection.find_one_and_update(
+            {"status": "enabled", "deadline": {"$lte": now}},
+            {"$set": {"status": "processing"}}
         )
+
+        if not raw:
+            return
+        
+        scheduler = Scheduler.model_validate(raw)
 
         distFunc = self.distributions[scheduler.distribution.name]
         deadline = scheduler.deadline + distFunc(**scheduler.distribution.kwargs)
@@ -387,7 +394,4 @@ class BaseQueue:
             {"uid": scheduler.uid},
             {"$set": {"status": "enabled", "deadline": deadline}}
         )
-
-
-
 
