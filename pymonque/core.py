@@ -1,7 +1,7 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, field_validator, field_serializer
 
-from typing import Any, Literal, Self, Callable, get_type_hints
+from typing import Any, Literal, Callable, get_type_hints
 from types import FunctionType, MethodType
 
 from pymongo.database import Database
@@ -17,8 +17,8 @@ import traceback
 
 import inspect
 
-from .exceptions import TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
-from .mongo import MongoModel
+from pymonque.exceptions import TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
+from pymonque.mongo import MongoModel
 
 
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
@@ -62,6 +62,9 @@ def buildValidator(func: Callable) -> type[BaseModel]:
 
     return create_model(f"{func.__name__}_Args", **fields)
 
+def uuid4str() -> str:
+    return str(uuid4())
+
 
 class Distributions:
     @classmethod
@@ -101,7 +104,7 @@ class Distribution(MongoModel):
 
 
 class Task(MongoModel):
-    uid:            UUID                = Field(default_factory=uuid4)
+    uid:            str                = Field(default_factory=uuid4str)
     functionName:   str
     kwargs:         dict[str, Any]
     status:         TASK_STATUS         = "pending"
@@ -112,9 +115,20 @@ class Task(MongoModel):
     result:         Any | None          = None
     error:          str | None          = None
 
+    @field_serializer("executionTime")
+    def serialize_executionTime(value: timedelta) -> float:
+        return float(value.seconds)
+    
+    @field_validator("executionTime", mode="before")
+    def validate_executionTime(value) -> timedelta:
+        if isinstance(value, (int, float)):
+            return timedelta(seconds=value)
+        
+        return value
+
 
 class TaskFactory(MongoModel):
-    uid:    UUID    = Field(default_factory=uuid4)
+    uid:    str    = Field(default_factory=uuid4str)
     name:   str
 
     def _emit(self, functionName: str, kwargs: dict[str, Any], deadline: datetime) -> Task:
@@ -395,3 +409,7 @@ class BaseQueue:
             {"$set": {"status": "enabled", "deadline": deadline}}
         )
 
+    def work(self):
+        while True:
+            self._work()
+            time.sleep(1)
