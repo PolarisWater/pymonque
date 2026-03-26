@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, create_model, field_validator, field_serializer
+from pydantic import BaseModel, Field, create_model, field_validator, field_serializer, ConfigDict
 
 from typing import Any, Literal, Callable, get_type_hints
 from types import FunctionType, MethodType
@@ -60,7 +60,12 @@ def buildValidator(func: Callable) -> type[BaseModel]:
 
         fields[name] = (annotation, default)
 
-    return create_model(f"{func.__name__}_Args", **fields)
+
+    return create_model(
+        f"{func.__name__}_Args",
+        **fields,
+        __config__ = ConfigDict(extra="forbid")
+    )
 
 def uuid4str() -> str:
     return str(uuid4())
@@ -341,8 +346,6 @@ class BaseQueue:
             scheduler.model_dump()
         )
 
-        
-
     def addValidatedSchedluer(
             self, 
             functionName: str, 
@@ -412,4 +415,6 @@ class BaseQueue:
     def work(self):
         while True:
             self._work()
+            self._schedule()
             time.sleep(1)
+            print(list(self.tasksCollection.find()))
