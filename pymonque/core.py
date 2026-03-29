@@ -8,11 +8,11 @@ from pymongo.database import Database
 from pymongo.collection import Collection
 
 from datetime import datetime, timedelta
-from uuid import UUID, uuid4
 
 import random
 import math
 import time
+import uuid
 import traceback
 
 import inspect
@@ -68,7 +68,7 @@ def buildValidator(func: Callable) -> type[BaseModel]:
     )
 
 def uuid4str() -> str:
-    return str(uuid4())
+    return str(uuid.uuid4())
 
 
 class Distributions:
@@ -102,6 +102,12 @@ class Distributions:
         interval_sec = random.expovariate(1 / mean_sec)
         return timedelta(seconds=interval_sec)
 
+class Executable:
+    functionName:   str
+    kwargs:         dict[str, Any]
+
+    def __call__(self, cls: type) -> Any:
+        pass
 
 class Distribution(MongoModel):
     name:           str
@@ -121,15 +127,19 @@ class Task(MongoModel):
     error:          str | None          = None
 
     @field_serializer("executionTime")
-    def serialize_executionTime(value: timedelta) -> float:
-        return float(value.seconds)
+    def serialize_executionTime(value: timedelta | None) -> float | None:
+        if value is not None:
+            return float(value.seconds)
     
     @field_validator("executionTime", mode="before")
     def validate_executionTime(value) -> timedelta:
         if isinstance(value, (int, float)):
             return timedelta(seconds=value)
         
-        return value
+        raise TypeError(f"executionTime should be a float or int, is: {type(value)} ({value})")
+    
+    def __repr__(self) -> str:
+        return f"Task {self.functionName}({self.kwargs}) from {self.factory}"
 
 
 class TaskFactory(MongoModel):
@@ -138,6 +148,9 @@ class TaskFactory(MongoModel):
 
     def _emit(self, functionName: str, kwargs: dict[str, Any], deadline: datetime) -> Task:
         return Task(functionName=functionName, kwargs=kwargs, deadline=deadline, factory=self)
+    
+    def __repr__(self) -> str:
+        return f"Factory {self.name}"
 
 
 class Scheduler(TaskFactory):
@@ -153,9 +166,12 @@ class Scheduler(TaskFactory):
             super()._emit(self.functionName, kwarg, deadline)
             for kwarg in self.kwargs
         ]
+    
+    def __repr__(self) -> str:
+        return f"Scheduler {self.name}: {self.functionName}({self.kwargs})"
 
 
-def task(obj):
+def task(obj):  # task decorator
     if isinstance(obj, staticmethod):
         func = obj.__func__
         setattr(func, "__is_task__", True)
@@ -228,19 +244,20 @@ class BaseQueue:
         self.tasksCollection: Collection = queueDB["pymonque_tasks"]
         self.schedulersCollection: Collection = queueDB["pymonque_schedulers"]
 
-        self.tasksCollection.create_index([("functionName", 1), ("status", 1), ("deadline", 1)])  # Make task query blazingly fast
+        self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # Make task query blazingly fast
+        self.tasksCollection.create_index([("uid", 1)])
         self.tasksCollection.create_index([("functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
 
-        self.schedulersCollection.create_index([("uid", 1), ("status", 1)])
+        self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
         self.schedulersCollection.create_index([("functionName", 1), ("status", 1)])
 
         self.tasksCollection.update_many(
-            {"status": "pending", "functionName": {"$nin": self.tasks.keys()}},
+            {"status": "pending", "functionName": {"$nin": list(self.tasks.keys())}},
             {"$set": {"status": "incompatible", "error": "Function for this task does not exist in the TaskClass"}}
         )  # flag pending tasks that cannot be executed
 
         self.schedulersCollection.update_many(
-            {"status": "enabled", "functionName": {"$nin": self.tasks.keys()}}, 
+            {"status": "enabled", "functionName": {"$nin": list(self.tasks.keys())}}, 
             {"$set": {"status": "disabled"}}
         )  # disable Schedulers that emit tasks that cannot be executed
 
@@ -371,7 +388,8 @@ class BaseQueue:
         now = datetime.now()
         raw = self.tasksCollection.find_one_and_update(
             {"status": "pending", "deadline": {"$lte": now}},
-            {"$set": {"status": "processing"}}
+            {"$set": {"status": "processing"}},
+            sort=[("deadline", 1)]
         )
 
         if not raw:
@@ -380,16 +398,17 @@ class BaseQueue:
         task = Task.model_validate(raw)
         task = self._executeTask(task)
 
-        self.tasksCollection.replace_one(
+        self.tasksCollection.update_one(
             {"uid": task.uid},
-            task.model_dump()
+            {"$set": task.model_dump()}
         )
 
     def _schedule(self):
         now = datetime.now()
         raw = self.schedulersCollection.find_one_and_update(
             {"status": "enabled", "deadline": {"$lte": now}},
-            {"$set": {"status": "processing"}}
+            {"$set": {"status": "processing"}},
+            sort=[("deadline", 1)]
         )
 
         if not raw:
@@ -400,12 +419,13 @@ class BaseQueue:
         distFunc = self.distributions[scheduler.distribution.name]
         deadline = scheduler.deadline + distFunc(**scheduler.distribution.kwargs)
 
-        serialized = [
+        if deadline <= datetime.now():
+            pass  # logging.warn(f"{scheduler} is ")
+
+        self.tasksCollection.insert_many([
             task.model_dump()
             for task in scheduler._emit(deadline=deadline)
-        ]
-
-        self.tasksCollection.insert_many(serialized)
+        ])
 
         self.schedulersCollection.update_one(
             {"uid": scheduler.uid},
@@ -416,5 +436,4 @@ class BaseQueue:
         while True:
             self._work()
             self._schedule()
-            time.sleep(1)
-            print(list(self.tasksCollection.find()))
+            # print(list(self.tasksCollection.find()))
