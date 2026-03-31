@@ -115,7 +115,7 @@ class Distribution(MongoModel):
 
 
 class Task(MongoModel):
-    uid:            str                = Field(default_factory=uuid4str)
+    uid:            str                 = Field(default_factory=uuid4str)
     functionName:   str
     kwargs:         dict[str, Any]
     status:         TASK_STATUS         = "pending"
@@ -127,16 +127,21 @@ class Task(MongoModel):
     error:          str | None          = None
 
     @field_serializer("executionTime")
+    @staticmethod
     def serialize_executionTime(value: timedelta | None) -> float | None:
         if value is not None:
-            return float(value.seconds)
-    
+            return float(value.total_seconds())
+
     @field_validator("executionTime", mode="before")
-    def validate_executionTime(value) -> timedelta:
+    @staticmethod
+    def validate_executionTime(value: int | float) -> timedelta:
         if isinstance(value, (int, float)):
             return timedelta(seconds=value)
         
-        raise TypeError(f"executionTime should be a float or int, is: {type(value)} ({value})")
+        if isinstance(value, str):
+            return timedelta(seconds=float(value))
+        
+        raise TypeError(f"executionTime should not be a {type(value)}  ({value})")
     
     def __repr__(self) -> str:
         return f"Task {self.functionName}({self.kwargs}) from {self.factory}"
@@ -146,8 +151,19 @@ class TaskFactory(MongoModel):
     uid:    str    = Field(default_factory=uuid4str)
     name:   str
 
-    def _emit(self, functionName: str, kwargs: dict[str, Any], deadline: datetime) -> Task:
-        return Task(functionName=functionName, kwargs=kwargs, deadline=deadline, factory=self)
+    def _emit(
+            self, 
+            functionName: str, 
+            kwargs: dict[str, Any], 
+            deadline: datetime
+        ) -> Task:
+
+        return Task(
+            functionName=functionName, 
+            kwargs=kwargs, 
+            deadline=deadline, 
+            factory=self
+        )
     
     def __repr__(self) -> str:
         return f"Factory {self.name}"
@@ -269,22 +285,21 @@ class BaseQueue:
         except KeyError:
             raise TaskNotFound(f"Task {functionName} does not exist in this Queue")
         
-    def _validateDistribution(self, distribution: Distribution):
+    def _validateDistribution(self, dist: Distribution):
         try:
-            self.distributionValidators[distribution.name](**distribution.kwargs)
+            self.distributionValidators[dist.name](**dist.kwargs)
         except ValueError as e:
-            raise DistributionValidationError(f"Failed to validate distribution {distribution.name}") from e
+            raise DistributionValidationError(f"Failed to validate distribution {dist.name}") from e
         except KeyError:
-            raise DistributionNotFound(f"Distribution {distribution.name} does not exist in this Queue")
+            raise DistributionNotFound(f"Distribution {dist.name} does not exist in this Queue")
 
     def _executeTask(self, task: Task) -> Task:
         func = self.tasks[task.functionName]
 
         start = time.perf_counter()
         try:
-            result = func(**task.kwargs)
+            task.result = func(**task.kwargs)
             task.status = "success"
-            task.result = result
         except Exception:
             task.status = "failed"
             task.error = traceback.format_exc()
@@ -294,6 +309,23 @@ class BaseQueue:
 
         return task
 
+    def _scheduleTasksUnvalidated(
+            self, 
+            functionName:   str, 
+            kwargs:         list[dict[str, Any]], 
+            deadline:       datetime, 
+            factory:        TaskFactory
+        ):
+
+        self.tasksCollection.insert_many([
+            factory._emit(
+                functionName=functionName, 
+                kwargs=kwarg, 
+                deadline=deadline
+            ).model_dump() 
+            for kwarg in kwargs
+        ])
+
     def scheduleTask(
             self, 
             functionName:   str, 
@@ -301,30 +333,8 @@ class BaseQueue:
             deadline:       datetime, 
             factory:        TaskFactory | None = None
         ):
-        
+
         factory = factory or self.defaultFactory
-
-        if isinstance(kwargs, dict):
-            kwargs = [kwargs]
-
-        serialized = [
-            factory._emit(
-                functionName=functionName, 
-                kwargs=kwarg, 
-                deadline=deadline
-            ).model_dump() 
-            for kwarg in kwargs
-        ]
-
-        self.tasksCollection.insert_many(serialized)
-
-    def scheduleValidatedTask(
-            self, 
-            functionName:   str, 
-            kwargs:         dict[str, Any] | list[dict[str, Any]], 
-            deadline:       datetime, 
-            factory:        TaskFactory | None = None
-        ):
 
         if isinstance(kwargs, dict):
             kwargs = [kwargs]
@@ -332,7 +342,7 @@ class BaseQueue:
         for kwarg in kwargs:
             self._validateTask(functionName, kwarg)
 
-        self.scheduleTask(
+        self._scheduleTasksUnvalidated(
             functionName=functionName, 
             kwargs=kwargs, 
             deadline=deadline, 
@@ -419,9 +429,6 @@ class BaseQueue:
         distFunc = self.distributions[scheduler.distribution.name]
         deadline = scheduler.deadline + distFunc(**scheduler.distribution.kwargs)
 
-        if deadline <= datetime.now():
-            pass  # logging.warn(f"{scheduler} is ")
-
         self.tasksCollection.insert_many([
             task.model_dump()
             for task in scheduler._emit(deadline=deadline)
@@ -431,6 +438,9 @@ class BaseQueue:
             {"uid": scheduler.uid},
             {"$set": {"status": "enabled", "deadline": deadline}}
         )
+
+        if deadline <= datetime.now():
+            pass  # logging.warn(f"{scheduler} is being throtled")
 
     def work(self):
         while True:
