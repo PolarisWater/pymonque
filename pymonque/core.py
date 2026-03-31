@@ -349,31 +349,26 @@ class BaseQueue:
             factory=factory
         )
 
-    def addSchedluer(
+    def _addSchedluerUnvalidated(
             self, 
             functionName: str, 
-            kwargs: dict[str, Any] | list[dict[str, Any]], 
+            kwargs: list[dict[str, Any]], 
             distribution: Distribution
         ):
         
         distFunc = self.distributions[distribution.name]
         deadline = datetime.now() + distFunc(**distribution.kwargs)
 
-        if isinstance(kwargs, dict):
-            kwargs = [kwargs]
-
-        scheduler = Scheduler(
-            functionName=functionName, 
-            kwargs=kwargs, 
-            distribution=distribution, 
-            deadline=deadline
-        )
-
         self.schedulersCollection.insert_one(
-            scheduler.model_dump()
+            Scheduler(
+                functionName=functionName, 
+                kwargs=kwargs, 
+                distribution=distribution, 
+                deadline=deadline
+            ).model_dump()
         )
 
-    def addValidatedSchedluer(
+    def addSchedluer(
             self, 
             functionName: str, 
             kwargs: dict[str, Any] | list[dict[str, Any]], 
