@@ -71,7 +71,7 @@ def uuid4str() -> str:
     return str(uuid.uuid4())
 
 
-class Distributions:
+class BaseDistributions:
     @classmethod
     def _getDistributions(cls) -> dict[str, Callable]:
         return getStaticmethods(cls)
@@ -102,22 +102,21 @@ class Distributions:
         interval_sec = random.expovariate(1 / mean_sec)
         return timedelta(seconds=interval_sec)
 
-class Executable:
+class Executable(MongoModel):
     functionName:   str
     kwargs:         dict[str, Any]
 
-    def __call__(self, cls: type) -> Any:
-        pass
+    def __call__(self, cls: type | dict[str, Callable] | dict[str, type[BaseModel]]) -> Any:
+        return getattr(cls, self.functionName)(**self.kwargs)
 
-class Distribution(MongoModel):
-    name:           str
-    kwargs:         dict[str, Any]
+# class Distribution(MongoModel):
+#     name:           str
+#     kwargs:         dict[str, Any]
 
 
 class Task(MongoModel):
     uid:            str                 = Field(default_factory=uuid4str)
-    functionName:   str
-    kwargs:         dict[str, Any]
+    work:           Executable
     status:         TASK_STATUS         = "pending"
     deadline:       datetime
     factory:        TaskFactory
@@ -153,14 +152,12 @@ class TaskFactory(MongoModel):
 
     def _emit(
             self, 
-            functionName: str, 
-            kwargs: dict[str, Any], 
-            deadline: datetime
+            work:       Executable,
+            deadline:   datetime
         ) -> Task:
 
         return Task(
-            functionName=functionName, 
-            kwargs=kwargs, 
+            work=work,
             deadline=deadline, 
             factory=self
         )
@@ -199,6 +196,36 @@ def task(obj):  # task decorator
     
     raise TypeError(f"@task cannot be applied to {type(obj)}")
 
+class Distribution:
+    def __init__(self, distributionsClass: type[BaseDistributions] = BaseDistributions):
+        self.distributionsClass: type[BaseDistributions] = distributionsClass
+
+        self.distributions: dict[str, Callable] = distributionsClass._getDistributions()
+
+        self.distributionValidators: dict[str, type[BaseModel]] = {
+            name: buildValidator(func)
+            for name, func in self.distributions.items()
+        }
+
+    def _validate(self, distribution: Executable):
+        try:
+            distribution(self.distributionValidators)
+        except ValueError as e:
+            raise DistributionValidationError(f"Failed to validate distribution {distribution.functionName}") from e
+        except KeyError:
+            raise DistributionNotFound(f"Distribution {distribution.functionName} does not exist in this Queue")
+
+    def gen(self, distribution: Executable) -> timedelta:
+        delta = distribution(self.distributions)
+        if isinstance(delta, timedelta):
+            return delta
+        
+        raise DistributionValidationError # TODO: specify error
+    
+    def __call__(self, functionName: str, **kwargs) -> Executable:
+        obj = Executable(functionName=functionName, kwargs=kwargs)
+        self._validate(obj)
+        return obj
 
 class BaseQueue:
     @classmethod
@@ -231,7 +258,7 @@ class BaseQueue:
             and getattr(obj, "__is_task__", False)
         }
 
-    def __init__(self, queueDB: Database, DistributionsClass: type[Distributions] = Distributions):
+    def __init__(self, queueDB: Database):
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
         
         # resolve tasks and distributions
@@ -243,17 +270,10 @@ class BaseQueue:
             }
         }
 
-        self.distributions: dict[str, Callable] = DistributionsClass._getDistributions()
-
         # build kwarg validators
         self.taskValidators: dict[str, type[BaseModel]] = {
             name: buildValidator(func)
             for name, func in self.tasks.items()
-        }
-
-        self.distributionValidators: dict[str, type[BaseModel]] = {
-            name: buildValidator(func)
-            for name, func in self.distributions.items()
         }
 
         # prepare DB
@@ -262,7 +282,7 @@ class BaseQueue:
 
         self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # Make task query blazingly fast
         self.tasksCollection.create_index([("uid", 1)])
-        self.tasksCollection.create_index([("functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
+        self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
 
         self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
         self.schedulersCollection.create_index([("functionName", 1), ("status", 1)])
@@ -284,21 +304,11 @@ class BaseQueue:
             raise TaskValidationError(f"Failed to validate task {functionName}") from e
         except KeyError:
             raise TaskNotFound(f"Task {functionName} does not exist in this Queue")
-        
-    def _validateDistribution(self, dist: Distribution):
-        try:
-            self.distributionValidators[dist.name](**dist.kwargs)
-        except ValueError as e:
-            raise DistributionValidationError(f"Failed to validate distribution {dist.name}") from e
-        except KeyError:
-            raise DistributionNotFound(f"Distribution {dist.name} does not exist in this Queue")
 
     def _executeTask(self, task: Task) -> Task:
-        func = self.tasks[task.functionName]
-
         start = time.perf_counter()
         try:
-            task.result = func(**task.kwargs)
+            task.result = task.work(self.tasks)
             task.status = "success"
         except Exception:
             task.status = "failed"
@@ -311,20 +321,17 @@ class BaseQueue:
 
     def _scheduleTasksUnvalidated(
             self, 
-            functionName:   str, 
-            kwargs:         list[dict[str, Any]], 
+            work:           Executable,
             deadline:       datetime, 
             factory:        TaskFactory
         ):
 
-        self.tasksCollection.insert_many([
+        self.tasksCollection.insert_one(
             factory._emit(
-                functionName=functionName, 
-                kwargs=kwarg, 
-                deadline=deadline
+                deadline=deadline,
+                work=work
             ).model_dump() 
-            for kwarg in kwargs
-        ])
+        )
 
     def scheduleTask(
             self, 
