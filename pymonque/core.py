@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pydantic import BaseModel, Field, create_model, field_validator, field_serializer, ConfigDict
 
-from typing import Any, Literal, Callable, get_type_hints
+from typing import Any, Literal, Callable, get_type_hints, TypeVar, overload, Mapping
 from types import FunctionType, MethodType
 
 from pymongo.database import Database
@@ -20,7 +20,7 @@ import inspect
 from pymonque.exceptions import TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
 from pymonque.mongo import MongoModel
 
-
+T = TypeVar("T")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
 SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
 
@@ -71,6 +71,38 @@ def uuid4str() -> str:
     return str(uuid.uuid4())
 
 
+class CallSpec(MongoModel):
+    functionName:   str
+    kwargs:         dict[str, Any]
+
+    @classmethod
+    def new(cls, functionName, **kwargs):
+        return cls(
+            functionName=functionName,
+            kwargs=kwargs
+        )
+
+    @overload
+    def __call__(self, source: Mapping[str, Callable[..., T]]) -> T: ...
+    
+    @overload
+    def __call__(self, source: Mapping[str, type[BaseModel]]) -> BaseModel: ...
+    
+    def __call__(self, source: type | Mapping[str, Callable] | Mapping[str, type[BaseModel]]) -> Any:
+        func = (
+            source.get(self.functionName)
+            if isinstance(source, Mapping)
+            else getattr(source, self.functionName, None)
+        )
+        
+        if func is None:
+            raise KeyError(f"{source} has no function {self.functionName}")
+        
+        return func(**self.kwargs)
+    
+    def __repr__(self) -> str:
+        return f"{self.functionName}({self.kwargs})"
+
 class BaseDistributions:
     @classmethod
     def _getDistributions(cls) -> dict[str, Callable]:
@@ -102,22 +134,42 @@ class BaseDistributions:
         interval_sec = random.expovariate(1 / mean_sec)
         return timedelta(seconds=interval_sec)
 
-class Executable(MongoModel):
-    functionName:   str
-    kwargs:         dict[str, Any]
+class DistributionEngine:
+    def __init__(self, registry: type[BaseDistributions] = BaseDistributions):
+        self.registry: type[BaseDistributions] = registry
 
-    def __call__(self, cls: type | dict[str, Callable] | dict[str, type[BaseModel]]) -> Any:
-        return getattr(cls, self.functionName)(**self.kwargs)
+        self.functions: dict[str, Callable] = registry._getDistributions()
 
-# class Distribution(MongoModel):
-#     name:           str
-#     kwargs:         dict[str, Any]
+        self.validators: dict[str, type[BaseModel]] = {
+            name: buildValidator(func)
+            for name, func in self.functions.items()
+        }
+
+    def validate(self, distribution: CallSpec):
+        try:
+            distribution(self.validators)
+        except ValueError as e:
+            raise DistributionValidationError(f"Failed to validate distribution {distribution}") from e
+        except KeyError:
+            raise DistributionNotFound(f"Distribution {distribution.functionName} does not exist in this Queue")
+
+    def gen(self, distribution: CallSpec) -> timedelta:
+        delta = distribution(self.functions)
+        if isinstance(delta, timedelta):
+            return delta
+        
+        raise DistributionValidationError(f"distribution {distribution} did not return a timedelta")
+    
+    def __call__(self, functionName: str, **kwargs) -> CallSpec:
+        obj = CallSpec.new(functionName, **kwargs)
+        self.validate(obj)
+        return obj
 
 
 class Task(MongoModel):
     uid:            str                 = Field(default_factory=uuid4str)
-    work:           Executable
     status:         TASK_STATUS         = "pending"
+    work:           CallSpec
     deadline:       datetime
     factory:        TaskFactory
 
@@ -133,18 +185,14 @@ class Task(MongoModel):
 
     @field_validator("executionTime", mode="before")
     @staticmethod
-    def validate_executionTime(value: int | float) -> timedelta:
-        if isinstance(value, (int, float)):
-            return timedelta(seconds=value)
-        
-        if isinstance(value, str):
+    def validate_executionTime(value: int | float | str) -> timedelta:
+        if isinstance(value, (int, float, str)):
             return timedelta(seconds=float(value))
         
         raise TypeError(f"executionTime should not be a {type(value)}  ({value})")
     
     def __repr__(self) -> str:
-        return f"Task {self.functionName}({self.kwargs}) from {self.factory}"
-
+        return f"Task {self.work} from {self.factory}"
 
 class TaskFactory(MongoModel):
     uid:    str    = Field(default_factory=uuid4str)
@@ -152,7 +200,7 @@ class TaskFactory(MongoModel):
 
     def _emit(
             self, 
-            work:       Executable,
+            work:       CallSpec,
             deadline:   datetime
         ) -> Task:
 
@@ -165,23 +213,18 @@ class TaskFactory(MongoModel):
     def __repr__(self) -> str:
         return f"Factory {self.name}"
 
-
 class Scheduler(TaskFactory):
     name:           str                 = "Scheduler"
-    functionName:   str
-    kwargs:         list[dict[str, Any]]  # all tasks are emited at once
-    distribution:   Distribution
-    deadline:       datetime
     status:         SCHEDULER_STATUS    = "enabled"
+    work:           CallSpec
+    distribution:   CallSpec
+    deadline:       datetime
 
-    def _emit(self, deadline: datetime) -> list[Task]:
-        return [
-            super()._emit(self.functionName, kwarg, deadline)
-            for kwarg in self.kwargs
-        ]
+    def _emit(self, deadline: datetime) -> Task:
+        return super()._emit(self.work, deadline)
     
     def __repr__(self) -> str:
-        return f"Scheduler {self.name}: {self.functionName}({self.kwargs})"
+        return f"Scheduler {self.name}: {self.work}"
 
 
 def task(obj):  # task decorator
@@ -195,37 +238,6 @@ def task(obj):  # task decorator
         return obj
     
     raise TypeError(f"@task cannot be applied to {type(obj)}")
-
-class Distribution:
-    def __init__(self, distributionsClass: type[BaseDistributions] = BaseDistributions):
-        self.distributionsClass: type[BaseDistributions] = distributionsClass
-
-        self.distributions: dict[str, Callable] = distributionsClass._getDistributions()
-
-        self.distributionValidators: dict[str, type[BaseModel]] = {
-            name: buildValidator(func)
-            for name, func in self.distributions.items()
-        }
-
-    def _validate(self, distribution: Executable):
-        try:
-            distribution(self.distributionValidators)
-        except ValueError as e:
-            raise DistributionValidationError(f"Failed to validate distribution {distribution.functionName}") from e
-        except KeyError:
-            raise DistributionNotFound(f"Distribution {distribution.functionName} does not exist in this Queue")
-
-    def gen(self, distribution: Executable) -> timedelta:
-        delta = distribution(self.distributions)
-        if isinstance(delta, timedelta):
-            return delta
-        
-        raise DistributionValidationError # TODO: specify error
-    
-    def __call__(self, functionName: str, **kwargs) -> Executable:
-        obj = Executable(functionName=functionName, kwargs=kwargs)
-        self._validate(obj)
-        return obj
 
 class BaseQueue:
     @classmethod
@@ -258,7 +270,13 @@ class BaseQueue:
             and getattr(obj, "__is_task__", False)
         }
 
-    def __init__(self, queueDB: Database):
+    def __init__(
+            self, 
+            queueDB:                Database, 
+            distributionsRegistry:  type[BaseDistributions] = BaseDistributions
+        ):
+
+        self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
         
         # resolve tasks and distributions
@@ -277,6 +295,7 @@ class BaseQueue:
         }
 
         # prepare DB
+        
         self.tasksCollection: Collection = queueDB["pymonque_tasks"]
         self.schedulersCollection: Collection = queueDB["pymonque_schedulers"]
 
@@ -285,8 +304,9 @@ class BaseQueue:
         self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
 
         self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
-        self.schedulersCollection.create_index([("functionName", 1), ("status", 1)])
-
+        self.schedulersCollection.create_index([("work.functionName", 1), ("status", 1)])
+        
+        """
         self.tasksCollection.update_many(
             {"status": "pending", "functionName": {"$nin": list(self.tasks.keys())}},
             {"$set": {"status": "incompatible", "error": "Function for this task does not exist in the TaskClass"}}
@@ -296,14 +316,15 @@ class BaseQueue:
             {"status": "enabled", "functionName": {"$nin": list(self.tasks.keys())}}, 
             {"$set": {"status": "disabled"}}
         )  # disable Schedulers that emit tasks that cannot be executed
+        """
 
-    def _validateTask(self, functionName: str, kwargs: dict[str, Any]):
+    def _validateTask(self, work: CallSpec):
         try:
-            self.taskValidators[functionName](**kwargs)
+            work(self.taskValidators)
         except ValueError as e:
-            raise TaskValidationError(f"Failed to validate task {functionName}") from e
+            raise TaskValidationError(f"Failed to validate task {work.functionName}") from e
         except KeyError:
-            raise TaskNotFound(f"Task {functionName} does not exist in this Queue")
+            raise TaskNotFound(f"Task {work.functionName} does not exist in this Queue")
 
     def _executeTask(self, task: Task) -> Task:
         start = time.perf_counter()
@@ -319,9 +340,9 @@ class BaseQueue:
 
         return task
 
-    def _scheduleTasksUnvalidated(
+    def _scheduleTaskUnvalidated(
             self, 
-            work:           Executable,
+            work:           CallSpec,
             deadline:       datetime, 
             factory:        TaskFactory
         ):
@@ -335,41 +356,48 @@ class BaseQueue:
 
     def scheduleTask(
             self, 
-            functionName:   str, 
-            kwargs:         dict[str, Any] | list[dict[str, Any]], 
-            deadline:       datetime, 
+            work:           CallSpec, 
+            deadline:       datetime,
             factory:        TaskFactory | None = None
         ):
 
         factory = factory or self.defaultFactory
 
-        if isinstance(kwargs, dict):
-            kwargs = [kwargs]
+        self._validateTask(work)
 
-        for kwarg in kwargs:
-            self._validateTask(functionName, kwarg)
-
-        self._scheduleTasksUnvalidated(
-            functionName=functionName, 
-            kwargs=kwargs, 
+        self._scheduleTaskUnvalidated(
+            work=work,
             deadline=deadline, 
             factory=factory
         )
 
+    def scheduleTaskFromDistribution(
+            self,
+            work:           CallSpec,
+            distribution:   CallSpec,
+            factory:        TaskFactory | None = None
+        ):
+
+        self.distribution.validate(distribution)
+        deadline = datetime.now() + self.distribution.gen(distribution)
+
+        self.scheduleTask(
+            work=work,
+            deadline=deadline,
+            factory=factory
+        )
+
     def _addSchedluerUnvalidated(
-            self, 
-            functionName: str, 
-            kwargs: list[dict[str, Any]], 
-            distribution: Distribution
+            self,
+            work:           CallSpec,
+            distribution:   CallSpec
         ):
         
-        distFunc = self.distributions[distribution.name]
-        deadline = datetime.now() + distFunc(**distribution.kwargs)
+        deadline = datetime.now() + self.distribution.gen(distribution)
 
         self.schedulersCollection.insert_one(
             Scheduler(
-                functionName=functionName, 
-                kwargs=kwargs, 
+                work=work,
                 distribution=distribution, 
                 deadline=deadline
             ).model_dump()
@@ -377,23 +405,16 @@ class BaseQueue:
 
     def addSchedluer(
             self, 
-            functionName: str, 
-            kwargs: dict[str, Any] | list[dict[str, Any]], 
-            distribution: Distribution
+            work:           CallSpec, 
+            distribution:   CallSpec
         ):
 
-        self._validateDistribution(distribution)
+        self.distribution.validate(distribution)
+        self._validateTask(work)
 
-        if isinstance(kwargs, dict):
-            kwargs = [kwargs]
-
-        for kwarg in kwargs:
-            self._validateTask(functionName, kwarg)
-
-        self.addSchedluer(
-            functionName=functionName,
-            kwargs=kwargs,
-            distribution=distribution
+        self._addSchedluerUnvalidated(
+            distribution=distribution,
+            work=work
         )
 
     def _work(self):
@@ -410,7 +431,7 @@ class BaseQueue:
         task = Task.model_validate(raw)
         task = self._executeTask(task)
 
-        self.tasksCollection.update_one(
+        return self.tasksCollection.update_one(
             {"uid": task.uid},
             {"$set": task.model_dump()}
         )
@@ -427,14 +448,11 @@ class BaseQueue:
             return
         
         scheduler = Scheduler.model_validate(raw)
+        deadline = scheduler.deadline + self.distribution.gen(scheduler.distribution)
 
-        distFunc = self.distributions[scheduler.distribution.name]
-        deadline = scheduler.deadline + distFunc(**scheduler.distribution.kwargs)
-
-        self.tasksCollection.insert_many([
-            task.model_dump()
-            for task in scheduler._emit(deadline=deadline)
-        ])
+        self.tasksCollection.insert_one(
+            scheduler._emit(deadline=deadline).model_dump()
+        )
 
         self.schedulersCollection.update_one(
             {"uid": scheduler.uid},
