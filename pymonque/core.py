@@ -76,7 +76,7 @@ class CallSpec(MongoModel):
     kwargs:         dict[str, Any]
 
     @classmethod
-    def new(cls, functionName, **kwargs):
+    def new(cls, functionName: str, **kwargs):
         return cls(
             functionName=functionName,
             kwargs=kwargs
@@ -213,6 +213,100 @@ class TaskFactory(MongoModel):
     def __repr__(self) -> str:
         return f"Factory {self.name}"
 
+class TaskEngine:
+    def __init__(self, queue: BaseQueue):
+        self._queue = queue
+
+        # resolve tasks and distributions
+        self.functions: dict[str, Callable] = {
+            **type(self._queue)._getStaticmethodTasks(),
+            **{
+                name: getattr(self._queue, name)
+                for name in type(self._queue)._getInstanceTasks()
+            }
+        }
+
+        # build kwarg validators
+        self.validators: dict[str, type[BaseModel]] = {
+            name: buildValidator(func)
+            for name, func in self.functions.items()
+        }
+
+    def execute(self, task: Task) -> Task:
+        start = time.perf_counter()
+        try:
+            task.result = task.work(self.functions)
+            task.status = "success"
+        except Exception:
+            task.status = "failed"
+            task.error = traceback.format_exc()
+        finally:
+            end = time.perf_counter()
+            task.executionTime = timedelta(seconds=(end - start))
+
+        return task
+    
+    def validate(self, work: CallSpec):
+        try:
+            work(self.validators)
+        except ValueError as e:
+            raise TaskValidationError(f"Failed to validate task {work.functionName}") from e
+        except KeyError:
+            raise TaskNotFound(f"Task {work.functionName} does not exist in this Queue")
+
+    def _add(
+            self, 
+            work:           CallSpec,
+            deadline:       datetime, 
+            factory:        TaskFactory
+        ):
+
+        self._queue.tasksCollection.insert_one(
+            factory._emit(
+                deadline=deadline,
+                work=work
+            ).model_dump() 
+        )
+
+    def schedule(
+            self, 
+            work:           CallSpec, 
+            deadline:       datetime,
+            factory:        TaskFactory | None = None
+        ):
+
+        factory = factory or self._queue.defaultFactory
+
+        self.validate(work)
+
+        self._add(
+            work=work,
+            deadline=deadline, 
+            factory=factory
+        )
+
+    def scheduleFromDistribution(
+            self,
+            work:           CallSpec,
+            distribution:   CallSpec,
+            factory:        TaskFactory | None = None
+        ):
+
+        self._queue.distribution.validate(distribution)
+        deadline = datetime.now() + self._queue.distribution.gen(distribution)
+
+        self.schedule(
+            work=work,
+            deadline=deadline,
+            factory=factory
+        )
+
+    def __call__(self, functionName: str, **kwargs) -> CallSpec:
+        obj = CallSpec.new(functionName, **kwargs)
+        self.validate(obj)
+        return obj
+
+
 class Scheduler(TaskFactory):
     name:           str                 = "Scheduler"
     status:         SCHEDULER_STATUS    = "enabled"
@@ -225,7 +319,6 @@ class Scheduler(TaskFactory):
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work}"
-
 
 def task(obj):  # task decorator
     if isinstance(obj, staticmethod):
@@ -277,25 +370,11 @@ class BaseQueue:
         ):
 
         self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
+        self.task: TaskEngine = TaskEngine(self)
+
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
         
-        # resolve tasks and distributions
-        self.tasks: dict[str, Callable] = {
-            **type(self)._getStaticmethodTasks(),
-            **{
-                name: getattr(self, name)
-                for name in type(self)._getInstanceTasks()
-            }
-        }
-
-        # build kwarg validators
-        self.taskValidators: dict[str, type[BaseModel]] = {
-            name: buildValidator(func)
-            for name, func in self.tasks.items()
-        }
-
         # prepare DB
-        
         self.tasksCollection: Collection = queueDB["pymonque_tasks"]
         self.schedulersCollection: Collection = queueDB["pymonque_schedulers"]
 
@@ -317,75 +396,6 @@ class BaseQueue:
             {"$set": {"status": "disabled"}}
         )  # disable Schedulers that emit tasks that cannot be executed
         """
-
-    def _validateTask(self, work: CallSpec):
-        try:
-            work(self.taskValidators)
-        except ValueError as e:
-            raise TaskValidationError(f"Failed to validate task {work.functionName}") from e
-        except KeyError:
-            raise TaskNotFound(f"Task {work.functionName} does not exist in this Queue")
-
-    def _executeTask(self, task: Task) -> Task:
-        start = time.perf_counter()
-        try:
-            task.result = task.work(self.tasks)
-            task.status = "success"
-        except Exception:
-            task.status = "failed"
-            task.error = traceback.format_exc()
-        finally:
-            end = time.perf_counter()
-            task.executionTime = timedelta(seconds=(end - start))
-
-        return task
-
-    def _scheduleTaskUnvalidated(
-            self, 
-            work:           CallSpec,
-            deadline:       datetime, 
-            factory:        TaskFactory
-        ):
-
-        self.tasksCollection.insert_one(
-            factory._emit(
-                deadline=deadline,
-                work=work
-            ).model_dump() 
-        )
-
-    def scheduleTask(
-            self, 
-            work:           CallSpec, 
-            deadline:       datetime,
-            factory:        TaskFactory | None = None
-        ):
-
-        factory = factory or self.defaultFactory
-
-        self._validateTask(work)
-
-        self._scheduleTaskUnvalidated(
-            work=work,
-            deadline=deadline, 
-            factory=factory
-        )
-
-    def scheduleTaskFromDistribution(
-            self,
-            work:           CallSpec,
-            distribution:   CallSpec,
-            factory:        TaskFactory | None = None
-        ):
-
-        self.distribution.validate(distribution)
-        deadline = datetime.now() + self.distribution.gen(distribution)
-
-        self.scheduleTask(
-            work=work,
-            deadline=deadline,
-            factory=factory
-        )
 
     def _addSchedluerUnvalidated(
             self,
@@ -410,7 +420,7 @@ class BaseQueue:
         ):
 
         self.distribution.validate(distribution)
-        self._validateTask(work)
+        self.task.validate(work)
 
         self._addSchedluerUnvalidated(
             distribution=distribution,
@@ -429,7 +439,7 @@ class BaseQueue:
             return
 
         task = Task.model_validate(raw)
-        task = self._executeTask(task)
+        task = self.task.execute(task)
 
         return self.tasksCollection.update_one(
             {"uid": task.uid},
