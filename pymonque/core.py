@@ -285,6 +285,21 @@ class TaskEngine:
             factory=factory
         )
 
+    def scheduleIn(
+            self, 
+            work:           CallSpec, 
+            delta:          timedelta,
+            factory:        TaskFactory | None = None
+        ):
+
+        deadline = datetime.now() + delta
+
+        self.schedule(
+            work=work,
+            deadline=deadline,
+            factory=factory
+        )
+
     def scheduleFromDistribution(
             self,
             work:           CallSpec,
@@ -301,7 +316,10 @@ class TaskEngine:
             factory=factory
         )
 
-    def __call__(self, functionName: str, **kwargs) -> CallSpec:
+    def __call__(self, functionName: str | Callable, **kwargs) -> CallSpec:
+        if isinstance(functionName, Callable):
+            functionName = functionName.__name__
+
         obj = CallSpec.new(functionName, **kwargs)
         self.validate(obj)
         return obj
@@ -319,6 +337,11 @@ class Scheduler(TaskFactory):
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work}"
+
+class SchedulerEngine:
+    def __init__(self, queue: BaseQueue):
+        self._queue = queue
+        self.taskEngine = queue.task
 
 def task(obj):  # task decorator
     if isinstance(obj, staticmethod):
@@ -477,3 +500,4 @@ class BaseQueue:
             self._work()
             self._schedule()
             # print(list(self.tasksCollection.find()))
+            
