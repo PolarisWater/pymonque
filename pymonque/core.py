@@ -1,7 +1,14 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, create_model, field_validator, field_serializer, ConfigDict
+from pydantic import (
+    create_model, field_validator, field_serializer, 
+    ConfigDict, BaseModel, Field
+)
 
-from typing import Any, Literal, Callable, get_type_hints, TypeVar, overload, Mapping
+from typing import (
+    Any, Literal, Callable, TypeVar, Mapping,
+    get_type_hints, overload
+)
+
 from types import FunctionType, MethodType
 
 from pymongo.database import Database
@@ -17,8 +24,10 @@ import traceback
 
 import inspect
 
-from pymonque.exceptions import TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
 from pymonque.mongo import MongoModel
+from pymonque.exceptions import (
+    TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
+)
 
 T = TypeVar("T")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
@@ -214,8 +223,17 @@ class TaskFactory(MongoModel):
         return f"Factory {self.name}"
 
 class TaskEngine:
-    def __init__(self, queue: BaseQueue):
+    def __init__(
+            self, 
+            queue: BaseQueue, 
+            tasksCollection: Collection | None = None, 
+            defaultFactory: TaskFactory | None = None
+        ):
+
         self._queue = queue
+        self.tasksCollection: Collection = tasksCollection or queue.tasksCollection
+        self.defaultFactory: TaskFactory = defaultFactory or queue.defaultFactory
+        self.distributionEngine: DistributionEngine = queue.distribution
 
         # resolve tasks and distributions
         self.functions: dict[str, Callable] = {
@@ -231,6 +249,25 @@ class TaskEngine:
             name: buildValidator(func)
             for name, func in self.functions.items()
         }
+
+    def _work(self):
+        now = datetime.now()
+        raw = self.tasksCollection.find_one_and_update(
+            {"status": "pending", "deadline": {"$lte": now}},
+            {"$set": {"status": "processing"}},
+            sort=[("deadline", 1)]
+        )
+
+        if not raw:
+            return
+
+        task = Task.model_validate(raw)
+        task = self.execute(task)
+
+        return self.tasksCollection.update_one(
+            {"uid": task.uid},
+            {"$set": task.model_dump()}
+        )
 
     def execute(self, task: Task) -> Task:
         start = time.perf_counter()
@@ -254,6 +291,11 @@ class TaskEngine:
         except KeyError:
             raise TaskNotFound(f"Task {work.functionName} does not exist in this Queue")
 
+    def insert(self, task: Task):
+        self.tasksCollection.insert_one(
+            task.model_dump()
+        )
+
     def _add(
             self, 
             work:           CallSpec,
@@ -261,11 +303,11 @@ class TaskEngine:
             factory:        TaskFactory
         ):
 
-        self._queue.tasksCollection.insert_one(
+        self.insert(
             factory._emit(
                 deadline=deadline,
                 work=work
-            ).model_dump() 
+            ) 
         )
 
     def schedule(
@@ -275,7 +317,7 @@ class TaskEngine:
             factory:        TaskFactory | None = None
         ):
 
-        factory = factory or self._queue.defaultFactory
+        factory = factory or self.defaultFactory
 
         self.validate(work)
 
@@ -319,6 +361,92 @@ class Scheduler(TaskFactory):
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work}"
+
+class SchedulerEngine:
+    def __init__(
+            self, 
+            queue: BaseQueue, 
+            schedulersCollection: Collection | None = None,
+            taskEngine: TaskEngine | None = None
+        ):
+
+        self._queue = queue
+        self.schedulersCollection: Collection = schedulersCollection or queue.schedulersCollection
+        self.taskEngine: TaskEngine = taskEngine or queue.task
+
+    def _work(self):
+        now = datetime.now()
+        raw = self.schedulersCollection.find_one_and_update(
+            {"status": "enabled", "deadline": {"$lte": now}},
+            {"$set": {"status": "processing"}},
+            sort=[("deadline", 1)]
+        )
+
+        if not raw:
+            return
+        
+        scheduler = Scheduler.model_validate(raw)
+        deadline = scheduler.deadline + self.taskEngine.distributionEngine.gen(scheduler.distribution)
+
+        self.taskEngine.insert(
+            scheduler._emit(deadline=deadline)
+        )
+
+        self.schedulersCollection.update_one(
+            {"uid": scheduler.uid},
+            {"$set": {"status": "enabled", "deadline": deadline}}
+        )
+
+        if deadline <= datetime.now():
+            pass  # logging.warn(f"{scheduler} is being throtled")
+
+    def validate(
+            self, 
+            work:           CallSpec, 
+            distribution:   CallSpec
+        ):
+
+        self.taskEngine.distributionEngine.validate(distribution)
+        self.taskEngine.validate(work)
+
+    def insert(self, scheduler: Scheduler):
+        self.schedulersCollection.insert_one(
+            scheduler.model_dump()
+        )
+
+    def _add(
+            self,
+            work:           CallSpec,
+            distribution:   CallSpec
+        ):
+
+        deadline = datetime.now() + self.taskEngine.distributionEngine.gen(distribution)
+
+        self.insert(
+            Scheduler(
+                work=work,
+                distribution=distribution, 
+                deadline=deadline
+            )
+        )
+
+    def add(
+            self, 
+            work:           CallSpec, 
+            distribution:   CallSpec
+        ):
+
+        self.validate(
+            distribution=distribution,
+             work=work
+        )
+
+        self._add(
+            distribution=distribution,
+            work=work
+        )
+
+
 
 def task(obj):  # task decorator
     if isinstance(obj, staticmethod):
@@ -369,9 +497,6 @@ class BaseQueue:
             distributionsRegistry:  type[BaseDistributions] = BaseDistributions
         ):
 
-        self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
-        self.task: TaskEngine = TaskEngine(self)
-
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
         
         # prepare DB
@@ -385,6 +510,10 @@ class BaseQueue:
         self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
         self.schedulersCollection.create_index([("work.functionName", 1), ("status", 1)])
         
+        self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
+        self.task: TaskEngine = TaskEngine(self)
+        self.scheduler: SchedulerEngine = SchedulerEngine(self)
+
         """
         self.tasksCollection.update_many(
             {"status": "pending", "functionName": {"$nin": list(self.tasks.keys())}},
@@ -397,83 +526,10 @@ class BaseQueue:
         )  # disable Schedulers that emit tasks that cannot be executed
         """
 
-    def _addSchedluerUnvalidated(
-            self,
-            work:           CallSpec,
-            distribution:   CallSpec
-        ):
-        
-        deadline = datetime.now() + self.distribution.gen(distribution)
 
-        self.schedulersCollection.insert_one(
-            Scheduler(
-                work=work,
-                distribution=distribution, 
-                deadline=deadline
-            ).model_dump()
-        )
-
-    def addSchedluer(
-            self, 
-            work:           CallSpec, 
-            distribution:   CallSpec
-        ):
-
-        self.distribution.validate(distribution)
-        self.task.validate(work)
-
-        self._addSchedluerUnvalidated(
-            distribution=distribution,
-            work=work
-        )
-
-    def _work(self):
-        now = datetime.now()
-        raw = self.tasksCollection.find_one_and_update(
-            {"status": "pending", "deadline": {"$lte": now}},
-            {"$set": {"status": "processing"}},
-            sort=[("deadline", 1)]
-        )
-
-        if not raw:
-            return
-
-        task = Task.model_validate(raw)
-        task = self.task.execute(task)
-
-        return self.tasksCollection.update_one(
-            {"uid": task.uid},
-            {"$set": task.model_dump()}
-        )
-
-    def _schedule(self):
-        now = datetime.now()
-        raw = self.schedulersCollection.find_one_and_update(
-            {"status": "enabled", "deadline": {"$lte": now}},
-            {"$set": {"status": "processing"}},
-            sort=[("deadline", 1)]
-        )
-
-        if not raw:
-            return
-        
-        scheduler = Scheduler.model_validate(raw)
-        deadline = scheduler.deadline + self.distribution.gen(scheduler.distribution)
-
-        self.tasksCollection.insert_one(
-            scheduler._emit(deadline=deadline).model_dump()
-        )
-
-        self.schedulersCollection.update_one(
-            {"uid": scheduler.uid},
-            {"$set": {"status": "enabled", "deadline": deadline}}
-        )
-
-        if deadline <= datetime.now():
-            pass  # logging.warn(f"{scheduler} is being throtled")
 
     def work(self):
         while True:
-            self._work()
-            self._schedule()
+            self.task._work()
+            self.scheduler._work()
             # print(list(self.tasksCollection.find()))
