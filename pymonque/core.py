@@ -250,6 +250,14 @@ class TaskEngine:
             for name, func in self.functions.items()
         }
 
+        self.createIndexes()
+
+    def createIndexes(self):
+        self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # Make task query blazingly fast
+        self.tasksCollection.create_index([("uid", 1)])
+        self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
+
+
     def _work(self):
         now = datetime.now()
         raw = self.tasksCollection.find_one_and_update(
@@ -373,6 +381,12 @@ class SchedulerEngine:
         self._queue = queue
         self.schedulersCollection: Collection = schedulersCollection or queue.schedulersCollection
         self.taskEngine: TaskEngine = taskEngine or queue.task
+
+        self.createIndexes()
+
+    def createIndexes(self):
+        self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
+        self.schedulersCollection.create_index([("work.functionName", 1), ("status", 1)])
 
     def _work(self):
         now = datetime.now()
@@ -503,13 +517,6 @@ class BaseQueue:
         self.tasksCollection: Collection = queueDB["pymonque_tasks"]
         self.schedulersCollection: Collection = queueDB["pymonque_schedulers"]
 
-        self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # Make task query blazingly fast
-        self.tasksCollection.create_index([("uid", 1)])
-        self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
-
-        self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
-        self.schedulersCollection.create_index([("work.functionName", 1), ("status", 1)])
-        
         self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
         self.task: TaskEngine = TaskEngine(self)
         self.scheduler: SchedulerEngine = SchedulerEngine(self)
