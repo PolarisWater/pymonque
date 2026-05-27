@@ -29,6 +29,8 @@ from pymonque.exceptions import (
     TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
 )
 
+import threading
+
 T = TypeVar("T")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
 SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
@@ -226,11 +228,13 @@ class TaskEngine:
     def __init__(
             self, 
             queue: BaseQueue, 
+            poolInterval: float = 1,
             tasksCollection: Collection | None = None, 
             defaultFactory: TaskFactory | None = None
         ):
 
         self._queue = queue
+        self.poolInterval = poolInterval
         self.tasksCollection: Collection = tasksCollection or queue.tasksCollection
         self.defaultFactory: TaskFactory = defaultFactory or queue.defaultFactory
         self.distributionEngine: DistributionEngine = queue.distribution
@@ -257,7 +261,6 @@ class TaskEngine:
         self.tasksCollection.create_index([("uid", 1)])
         self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
 
-
     def _work(self):
         now = datetime.now()
         raw = self.tasksCollection.find_one_and_update(
@@ -276,6 +279,22 @@ class TaskEngine:
             {"uid": task.uid},
             {"$set": task.model_dump()}
         )
+
+    def work(self):
+        while True:
+            self._work()
+            time.sleep(self.poolInterval)
+
+    def startWorkers(self, workerCount: int):
+        threads = [
+            threading.Thread(
+                target=self.work,
+                daemon=True
+            ) for i in range(workerCount)
+        ]
+
+        for t in threads:
+            t.start()
 
     def execute(self, task: Task) -> Task:
         start = time.perf_counter()
@@ -373,11 +392,13 @@ class Scheduler(TaskFactory):
 class SchedulerEngine:
     def __init__(
             self, 
-            queue: BaseQueue, 
+            queue: BaseQueue,
+            poolInterval: float = 1,
             schedulersCollection: Collection | None = None,
             taskEngine: TaskEngine | None = None
         ):
 
+        self.poolInterval = poolInterval
         self._queue = queue
         self.schedulersCollection: Collection = schedulersCollection or queue.schedulersCollection
         self.taskEngine: TaskEngine = taskEngine or queue.task
@@ -413,6 +434,22 @@ class SchedulerEngine:
 
         if deadline <= datetime.now():
             pass  # logging.warn(f"{scheduler} is being throtled")
+
+    def work(self):
+        while True:
+            self._work()
+            time.sleep(self.poolInterval)
+
+    def startWorkers(self, workerCount: int):
+        threads = [
+            threading.Thread(
+                target=self.work,
+                daemon=True
+            ) for i in range(workerCount)
+        ]
+
+        for t in threads:
+            t.start()
 
     def validate(
             self, 
@@ -533,7 +570,9 @@ class BaseQueue:
         )  # disable Schedulers that emit tasks that cannot be executed
         """
 
-
+    def startWorkers(self, taskWorkers: int, schedulerWorkers: int):
+        self.task.startWorkers(taskWorkers)
+        self.scheduler.startWorkers(schedulerWorkers)
 
     def work(self):
         while True:
