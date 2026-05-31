@@ -1,5 +1,5 @@
-.env
+.pytest_cache
 .venv
-main.py
-__pycache__
-*/__pycache__
+src/pymonque/__pycache__
+tests/__pycache__
+.env

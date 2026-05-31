@@ -21,15 +21,15 @@ import math
 import time
 import uuid
 import traceback
-
+import threading
 import inspect
 
 from pymonque.mongo import MongoModel
+
 from pymonque.exceptions import (
     TaskValidationError, TaskNotFound, DistributionValidationError, DistributionNotFound
 )
 
-import threading
 
 T = TypeVar("T")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
@@ -570,12 +570,11 @@ class BaseQueue:
         )  # disable Schedulers that emit tasks that cannot be executed
         """
 
-    def startWorkers(self, taskWorkers: int, schedulerWorkers: int):
-        self.task.startWorkers(taskWorkers)
-        self.scheduler.startWorkers(schedulerWorkers)
+    def startWorkers(self, taskWorkers: int | None = None, schedulerWorkers: int | None = None):
+        self.task.startWorkers(taskWorkers or 0)
+        self.scheduler.startWorkers(schedulerWorkers or 0)
 
-    def work(self):
+    def _work(self):
         while True:
             self.task._work()
             self.scheduler._work()
-            # print(list(self.tasksCollection.find()))
