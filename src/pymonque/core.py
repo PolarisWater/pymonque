@@ -13,6 +13,7 @@ from types import FunctionType, MethodType
 
 from pymongo.database import Database
 from pymongo.collection import Collection
+from pymongo import UpdateOne
 
 from datetime import datetime, timedelta
 
@@ -227,10 +228,11 @@ class TaskFactory(MongoModel):
 class TaskEngine:
     def __init__(
             self, 
-            queue: BaseQueue, 
-            poolInterval: float = 1,
-            tasksCollection: Collection | None = None, 
-            defaultFactory: TaskFactory | None = None
+            queue:              BaseQueue,
+            tasksCollection:    Collection | None = None,
+            poolInterval:       float = 1,
+            policy:             OVERDUE_TASKS_POLICY = "execute now",
+            defaultFactory:     TaskFactory | None = None
         ):
 
         self._queue = queue
@@ -238,6 +240,7 @@ class TaskEngine:
         self.tasksCollection: Collection = tasksCollection or queue.tasksCollection
         self.defaultFactory: TaskFactory = defaultFactory or queue.defaultFactory
         self.distributionEngine: DistributionEngine = queue.distribution
+        self.policy: OVERDUE_TASKS_POLICY = policy
 
         # resolve tasks and distributions
         self.functions: dict[str, Callable] = {
@@ -256,10 +259,26 @@ class TaskEngine:
 
         self.createIndexes()
 
+    def init(self):
+        now = datetime.now()
+
+        self.tasksCollection.update_many(
+            {"status": "processing"},
+            {"$set": {"status": "canceled"}},
+        )
+
+        if self.policy == "execute now":
+            return
+        
+        if self.policy == "skip":
+            self.tasksCollection.update_many(
+                {"status": "pending", "deadline": {"$lte": now}},
+                {"$set": {"status": "outdated"}},
+            )
+
     def createIndexes(self):
-        self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # Make task query blazingly fast
-        self.tasksCollection.create_index([("uid", 1)])
-        self.tasksCollection.create_index([("work.functionName", 1), ("status", 1), ("factory.uid", 1)])  # Optimize task deletion
+        self.tasksCollection.create_index([("status", 1), ("deadline", 1)])  # _work() claim + init() skip/outdate
+        self.tasksCollection.create_index([("uid", 1)])  # _work() update result
 
     def _work(self):
         now = datetime.now()
@@ -392,27 +411,64 @@ class Scheduler(TaskFactory):
 class SchedulerEngine:
     def __init__(
             self, 
-            queue: BaseQueue,
-            poolInterval: float = 1,
-            schedulersCollection: Collection | None = None,
-            taskEngine: TaskEngine | None = None
+            queue:                  BaseQueue,
+            schedulersCollection:   Collection | None = None,
+            taskEngine:             TaskEngine | None = None,
+            poolInterval:           float = 1,
+            policy:                 OVERDUE_SCHEDULES_POLICY = "execute reconstructed"
         ):
 
-        self.poolInterval = poolInterval
         self._queue = queue
+        self.poolInterval = poolInterval
         self.schedulersCollection: Collection = schedulersCollection or queue.schedulersCollection
         self.taskEngine: TaskEngine = taskEngine or queue.task
+        self.policy: OVERDUE_SCHEDULES_POLICY = policy
 
         self.createIndexes()
 
+    def init(self):
+        now = datetime.now()
+
+        self.schedulersCollection.update_many(
+            {"status": "processing"},
+            {"$set": {"status": "enabled"}}
+        )
+
+        if self.policy == "execute reconstructed":
+            return
+        
+        if self.policy == "execute once":
+            self.schedulersCollection.update_many(
+                {"deadline": {"$lte": now}},
+                {"$set": {"deadline": now}}
+            )
+        
+        if self.policy == "skip":
+            schedulers = [
+                Scheduler.model_validate(raw)
+                for raw in self.schedulersCollection.find(
+                    {"deadline": {"$lte": now}}
+                )
+            ]
+
+            if schedulers:
+                self.schedulersCollection.bulk_write([
+                    UpdateOne(
+                        {"uid": s.uid},
+                        {"$set": {"deadline": now + self.taskEngine.distributionEngine.gen(s.distribution)}}
+                    )
+                    for s in schedulers
+                ])
+
+
     def createIndexes(self):
-        self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])
-        self.schedulersCollection.create_index([("work.functionName", 1), ("status", 1)])
+        self.schedulersCollection.create_index([("status", 1), ("deadline", 1)])  # _work() claim + init() policies
+        self.schedulersCollection.create_index([("uid", 1)])  # _work() update deadline
 
     def _work(self):
         now = datetime.now()
         raw = self.schedulersCollection.find_one_and_update(
-            {"status": "enabled", "deadline": {"$lte": now}},
+            {"deadline": {"$lte": now}, "status": {"$ne": "processing"}},
             {"$set": {"status": "processing"}},
             sort=[("deadline", 1)]
         )
@@ -421,15 +477,17 @@ class SchedulerEngine:
             return
         
         scheduler = Scheduler.model_validate(raw)
-        deadline = scheduler.deadline + self.taskEngine.distributionEngine.gen(scheduler.distribution)
 
-        self.taskEngine.insert(
-            scheduler._emit(deadline=deadline)
-        )
+        if scheduler.status == "enabled":
+            self.taskEngine.insert(
+                scheduler._emit(deadline=scheduler.deadline)
+            )
+
+        deadline = scheduler.deadline + self.taskEngine.distributionEngine.gen(scheduler.distribution)
 
         self.schedulersCollection.update_one(
             {"uid": scheduler.uid},
-            {"$set": {"status": "enabled", "deadline": deadline}}
+            {"$set": {"status": scheduler.status, "deadline": deadline}}
         )
 
         if deadline <= datetime.now():
@@ -536,7 +594,7 @@ class BaseQueue:
         }  # resolve child overrides
 
         return {
-            name: object
+            name: obj
             for name, obj in candidates.items()
             if inspect.isfunction(obj)
             and getattr(obj, "__is_task__", False)
@@ -544,8 +602,12 @@ class BaseQueue:
 
     def __init__(
             self, 
-            queueDB:                Database, 
-            distributionsRegistry:  type[BaseDistributions] = BaseDistributions
+            queueDB:                    Database, 
+            distributionsRegistry:      type[BaseDistributions] = BaseDistributions,
+            taskPoolInterval:           float = 1,
+            schedulerPoolInterval:      float = 1,
+            overdueTaskPolicy:          OVERDUE_TASKS_POLICY = "execute now",
+            overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY = "execute once"
         ):
 
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
@@ -555,8 +617,8 @@ class BaseQueue:
         self.schedulersCollection: Collection = queueDB["pymonque_schedulers"]
 
         self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
-        self.task: TaskEngine = TaskEngine(self)
-        self.scheduler: SchedulerEngine = SchedulerEngine(self)
+        self.task: TaskEngine = TaskEngine(self, poolInterval=taskPoolInterval, policy=overdueTaskPolicy)
+        self.scheduler: SchedulerEngine = SchedulerEngine(self, poolInterval=schedulerPoolInterval, policy=overdueSchedulersPolicy)
 
         """
         self.tasksCollection.update_many(
@@ -569,6 +631,9 @@ class BaseQueue:
             {"$set": {"status": "disabled"}}
         )  # disable Schedulers that emit tasks that cannot be executed
         """
+
+        self.task.init()
+        self.scheduler.init()
 
     def startWorkers(self, taskWorkers: int | None = None, schedulerWorkers: int | None = None):
         self.task.startWorkers(taskWorkers or 0)
