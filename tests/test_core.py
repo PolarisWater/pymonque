@@ -1,4 +1,4 @@
-from pymonque import BaseQueue, Task, task
+from pymonque import BaseQueue, Task, task, utc_now
 
 from mongomock import MongoClient
 from datetime import datetime
@@ -22,7 +22,7 @@ def test_indexes():
 
 def test_scheduling():
     work = q.task("hello", msg="pytest")
-    q.task.schedule(work, deadline=datetime.now())
+    q.task.schedule(work, deadline=utc_now())
     assert len(list(q.task.tasksCollection.find())) >= 1
 
 

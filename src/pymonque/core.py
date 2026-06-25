@@ -15,7 +15,7 @@ from pymongo.database import Database
 from pymongo.collection import Collection
 from pymongo import UpdateOne
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import random
 import math
@@ -38,6 +38,9 @@ SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
 
 OVERDUE_TASKS_POLICY = Literal["skip", "execute now"]
 OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def getStaticmethods(cls: type) -> dict[str, Callable]:
@@ -237,7 +240,7 @@ class TaskEngine:
 
         self._queue = queue
         self.poolInterval = poolInterval
-        self.tasksCollection: Collection = tasksCollection or queue.tasksCollection
+        self.tasksCollection: Collection = tasksCollection  if tasksCollection is not None else queue.tasksCollection
         self.defaultFactory: TaskFactory = defaultFactory or queue.defaultFactory
         self.distributionEngine: DistributionEngine = queue.distribution
         self.policy: OVERDUE_TASKS_POLICY = policy
@@ -260,7 +263,7 @@ class TaskEngine:
         self.createIndexes()
 
     def init(self):
-        now = datetime.now()
+        now = utc_now()
 
         self.tasksCollection.update_many(
             {"status": "processing"},
@@ -281,7 +284,7 @@ class TaskEngine:
         self.tasksCollection.create_index([("uid", 1)])  # _work() update result
 
     def _work(self):
-        now = datetime.now()
+        now = utc_now()
         raw = self.tasksCollection.find_one_and_update(
             {"status": "pending", "deadline": {"$lte": now}},
             {"$set": {"status": "processing"}},
@@ -381,7 +384,7 @@ class TaskEngine:
         ):
 
         self._queue.distribution.validate(distribution)
-        deadline = datetime.now() + self._queue.distribution.gen(distribution)
+        deadline = utc_now() + self._queue.distribution.gen(distribution)
 
         self.schedule(
             work=work,
@@ -420,14 +423,14 @@ class SchedulerEngine:
 
         self._queue = queue
         self.poolInterval = poolInterval
-        self.schedulersCollection: Collection = schedulersCollection or queue.schedulersCollection
+        self.schedulersCollection: Collection = schedulersCollection if schedulersCollection is not None else queue.schedulersCollection
         self.taskEngine: TaskEngine = taskEngine or queue.task
         self.policy: OVERDUE_SCHEDULES_POLICY = policy
 
         self.createIndexes()
 
     def init(self):
-        now = datetime.now()
+        now = utc_now()
 
         self.schedulersCollection.update_many(
             {"status": "processing"},
@@ -466,7 +469,7 @@ class SchedulerEngine:
         self.schedulersCollection.create_index([("uid", 1)])  # _work() update deadline
 
     def _work(self):
-        now = datetime.now()
+        now = utc_now()
         raw = self.schedulersCollection.find_one_and_update(
             {"deadline": {"$lte": now}, "status": {"$ne": "processing"}},
             {"$set": {"status": "processing"}},
@@ -490,7 +493,7 @@ class SchedulerEngine:
             {"$set": {"status": scheduler.status, "deadline": deadline}}
         )
 
-        if deadline <= datetime.now():
+        if deadline <= utc_now():
             pass  # logging.warn(f"{scheduler} is being throtled")
 
     def work(self):
@@ -529,7 +532,7 @@ class SchedulerEngine:
             distribution:   CallSpec
         ):
 
-        deadline = datetime.now() + self.taskEngine.distributionEngine.gen(distribution)
+        deadline = utc_now() + self.taskEngine.distributionEngine.gen(distribution)
 
         self.insert(
             Scheduler(

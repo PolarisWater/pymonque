@@ -2,7 +2,7 @@ from .core import (
     BaseQueue, BaseDistributions, CallSpec,
     Task, TaskFactory, TaskEngine,
     Scheduler, SchedulerEngine,
-    task
+    task, utc_now
 )
 
 import pymonque.exceptions
