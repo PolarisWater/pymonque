@@ -21,8 +21,8 @@ def test_indexes():
 
 
 def test_scheduling():
-    work = q.task("hello", msg="pytest")
-    q.task.schedule(work, deadline=utc_now())
+    work = Queue.hello
+    q.task.schedule(work(msg="a"), deadline=utc_now())
     assert len(list(q.task.tasksCollection.find())) >= 1
 
 

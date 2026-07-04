@@ -118,6 +118,18 @@ class CallSpec(MongoModel):
     def __repr__(self) -> str:
         return f"{self.functionName}({self.kwargs})"
 
+class FuncSpec:
+    def __init__(self, func: Callable):
+        self.__is_task__ = True
+        self._func: Callable = func
+
+    def __call__(self, **kwargs):
+        return CallSpec.new(self._func.__name__, **kwargs)
+
+    def __repr__(self):
+        return repr(self._func)
+
+
 class BaseDistributions:
     @classmethod
     def _getDistributions(cls) -> dict[str, Callable]:
@@ -245,13 +257,11 @@ class TaskEngine:
         self.distributionEngine: DistributionEngine = queue.distribution
         self.policy: OVERDUE_TASKS_POLICY = policy
 
-        # resolve tasks and distributions
+        # resolve tasks
         self.functions: dict[str, Callable] = {
-            **type(self._queue)._getStaticmethodTasks(),
-            **{
-                name: getattr(self._queue, name)
-                for name in type(self._queue)._getInstanceTasks()
-            }
+            name: spec.func if spec.__is_staticmethod__ 
+            else getattr(self._queue, name)
+            for name, spec in type(self._queue)._getTasks().items()
         }
 
         # build kwarg validators
@@ -312,7 +322,7 @@ class TaskEngine:
             threading.Thread(
                 target=self.work,
                 daemon=True
-            ) for i in range(workerCount)
+            ) for _ in range(workerCount)
         ]
 
         for t in threads:
@@ -362,11 +372,12 @@ class TaskEngine:
     def schedule(
             self, 
             work:           CallSpec, 
-            deadline:       datetime,
+            deadline:       datetime | None = None,
             factory:        TaskFactory | None = None
         ):
 
         factory = factory or self.defaultFactory
+        deadline = deadline or utc_now()
 
         self.validate(work)
 
@@ -506,7 +517,7 @@ class SchedulerEngine:
             threading.Thread(
                 target=self.work,
                 daemon=True
-            ) for i in range(workerCount)
+            ) for _ in range(workerCount)
         ]
 
         for t in threads:
@@ -558,50 +569,27 @@ class SchedulerEngine:
             work=work
         )
 
+class task:
+    def __init__(self, func: Callable):
+        self.func: Callable = func.__func__ if isinstance(func, staticmethod) else func
+        self.__is_staticmethod__: bool = isinstance(func, staticmethod)
+        self.__is_task__: bool = True
 
-
-def task(obj):  # task decorator
-    if isinstance(obj, staticmethod):
-        func = obj.__func__
-        setattr(func, "__is_task__", True)
-        return staticmethod(func)
+    def __get__(self, obj, objtype=None) -> Callable:
+        if obj is None:
+            return FuncSpec(self.func)
+        
+        return MethodType(self.func, obj)
     
-    if isinstance(obj, (FunctionType, MethodType)):
-        setattr(obj, "__is_task__", True)
-        return obj
-    
-    raise TypeError(f"@task cannot be applied to {type(obj)}")
-
 class BaseQueue:
     @classmethod
-    def _getStaticmethodTasks(cls) -> dict[str, Callable]:
-        candidates = {
+    def _getTasks(cls) -> dict[str, task]:
+        return {
             name: obj
             for base in reversed(cls.__mro__)
             for name, obj in base.__dict__.items()
+            if getattr(obj, "__is_task__", False)
         }  # resolve child overrides
-
-        return {
-            name: obj.__func__
-            for name, obj in candidates.items()
-            if isinstance(obj, staticmethod)
-            and getattr(obj.__func__, "__is_task__", False)
-        }  # only return static methods marked with the task decorator
-    
-    @classmethod
-    def _getInstanceTasks(cls) -> dict[str, Callable]:
-        candidates = {
-            name: obj
-            for base in reversed(cls.__mro__)
-            for name, obj in base.__dict__.items()
-        }  # resolve child overrides
-
-        return {
-            name: obj
-            for name, obj in candidates.items()
-            if inspect.isfunction(obj)
-            and getattr(obj, "__is_task__", False)
-        }
 
     def __init__(
             self, 
