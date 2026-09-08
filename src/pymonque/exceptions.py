@@ -14,3 +14,12 @@ class DistributionValidationError(Exception):
 class DistributionNotFound(Exception):
     def __init__(self, message: str | None = None):
         super().__init__(message)
+
+class VersionMismatch(Exception):
+    def __init__(self, message: str | None = None):
+        super().__init__(message)
+
+
+class UnboundDocument(Exception):
+    def __init__(self, message: str | None = None):
+        super().__init__(message)

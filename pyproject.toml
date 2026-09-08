@@ -1,7 +1,7 @@
 [project]
 name = "pymonque"
-version = "0.1.0"
-description = "modular task queue running on MongoDB"
+version = "2.0.0"
+description = "a typed MongoDB layer for an application, with a task queue on top"
 readme = "README.md"
 authors = [
     { name = "PolarisWater" }
@@ -21,3 +21,8 @@ dev = [
     "mongomock>=4.3.0",
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-q --strict-markers"
