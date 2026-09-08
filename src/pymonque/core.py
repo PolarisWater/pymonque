@@ -13,7 +13,7 @@ from types import FunctionType, MethodType
 
 from pymongo.database import Database
 from pymongo.collection import Collection
-from pymongo import UpdateOne, ReturnDocument, IndexModel
+from pymongo import ReturnDocument, IndexModel
 from pymongo.errors import DuplicateKeyError
 
 from datetime import datetime, timedelta, timezone
@@ -876,7 +876,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             schedulersCollection:   Collection | str | None = None,
             taskEngine:             TaskEngine | None = None,
             poolInterval:           float = 1,
-            policy:                 OVERDUE_SCHEDULES_POLICY = "execute reconstructed",
+            policy:                 OVERDUE_SCHEDULES_POLICY = "execute once",
             schedulerModel:         type[Scheduler] = Scheduler,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float = LEASE_SECONDS
@@ -930,9 +930,13 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         )
 
     def init(self):
-        """Startup housekeeping. Only run by a process that starts workers."""
+        """Startup housekeeping. Only run by a process that starts workers.
 
-        now = utc_now()
+        The overdue policy is not applied here: a scheduler falls behind while
+        running just as easily as while nothing runs, so _work() applies it every
+        time it claims one.
+        """
+
         self.backfill()
 
         self.schedulersCollection.update_many(
@@ -940,37 +944,9 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             {"$set": {"status": "disabled"}},
         )  # disable schedulers emitting tasks that can no longer be executed
 
-        if self.policy == "execute reconstructed":
-            return
-        
-        if self.policy == "execute once":
-            self.schedulersCollection.update_many(
-                {"deadline": {"$lte": now}},
-                {"$set": {"deadline": now, "leaseUntil": now}}
-            )
-        
-        if self.policy == "skip":
-            schedulers = [
-                self.schedulerModel.model_validate(raw)
-                for raw in self.schedulersCollection.find(
-                    {"deadline": {"$lte": now}}
-                )
-            ]
-
-            if schedulers:
-                self.schedulersCollection.bulk_write([
-                    UpdateOne(
-                        {"uid": s.uid},
-                        {"$set": self._deadline(now + self.taskEngine.distributionEngine.gen(s.distribution))}
-                    )
-                    for s in schedulers
-                ])
-
-
     def createIndexes(self):
         super().createIndexes()  # unique uid: one scheduler per ensure() name
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])  # _work() claim
-        self.collection.create_index([("deadline", 1)])  # init() policies
 
     def _work(self):
         now = utc_now()
@@ -987,25 +963,36 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             return
         
         scheduler = self.schedulerModel.model_validate(raw)
+        interval = self.taskEngine.distributionEngine.gen(scheduler.distribution)
+
+        # A whole beat came and went unworked, so this scheduler cannot keep its
+        # cadence — either nothing was running, or it is set faster than it can be
+        # served. Which is the only moment the policy has anything to say.
+        behind = scheduler.deadline + interval <= now
+        replay = self.policy == "execute reconstructed"
 
         self._hold(scheduler.uid)
         try:
-            if scheduler.status == "enabled":
+            if scheduler.status == "enabled" and not (behind and self.policy == "skip"):
                 self.taskEngine.insert(
                     scheduler._emit(deadline=scheduler.deadline)
                 )
-
-            deadline = scheduler.deadline + self.taskEngine.distributionEngine.gen(scheduler.distribution)
         finally:
             self._releaseHold(scheduler.uid)
+
+        # Only "execute reconstructed" walks the backlog beat by beat. The others
+        # resume from now, so time spent behind is not time owed.
+        deadline = scheduler.deadline + interval if replay or not behind else now + interval
 
         self.schedulersCollection.update_one(
             {"uid": scheduler.uid},
             {"$set": self._deadline(deadline)}
         )
 
-        if deadline <= utc_now():
-            logger.warning("%r is being throttled: its next deadline is already overdue", scheduler)
+        if behind:
+            logger.warning(
+                "%r missed a beat of %s (policy: %s)", scheduler, interval, self.policy
+            )
 
         return scheduler
 

@@ -64,10 +64,11 @@ process pymonque is running, not from inside someone else's server.
 | Second | `os._exit(128 + signum)` immediately |
 | SIGKILL | Cannot be caught. The process dies with work in flight. |
 
-After a SIGKILL, tasks left `processing` are recovered by the startup policies on the next boot
-— which is also why a hard `kill -9` during a deploy costs you whatever was running.
+After a SIGKILL, the leases of whatever was in flight simply lapse and the next worker to poll
+reclaims it. No boot is required, and no other worker is disturbed.
 
-Collections and indexes are created on construction. Startup cleanup runs then too.
+Collections and indexes are created on construction. Startup cleanup is not — it belongs to
+`startWorkers()`. See [Startup housekeeping](#startup-housekeeping).
 
 ## Collections
 
@@ -471,9 +472,9 @@ flight** — any process may connect, enqueue and read at any time.
 
 ## Startup housekeeping
 
-`init()` runs the overdue policies and backfills leases onto documents written by an older
-version. It is called by `startWorkers()` — a process that is actually taking over as a worker —
-and **never by the constructor**.
+`init()` backfills leases onto documents written by an older version, flags tasks whose
+function is gone, and applies the task and pile policies. It is called by `startWorkers()` —
+a process that is actually taking over as a worker — and **never by the constructor**.
 
 ```python
 app = App(db)      # safe from any process, changes nothing
@@ -487,18 +488,26 @@ away from a running worker.
 
 ## Policies
 
-Applied by `init()`, to whatever the last run left behind.
+`overdueTaskPolicy` and `staleItemsPolicy` are applied by `init()`, to whatever the last run
+left behind. `overdueSchedulersPolicy` is applied every time a scheduler is claimed, because a
+scheduler falls behind while an app is running just as easily as while it is down.
 
 | `overdueTaskPolicy` | |
 |---|---|
 | `"execute now"` | run overdue tasks as normal (default) |
 | `"skip"` | mark overdue pending tasks `outdated` |
 
-| `overdueSchedulersPolicy` | |
+| `overdueSchedulersPolicy` | when a whole beat has gone by unworked |
 |---|---|
-| `"execute once"` | pull all overdue deadlines to now, so they fire together (default) |
-| `"execute reconstructed"` | leave them; polling works through them in order |
-| `"skip"` | push each deadline one interval out without emitting |
+| `"execute once"` | emit one task, then resume from now (default) |
+| `"execute reconstructed"` | replay the backlog beat by beat, one per poll |
+| `"skip"` | emit nothing, resume from now |
+
+A scheduler that is merely due — its deadline has passed but the next one has not — emits
+normally under all three. The policy only decides what is owed for beats that were missed.
+`"execute reconstructed"` is the only one that can stay permanently behind: a scheduler set
+faster than its workers can serve it will keep a backlog forever. It logs `missed a beat` on
+every claim so you can see that happening.
 
 | `staleItemsPolicy` | what happens to an item whose holder stopped renewing |
 |---|---|

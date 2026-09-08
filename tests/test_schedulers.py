@@ -1,4 +1,4 @@
-"""SchedulerEngine: emitting on a rhythm, advancing deadlines, and startup policies."""
+"""SchedulerEngine: emitting on a rhythm, advancing deadlines, and falling behind."""
 
 import logging
 from datetime import timedelta
@@ -8,7 +8,7 @@ import pytest
 from pymonque import BaseApp, CallSpec, Scheduler, Task, task, utc_now
 from pymonque.exceptions import TaskNotFound, DistributionNotFound
 
-from conftest import ExampleApp, requiresBulkWrite
+from conftest import ExampleApp
 
 
 HOURLY = {"functionName": "constant", "kwargs": {"dailyFrequency": 24}}
@@ -148,14 +148,24 @@ def test_the_earliest_deadline_fires_first(app, tasks):
     assert tasks.find_one()["work"]["kwargs"]["name"] == "first"
 
 
-def test_a_throttled_scheduler_warns(app, caplog):
+def test_a_scheduler_that_missed_a_beat_warns(app, caplog):
     scheduler = addScheduler(app, dailyFrequency=86400)  # one second apart
     setDeadline(app, scheduler, utc_now() - timedelta(days=1))
 
     with caplog.at_level(logging.WARNING, logger="pymonque"):
         app.scheduler._work()
 
-    assert "throttled" in caplog.text
+    assert "missed a beat" in caplog.text
+
+
+def test_a_scheduler_that_is_merely_due_does_not_warn(app, caplog):
+    scheduler = addScheduler(app)                    # hourly
+    setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        app.scheduler._work()
+
+    assert caplog.text == ""
 
 
 def test_an_emitted_task_is_runnable(app, tasks):
@@ -173,11 +183,10 @@ def test_indexes_back_the_claim_query(app, schedulers):
     keys = [tuple(index["key"]) for index in schedulers.index_information().values()]
 
     assert (("status", 1), ("leaseUntil", 1)) in keys
-    assert (("deadline", 1),) in keys
     assert (("uid", 1),) in keys
 
 
-# --- startup policies ---
+# --- overdue policies, applied every time a scheduler is claimed ---
 
 def test_an_abandoned_scheduler_is_reclaimed_when_its_lease_lapses(db, app, tasks):
     scheduler = addScheduler(app)
@@ -205,42 +214,88 @@ def test_a_scheduler_with_a_live_lease_is_left_alone(db, app):
     assert abs(reload(app, scheduler).leaseUntil - held) < timedelta(milliseconds=100)
 
 
-def test_execute_reconstructed_leaves_deadlines_alone(db, app):
-    scheduler = addScheduler(app)
-    overdue = utc_now() - timedelta(days=2)
-    setDeadline(app, scheduler, overdue)
+def behindByADay(db, policy):
+    """An hourly scheduler that has not been served for a day: 24 beats missed."""
 
-    ExampleApp(db, overdueSchedulersPolicy="execute reconstructed").init()
-
-    assert abs(reload(app, scheduler).deadline - overdue) < timedelta(milliseconds=100)
-
-
-def test_execute_once_compresses_overdue_deadlines_to_now(db, app):
-    old = addScheduler(app, name="old")
-    older = addScheduler(app, name="older")
-    future = addScheduler(app, name="future")
-    setDeadline(app, old, utc_now() - timedelta(days=1))
-    setDeadline(app, older, utc_now() - timedelta(days=5))
-    futureDeadline = future.deadline
-
-    ExampleApp(db, overdueSchedulersPolicy="execute once").init()
-
-    now = utc_now()
-    assert abs(reload(app, old).deadline - now) < timedelta(seconds=1)
-    assert abs(reload(app, older).deadline - now) < timedelta(seconds=1)
-    assert abs(reload(app, future).deadline - futureDeadline) < timedelta(milliseconds=100)
-
-
-@requiresBulkWrite
-def test_skip_pushes_overdue_deadlines_one_interval_out(db, app, tasks):
+    app = ExampleApp(db, overdueSchedulersPolicy=policy)
     scheduler = addScheduler(app, dailyFrequency=24)
     setDeadline(app, scheduler, utc_now() - timedelta(days=1))
 
-    ExampleApp(db, overdueSchedulersPolicy="skip").init()
+    return app, scheduler
+
+
+def test_execute_reconstructed_replays_the_backlog_beat_by_beat(db, tasks):
+    app, scheduler = behindByADay(db, "execute reconstructed")
+    before = reload(app, scheduler).deadline
+
+    app.scheduler._work()
     after = reload(app, scheduler)
 
-    assert tasks.count_documents({}) == 0  # nothing emitted for the missed runs
+    assert tasks.count_documents({}) == 1                    # one missed run, replayed
+    assert abs((after.deadline - before) - timedelta(hours=1)) < timedelta(seconds=1)
+    assert after.deadline < utc_now()                        # still owed 23 more
+
+
+def test_execute_once_emits_one_run_and_resumes_from_now(db, tasks):
+    app, scheduler = behindByADay(db, "execute once")
+
+    app.scheduler._work()
+    after = reload(app, scheduler)
+
+    assert tasks.count_documents({}) == 1                    # the backlog collapses to one
     assert timedelta(minutes=59) < after.deadline - utc_now() < timedelta(minutes=61)
+
+
+def test_skip_emits_nothing_and_resumes_from_now(db, tasks):
+    app, scheduler = behindByADay(db, "skip")
+
+    app.scheduler._work()
+    after = reload(app, scheduler)
+
+    assert tasks.count_documents({}) == 0                    # nothing owed is run
+    assert timedelta(minutes=59) < after.deadline - utc_now() < timedelta(minutes=61)
+
+
+@pytest.mark.parametrize("policy", ["execute reconstructed", "execute once", "skip"])
+def test_a_scheduler_that_is_merely_due_emits_under_every_policy(db, tasks, policy):
+    app = ExampleApp(db, overdueSchedulersPolicy=policy)
+    scheduler = addScheduler(app, dailyFrequency=24)
+    setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
+
+    app.scheduler._work()
+
+    assert tasks.count_documents({}) == 1
+    assert timedelta(minutes=59) < reload(app, scheduler).deadline - utc_now() < timedelta(minutes=61)
+
+
+def test_a_scheduler_set_faster_than_it_can_be_served_stops_accumulating(db, tasks):
+    """The bug this policy exists for: a 1s scheduler down for an hour used to emit
+    an unbounded burst trying to catch up."""
+
+    app = ExampleApp(db, overdueSchedulersPolicy="execute once")
+    scheduler = addScheduler(app, dailyFrequency=86400)      # one second apart
+    setDeadline(app, scheduler, utc_now() - timedelta(hours=1))
+
+    for _ in range(20):
+        app.scheduler._work()
+
+    assert tasks.count_documents({}) == 1                    # not 20, and not 3600
+    assert reload(app, scheduler).deadline > utc_now()       # caught up on the first claim
+
+
+def test_the_policy_still_applies_after_startup(db, tasks):
+    """init() no longer owns the policy, so a scheduler that falls behind while
+    the app is up is treated the same as one that fell behind while it was down."""
+
+    app = ExampleApp(db, overdueSchedulersPolicy="skip")
+    app.init()
+
+    scheduler = addScheduler(app, dailyFrequency=24)
+    setDeadline(app, scheduler, utc_now() - timedelta(days=1))   # fell behind since
+
+    app.scheduler._work()
+
+    assert tasks.count_documents({}) == 0
 
 
 def test_a_scheduler_whose_task_vanished_is_disabled(db, app):

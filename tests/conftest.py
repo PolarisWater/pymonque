@@ -7,7 +7,6 @@ import time
 
 import pytest
 from mongomock import MongoClient
-from pymongo import UpdateOne
 from pydantic import BaseModel
 
 from pymonque import BaseApp, task, pile
@@ -27,27 +26,6 @@ def wait_for(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
         time.sleep(interval)
 
     return bool(predicate())
-
-
-def _bulkWriteSupported() -> bool:
-    collection = MongoClient()["probe"]["probe"]
-    collection.insert_one({"uid": "probe"})
-
-    try:
-        collection.bulk_write([UpdateOne({"uid": "probe"}, {"$set": {"n": 1}})])
-    except Exception:
-        return False
-
-    return True
-
-
-# mongomock 4.3 cannot consume a pymongo 4.17 UpdateOne, so the one branch that
-# uses bulk_write (SchedulerEngine.init under the "skip" policy) is unrunnable
-# here. The test is written anyway and runs as soon as the stack allows it.
-requiresBulkWrite = pytest.mark.skipif(
-    not _bulkWriteSupported(),
-    reason="mongomock cannot run bulk_write with this pymongo version",
-)
 
 
 class Email(BaseModel):
