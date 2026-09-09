@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pydantic import (
     create_model, field_validator, field_serializer, model_validator,
-    ConfigDict, BaseModel, Field, PrivateAttr
+    ConfigDict, BaseModel, Field, PrivateAttr, PositiveFloat
 )
 
 from typing import (
@@ -9,7 +9,7 @@ from typing import (
     get_type_hints, overload
 )
 
-from types import FunctionType, MethodType
+from types import MethodType
 
 from pymongo.database import Database
 from pymongo.collection import Collection
@@ -75,13 +75,30 @@ def getStaticmethods(cls: type) -> dict[str, Callable]:
     }
 
 def buildValidator(func: Callable) -> type[BaseModel]:
+    """A pydantic model of the call's keyword arguments, used to check a CallSpec
+    when it is scheduled rather than when a worker picks it up."""
+
     sig = inspect.signature(func)
-    hints = get_type_hints(func)
+    hints = get_type_hints(func, include_extras=True)
 
     fields = {}
+    extra = "forbid"
 
     for name, param in sig.parameters.items():
-        annotation = hints.get(name, object)
+        # A CallSpec is {functionName, kwargs}, so anything that can only be passed
+        # positionally could never be filled in. Say so where it is written, not on
+        # every call that tries to use it.
+        if param.kind in (param.VAR_POSITIONAL, param.POSITIONAL_ONLY):
+            raise TypeError(
+                f"{func.__name__} takes {'*' if param.kind is param.VAR_POSITIONAL else ''}"
+                f"{name} positionally; a task is called with keyword arguments only"
+            )
+
+        if param.kind is param.VAR_KEYWORD:
+            extra = "allow"     # **kwargs: whatever else is passed is the function's business
+            continue
+
+        annotation = hints.get(name, object)    # unannotated means anything
 
         if param.default is inspect._empty:
             default = ...
@@ -90,11 +107,10 @@ def buildValidator(func: Callable) -> type[BaseModel]:
 
         fields[name] = (annotation, default)
 
-
     return create_model(
         f"{func.__name__}_Args",
         **fields,
-        __config__ = ConfigDict(extra="forbid")
+        __config__ = ConfigDict(extra=extra)
     )
 
 def uuid4str() -> str:
@@ -123,14 +139,29 @@ class Document(BaseModel):
     uid: str = Field(default_factory=uuid4str)
 
     _engine: Any = PrivateAttr(default=None)
+    _storedKey: Any = PrivateAttr(default=None)
 
     def bind(self, engine: CollectionEngine) -> Self:
+        """Remember the engine, and the key this document is stored under.
+
+        Keeping the key is what makes changing one a rename: save() writes over
+        the row it came from instead of leaving the old one behind as a copy.
+        """
+
         self._engine = engine
+        self._storedKey = getattr(self, engine.key, None)
+
         return self
 
     @property
     def bound(self) -> bool:
         return self._engine is not None
+
+    @property
+    def storedKey(self) -> Any:
+        """The key this document was last written under, or None if never written."""
+
+        return self._storedKey
 
     def _requireEngine(self) -> CollectionEngine:
         if self._engine is None:
@@ -145,12 +176,14 @@ class Document(BaseModel):
         return self._requireEngine().save(self)
 
     def delete(self) -> bool:
-        return self._requireEngine().delete(getattr(self, self._requireEngine().key))
+        engine = self._requireEngine()
+
+        return engine.delete(self._storedKey)
 
     def reload(self) -> Self | None:
         engine = self._requireEngine()
 
-        return engine.get(getattr(self, engine.key))
+        return engine.get(self._storedKey)
 
 
 class CollectionEngine(Generic[M]):
@@ -259,10 +292,17 @@ class CollectionEngine(Generic[M]):
         return [d.bind(self) for d in documents]
 
     def save(self, document: M) -> M:
-        """Store the document as it is now, creating it if it is not there yet."""
+        """Store the document as it is now, creating it if it is not there yet.
+
+        A document that came from here is written over the row it came from, so
+        changing its key renames it rather than leaving a copy behind.
+        """
+
+        stored = document.storedKey if document.bound else None
+        match = stored if stored is not None else getattr(document, self.key)
 
         self.collection.replace_one(
-            {self.key: getattr(document, self.key)},
+            {self.key: match},
             document.model_dump(),
             upsert=True
         )
@@ -351,28 +391,31 @@ class BaseDistributions:
     def _getDistributions(cls) -> dict[str, Callable]:
         return getStaticmethods(cls)
     
+    # dailyFrequency is PositiveFloat throughout: zero divides, and a negative
+    # interval walks a scheduler backwards, which no overdue policy can stop.
+
     @staticmethod
-    def constant(dailyFrequency: float) -> timedelta:
+    def constant(dailyFrequency: PositiveFloat) -> timedelta:
         interval_sec = 86400 / dailyFrequency
         return timedelta(seconds=interval_sec)
     
     @staticmethod
-    def normal(dailyFrequency: float, stdFraction: float) -> timedelta:
+    def normal(dailyFrequency: PositiveFloat, stdFraction: float) -> timedelta:
         mean_sec = 86400 / dailyFrequency
         std_sec = mean_sec * stdFraction
         interval_sec = random.gauss(mean_sec, std_sec)
-        interval_sec = max(0, interval_sec)  # avoid negative intervals
-        return timedelta(seconds=interval_sec)
+        # a wide enough spread draws below zero; floor it well clear of it
+        return timedelta(seconds=max(interval_sec, mean_sec / 100))
 
     @staticmethod
-    def lognormal(dailyFrequency: float, sigma: float) -> timedelta:
+    def lognormal(dailyFrequency: PositiveFloat, sigma: float) -> timedelta:
         mean_sec = 86400 / dailyFrequency
         mu = math.log(mean_sec) - (sigma**2)/2
         interval_sec = random.lognormvariate(mu, sigma)
         return timedelta(seconds=interval_sec)
 
     @staticmethod
-    def exponential(dailyFrequency: float) -> timedelta:
+    def exponential(dailyFrequency: PositiveFloat) -> timedelta:
         mean_sec = 86400 / dailyFrequency
         interval_sec = random.expovariate(1 / mean_sec)
         return timedelta(seconds=interval_sec)
@@ -398,10 +441,18 @@ class DistributionEngine:
 
     def gen(self, distribution: CallSpec) -> timedelta:
         delta = distribution(self.functions)
-        if isinstance(delta, timedelta):
-            return delta
-        
-        raise DistributionValidationError(f"distribution {distribution!r} did not return a timedelta")
+
+        if not isinstance(delta, timedelta):
+            raise DistributionValidationError(
+                f"distribution {distribution!r} did not return a timedelta")
+
+        # catches a custom distribution too: a scheduler on a non-positive interval
+        # never moves forward, so it emits on every poll for as long as it exists
+        if delta <= timedelta(0):
+            raise DistributionValidationError(
+                f"distribution {distribution!r} returned {delta}; an interval must be positive")
+
+        return delta
     
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
         obj = CallSpec.new(functionName, **kwargs)
@@ -727,19 +778,15 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             self._releaseHold(task.uid)
 
         try:
-            return self.tasksCollection.update_one(
-                {"uid": task.uid},
-                {"$set": task.model_dump()}
-            )
+            self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
         except Exception:  # e.g. a result the driver cannot encode
             task.status = "failed"
             task.result = None
             task.error = traceback.format_exc()
 
-            return self.tasksCollection.update_one(
-                {"uid": task.uid},
-                {"$set": task.model_dump()}
-            )
+            self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+
+        return task     # truthy, so the worker loop knows not to sleep
 
     def timeoutFor(self, task: Task) -> float | None:
         """Nearest wins: the task's own, then this engine's, then the app's."""
@@ -1422,7 +1469,7 @@ class PileEngine(CollectionEngine):
             status:     ITEM_STATUS,
             result:     Any = None,
             error:      str | None = None
-        ):
+        ) -> bool:
 
         update: dict[str, Any] = {"status": status, "finishedAt": utc_now()}
 
@@ -1432,33 +1479,37 @@ class PileEngine(CollectionEngine):
         if error is not None:
             update["error"] = error
 
+        # matched, not modified: the question is whether there is such an item,
+        # not whether the bytes happened to change
         return self.collection.update_one(
             {"uid": self._uid(item)},
             {"$set": update}
-        )
+        ).matched_count > 0
 
-    def done(self, item: Item | str, result: Any = None):
+    def done(self, item: Item | str, result: Any = None) -> bool:
+        """Mark an item finished. False if there is no such item."""
+
         return self._finish(item, "done", result=result)
 
-    def fail(self, item: Item | str, error: str | None = None):
+    def fail(self, item: Item | str, error: str | None = None) -> bool:
         return self._finish(item, "failed", error=error)
 
-    def release(self, item: Item | str):
+    def release(self, item: Item | str) -> bool:
         """Put a claimed item back on the pile without consuming an outcome."""
 
         return self.collection.update_one(
             {"uid": self._uid(item)},
             # back to its own place in the pile, not the end of it
             [{"$set": {"status": "pending", "claimedAt": None, "leaseUntil": "$createdAt"}}]
-        )
+        ).matched_count > 0
 
-    def renewLease(self, item: Item | str):
+    def renewLease(self, item: Item | str) -> bool:
         """Hold on to an item for another lease period."""
 
         return self.collection.update_one(
             {"uid": self._uid(item)},
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
-        )
+        ).matched_count > 0
 
     def renewLeases(self) -> int:
         """Push back the lease on every item this process is working on."""
@@ -1622,6 +1673,13 @@ class collection:
             extraIndexes:   Sequence[IndexModel] | None = None
         ):
 
+        if not (isinstance(model, type) and issubclass(model, Document)):
+            raise TypeError(
+                f"collection() needs a Document subclass, not {getattr(model, '__name__', model)!r}. "
+                f"A stored model needs a uid and the ability to save itself; "
+                f"subclass pymonque.Document rather than pydantic's BaseModel."
+            )
+
         self.__is_collection__: bool = True
         self.model = model
         self.collection = collection
@@ -1671,6 +1729,12 @@ class schedulers:
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float | None = None
         ):
+
+        if not (isinstance(schedulerModel, type) and issubclass(schedulerModel, Scheduler)):
+            raise TypeError(
+                f"schedulers() needs a Scheduler subclass, not "
+                f"{getattr(schedulerModel, '__name__', schedulerModel)!r}"
+            )
 
         self.__is_schedulers__: bool = True
         self.leaseSeconds = leaseSeconds
@@ -1797,6 +1861,8 @@ class BaseApp:
         self.backlogInterval = backlogInterval
 
         self._stopping: bool = False
+        self._quit = threading.Event()      # what the monitor threads wait on
+        self._monitors: dict[str, threading.Thread] = {}
         self._previousHandlers: dict[int, Any] = {}
 
         self._prepareDB(db)
@@ -1949,8 +2015,7 @@ class BaseApp:
             )
 
     def _watchBacklog(self):
-        while not self._stopping:
-            time.sleep(self.backlogInterval)
+        while not self._quit.wait(self.backlogInterval):
             self._checkWorkers()
 
     def liveWorkers(self) -> list[dict]:
@@ -2011,9 +2076,21 @@ class BaseApp:
         except Exception:
             logger.exception("could not deregister worker")
 
+    def _monitor(self, name: str, target: Callable[[], None]):
+        """Start one background loop, once. A second startWorkers() must not leave
+        a second heartbeat behind."""
+
+        running = self._monitors.get(name)
+
+        if running is not None and running.is_alive():
+            return
+
+        thread = threading.Thread(target=target, name=f"pymonque-{name}", daemon=True)
+        self._monitors[name] = thread
+        thread.start()
+
     def _heartbeat(self):
-        while not self._stopping:
-            time.sleep(self.heartbeatInterval)
+        while not self._quit.wait(self.heartbeatInterval):
 
             try:
                 self.workersCollection.update_one(
@@ -2055,13 +2132,11 @@ class BaseApp:
         """Start workers on the task engine and on every scheduler engine."""
 
         self._stopping = False
+        self._quit.clear()
 
         if self.enforceVersion:
             self._claimVersion()
-
-            threading.Thread(
-                target=self._heartbeat, name="pymonque-heartbeat", daemon=True
-            ).start()
+            self._monitor("heartbeat", self._heartbeat)
 
         self.init()
 
@@ -2078,10 +2153,7 @@ class BaseApp:
 
         if self.backlogWarnAfter is not None:
             self._checkWorkers()    # say it now if the backlog is already old
-
-            threading.Thread(
-                target=self._watchBacklog, name="pymonque-backlog", daemon=True
-            ).start()
+            self._monitor("backlog", self._watchBacklog)
 
     # --- shutting down ---
 
@@ -2097,6 +2169,7 @@ class BaseApp:
         """Stop claiming new work, without waiting for what is in flight."""
 
         self._stopping = True
+        self._quit.set()        # heartbeat and backlog wake immediately
 
         for engine in self.engines:
             engine._stop.set()

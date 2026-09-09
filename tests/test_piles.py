@@ -420,3 +420,29 @@ def test_finished_items_survive_a_restart(db, app):
     ExampleApp(db).init()
 
     assert app.outbox.count(status="done") == 1
+
+
+# --- the api hands back its own values, not the driver's ---
+
+def test_finishing_an_item_reports_whether_it_changed_one(app):
+    item = app.outbox.add(to="a@b.c")
+    app.outbox.claim()
+
+    assert app.outbox.done(item) is True
+    assert app.outbox.done("no-such-uid") is False
+
+
+def test_failing_and_releasing_report_the_same_way(app):
+    item = app.outbox.add(to="a@b.c")
+    app.outbox.claim()
+
+    assert app.outbox.fail(item, error="nope") is True
+    assert app.outbox.release("no-such-uid") is False
+
+
+def test_renewing_a_lease_reports_whether_there_was_one(app):
+    item = app.outbox.add(to="a@b.c")
+    app.outbox.claim()
+
+    assert app.outbox.renewLease(item) is True
+    assert app.outbox.renewLease("no-such-uid") is False

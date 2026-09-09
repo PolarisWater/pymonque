@@ -276,3 +276,25 @@ def test_a_finished_task_is_not_flagged_incompatible(db, app, tasks):
     Smaller(db).init()
 
     assert stored(tasks, "greet").status == "success"
+
+
+def test_working_returns_the_task_it_ran(app, tasks):
+    """Same shape as SchedulerEngine._work, and useful for draining in a loop."""
+
+    stored = app.task.schedule(ExampleApp.greet(name="Ada"))
+    ran = app.task._work()
+
+    assert ran.uid == stored.uid
+    assert ran.status == "success"
+    assert app.task._work() is None      # nothing left
+
+
+def test_a_queue_can_be_drained_by_looping_on_work(app):
+    for name in ("Ada", "Grace", "Alan"):
+        app.task.schedule(ExampleApp.greet(name=name))
+
+    ran = []
+    while (task := app.task._work()) is not None:
+        ran.append(task.status)
+
+    assert ran == ["success"] * 3

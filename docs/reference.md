@@ -135,6 +135,20 @@ One you built by hand is unbound until you store it — `save()` on an unbound d
 `UnboundDocument` rather than guessing where it belongs. `bound` tells you which it is. The
 binding is never written to MongoDB.
 
+A bound document also remembers the key it was stored under, so **changing the key renames it**
+rather than leaving the old row behind as a copy:
+
+```python
+account = app.accounts.create(accountId=1)   # collection(Account, key="accountId")
+account.accountId = 2
+account.save()          # one row, now keyed 2 -- not two rows
+
+account.storedKey       # 2, the key it was last written under
+```
+
+`delete()` and `reload()` use the stored key too, so they act on the row the document came from
+whatever you have since done to the field in memory.
+
 ## Tasks
 
 Declare with `@task`, above `@staticmethod` if you use one:
@@ -154,6 +168,23 @@ class App(BaseApp):
 | `App.send` | `FuncSpec`; call it to build a `CallSpec` |
 | `app.send(...)` | the real function, executed now |
 | `app.task("send", ...)` | a validated `CallSpec`, by name |
+
+**Signatures.** A task is always called with keyword arguments, because a `CallSpec` is
+`{functionName, kwargs}` and has nowhere to put a positional one. So `*args` and positional-only
+parameters raise a `TypeError` when the app class is built, rather than failing every call later.
+`**kwargs` is fine — the named parameters are still checked and anything else is passed through.
+
+Arguments are validated against the signature when you **schedule**, not when a worker picks the
+task up. Unannotated parameters accept anything; annotated ones are checked by pydantic, so a
+constraint declared on the parameter is enforced at schedule time:
+
+```python
+@task
+@staticmethod
+def retain(days: Annotated[int, Field(gt=0)]): ...
+
+app.task.schedule(App.retain(days=0))    # TaskValidationError, before it is ever stored
+```
 
 ### TaskEngine
 
@@ -387,7 +418,10 @@ status. `processing` is no longer written and remains only so older documents va
 
 ## Distributions
 
-All take `dailyFrequency` — average runs per day — and return a `timedelta`.
+All take `dailyFrequency` — average runs per day — and return a `timedelta`. It must be
+positive: zero divides, and a negative interval walks a scheduler backwards, which no overdue
+policy can stop. `DistributionValidationError` either way, and `gen()` rejects a non-positive
+interval from a custom distribution too.
 
 | Name | Extra argument |
 |---|---|
@@ -411,7 +445,8 @@ class MyDistributions(BaseDistributions):
 app = App(db, distributionsRegistry=MyDistributions)
 ```
 
-Staticmethods only, not starting with `_`. Built-ins stay available.
+Staticmethods only, not starting with `_`. Built-ins stay available. Yours must return a
+positive `timedelta`.
 
 ## Piles
 
@@ -433,9 +468,9 @@ Each pile gets `pymonque_pile_<name>` unless told otherwise.
 | `addMany(iterable)` | Insert many; validates all before inserting any. |
 | `claim(where=None)` | Atomically take the oldest pending item, or `None`. |
 | `work(where=None)` | Context manager: claim, then done, or failed if the block raises. |
-| `done(item, result=None)` | |
-| `fail(item, error=None)` | |
-| `release(item)` | Put it back as pending. |
+| `done(item, result=None)` | `True`, or `False` if there is no such item. |
+| `fail(item, error=None)` | Same. |
+| `release(item)` | Put it back as pending. Same. |
 | `count(where=None, status=None)` / `counts()` | |
 | `find(where=None)` | `list[Item]`. |
 | `purge(status="done")` | Delete, return how many. |
