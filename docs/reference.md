@@ -510,8 +510,8 @@ distributions, and the policy on every engine. It does **not** see a changed fun
 every transitive dependency. It is a guard against the obvious mistake, not a proof of identity.
 The rule is the guarantee; the hash only enforces the part of it that is mechanically checkable.
 
-Constructing an app is never refused — only starting workers is. Any process may enqueue tasks
-and query results regardless of version.
+Constructing an app is never refused — only starting workers and running housekeeping are. Any
+process may enqueue tasks and query results regardless of version.
 
 ## Leases
 
@@ -544,19 +544,40 @@ flight** — any process may connect, enqueue and read at any time.
 
 ## Startup housekeeping
 
-`init()` backfills leases onto documents written by an older version, flags tasks whose
-function is gone, and applies the task and pile policies. It is called by `startWorkers()` —
-a process that is actually taking over as a worker — and **never by the constructor**.
-
 ```python
-app = App(db)      # safe from any process, changes nothing
+app = App(db)           # safe from any process, changes nothing
 app.startWorkers(4)     # runs init(), then starts working
 app.init()              # or call it yourself
 ```
 
-That split is what keeps an API process, a CLI script and a worker container able to share one
-database. Everything `init()` still does is scoped to documents nobody holds, so it cannot take work
-away from a running worker.
+`init()` is called by `startWorkers()` — a process that is actually taking over as a worker —
+and **never by the constructor**. That split is what keeps an API process, a CLI script and a
+worker container able to share one database.
+
+Almost nothing is left in it, because a condition that can change while an app is running is
+resolved where it is observed rather than at boot:
+
+| condition | when it can change | resolved |
+|---|---|---|
+| a scheduler fell behind | continuously | at the claim |
+| a worker died holding a pile item | continuously | at the claim |
+| a lease lapsed | continuously | at the claim |
+| **the set of tasks that exist** | **only at boot** | **`init()`** |
+| a task is overdue, under `"skip"` | continuously | `init()` — the [open one](#policies) |
+
+What `init()` still does:
+
+- **backfills `leaseUntil`** onto documents written before leases existed
+- **flags pending tasks whose function is gone** as `incompatible`, and **disables schedulers**
+  that emit one
+
+Those two belong at boot rather than at a claim, and not as a compromise: the fingerprint forces
+a full restart to change an app's task list, so boot is the only moment that set can change.
+
+`init()` is **version-checked**, like `startWorkers()`. It decides what is runnable from *this*
+process's task list, so a process holding a different one must not run it — otherwise a script
+importing half the app could disable a live deployment's schedulers. Everything it does is
+otherwise scoped to documents nobody holds, so it cannot take work from a running worker.
 
 ## Policies
 
@@ -629,7 +650,7 @@ for raw in app.task.tasksCollection.find({"status": "failed"}):
 | `TaskTimeout` | raised inside `execute()` when a task outlives its limit; recorded as status `timeout` |
 | `DistributionNotFound` | no such distribution in the registry |
 | `DistributionValidationError` | bad kwargs, or it didn't return a `timedelta` |
-| `VersionMismatch` | `startWorkers()` found a live worker on a different fingerprint |
+| `VersionMismatch` | `startWorkers()` or `init()` found a live worker on a different fingerprint |
 | `UnboundDocument` | `save()`/`delete()`/`reload()` on a document with no engine |
 
 ## Notes

@@ -246,3 +246,66 @@ def test_a_policy_mismatch_cannot_run_workers_alongside(db):
 def test_a_policy_is_not_a_constructor_argument(db):
     with pytest.raises(TypeError):
         ExampleApp(db, staleItemsPolicy="fail")
+
+
+# --- housekeeping is guarded the same as starting workers ---
+
+def test_init_is_refused_when_a_different_version_is_live(db):
+    """init() decides what is runnable from this process's task list, so a process
+    holding a different one must not run it."""
+
+    full = V1(db)
+    full.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        with pytest.raises(VersionMismatch):
+            V2Signature(db).init()
+    finally:
+        full.stopWorkers()
+
+
+def test_a_refused_process_cannot_disable_another_versions_scheduler(db):
+    full = ExampleApp(db)
+    full.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        stored = full.scheduler.ensure(
+            "nightly", ExampleApp.greet(name="Ada"),
+            full.distribution("constant", dailyFrequency=1),
+        )
+
+        class Smaller(BaseApp):
+            @task
+            @staticmethod
+            def other() -> None: return None
+
+        with pytest.raises(VersionMismatch):
+            Smaller(db).init()
+
+        assert full.scheduler.byUid(stored.uid).status == "enabled"
+    finally:
+        full.stopWorkers()
+
+
+def test_init_is_allowed_when_nothing_else_is_running(db):
+    ExampleApp(db).init()      # the ordinary case: no live worker to disagree with
+
+
+def test_init_is_allowed_alongside_the_same_version(db):
+    running = ExampleApp(db)
+    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        ExampleApp(db).init()
+    finally:
+        running.stopWorkers()
+
+
+def test_enforcement_off_skips_the_check_for_init_too(db):
+    running = ExampleApp(db)
+    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        V2Signature(db, enforceVersion=False).init()      # opted out, so unguarded
+    finally:
+        running.stopWorkers()

@@ -1961,8 +1961,13 @@ class BaseApp:
             {"_id": 0}
         ))
 
-    def _claimVersion(self):
-        """Refuse to start if a live worker is running different code."""
+    def _verifyVersion(self):
+        """Raise if a live worker is running different code.
+
+        Anything that writes on other processes' behalf goes through here, not
+        just startWorkers(): housekeeping decided by this process's task list is
+        only safe if this process's task list is everyone's.
+        """
 
         fingerprint = self.fingerprint
 
@@ -1979,11 +1984,16 @@ class BaseApp:
                 f"stop the old workers before starting these."
             )
 
+    def _claimVersion(self):
+        """Verify, then register this process as a worker."""
+
+        self._verifyVersion()
+
         self.workersCollection.update_one(
             {"uid": self.workerUid},
             {"$set": {
                 "uid":          self.workerUid,
-                "fingerprint":  fingerprint,
+                "fingerprint":  self.fingerprint,
                 "host":         HOSTNAME,
                 "pid":          os.getpid(),
                 "startedAt":    utc_now(),
@@ -2018,11 +2028,17 @@ class BaseApp:
         return [self.task, *self.schedulerEngines.values()]
 
     def init(self):
-        """Startup housekeeping: backfill leases and apply the overdue policies.
+        """Startup housekeeping: backfill leases, and resolve documents whose task
+        no longer exists on this app.
 
         Run by startWorkers(), not by the constructor — a process that only
-        enqueues or reads must never disturb what the workers are doing.
+        enqueues or reads must never disturb what the workers are doing. It is
+        version-checked for the same reason: it decides what is runnable from this
+        process's task list, so a process holding a different one must not run it.
         """
+
+        if self.enforceVersion:
+            self._verifyVersion()
 
         self.task.init()
 
