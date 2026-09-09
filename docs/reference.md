@@ -159,11 +159,13 @@ class App(BaseApp):
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None)` | Store a task. Deadline defaults to now. |
-| `scheduleFromDistribution(work, distribution, factory=None)` | Deadline is now + one interval. |
+| `schedule(work, deadline=None, factory=None, timeout=None)` | Store a task, and return it. Deadline defaults to now. |
+| `scheduleFromDistribution(work, distribution, factory=None, timeout=None)` | Deadline is now + one interval. |
 | `__call__(functionName, **kwargs)` | Build and validate a `CallSpec`. |
 | `validate(work)` | Raises `TaskNotFound` / `TaskValidationError`. |
 | `execute(task)` | Run one task, return it filled in. |
+| `timeoutFor(task)` | The limit that applies to it. |
+| `backlog()` | `(due, secondsTheOldestHasWaited)` — on `BaseApp`. |
 | `startWorkers(n)` | Poll, claim, execute. |
 
 Claiming is `find_one_and_update` on `{status: "pending", deadline: {$lte: now}}` sorted by
@@ -174,17 +176,19 @@ deadline, so the oldest due task goes first and no task runs twice.
 | Field | Type |
 |---|---|
 | `uid` | `str` |
-| `status` | `pending` `processing` `success` `failed` `canceled` `outdated` `incompatible` |
+| `status` | `pending` `processing` `success` `failed` `timeout` `canceled` `outdated` `incompatible` |
 | `work` | `CallSpec` |
 | `deadline` | `datetime` (naive UTC) |
 | `factory` | `TaskFactory` — `{uid, name}` |
 | `executionTime` | `timedelta`, stored as seconds |
 | `result` | anything BSON can encode |
 | `error` | traceback, on failure |
+| `timeout` | `float` seconds, or `None` for the engine's |
 
 ```
 pending ─→ processing ─→ success
-                ├──────→ failed
+                ├──────→ failed        the call raised
+                ├──────→ timeout       the call outlived its limit
                 └──────→ processing    lease lapsed; another worker claimed it
 
 pending ─→ outdated       overdue, under the "skip" policy
@@ -195,6 +199,67 @@ pending ─→ incompatible   the function no longer exists on the app
 cancelled at startup. It stays in the type so older documents still validate.
 
 A result the driver cannot encode is stored as a `failed` task, not left claimed.
+
+## Timeouts
+
+A task runs without a limit unless one is set. Three places can set one, and the **nearest wins**:
+
+```python
+class App(BaseApp):
+    taskTimeout = 300               # app: the outermost limit
+
+app.task.timeout = 60               # engine
+app.task.schedule(App.big(), timeout=900)   # task: wins over both, tighter or looser
+```
+
+A scheduler stamps its own onto everything it emits:
+
+```python
+app.scheduler.add(App.sync(), daily, timeout=120)
+```
+
+When the limit passes, the task is written `timeout` with the reason in `error`, the worker is
+freed, and a warning is logged. **The call itself is not interrupted** — Python cannot do that —
+so it runs on in a daemon thread until it returns. What a timeout guarantees is that the worker
+and the document stop waiting on it, which is what every other process can see. A task that must
+actually stop needs to check something itself.
+
+With no timeout set, the call runs on the worker thread exactly as before; the extra thread only
+appears when a limit applies.
+
+Timeouts are part of the [fingerprint](#one-version-at-a-time), like the policies: whether a task
+ends up `timeout` must not depend on which process picked it up.
+
+## Not enough workers
+
+`BaseApp` watches how long work sits due. A free worker claims within one poll interval, so
+anything waiting much longer means every worker is busy.
+
+```python
+app.backlog()       # (4, 31.2) -- four due, oldest waiting 31 seconds
+app.taskWorkers()   # task workers across every process that has checked in
+```
+
+Once the oldest has waited `backlogWarnAfter` seconds, it says so, at `startWorkers()` and every
+`backlogInterval` after:
+
+```
+4 task(s) due, oldest waiting 31s, 2 task worker(s) running -- not enough workers,
+or they are all on long tasks
+
+4 task(s) due, oldest waiting 31s, and no process is running task workers
+```
+
+| | |
+|---|---|
+| `backlogWarnAfter=60` | seconds due work may wait before warning. `None` turns it off |
+| `backlogInterval=30` | seconds between checks |
+
+The count spans processes — a scheduler-only box reports the workers on the worker boxes, not
+zero. That needs `enforceVersion=True` (the default), since that is what registers a process;
+without it the count is local.
+
+Schedulers have their own version of this: one that cannot keep its cadence logs `missed a beat`.
 
 ### TaskFactory
 
@@ -561,6 +626,7 @@ for raw in app.task.tasksCollection.find({"status": "failed"}):
 |---|---|
 | `TaskNotFound` | no such task on the app |
 | `TaskValidationError` | kwargs don't match the signature |
+| `TaskTimeout` | raised inside `execute()` when a task outlives its limit; recorded as status `timeout` |
 | `DistributionNotFound` | no such distribution in the registry |
 | `DistributionValidationError` | bad kwargs, or it didn't return a `timedelta` |
 | `VersionMismatch` | `startWorkers()` found a live worker on a different fingerprint |

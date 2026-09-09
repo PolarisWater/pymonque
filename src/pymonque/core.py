@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from pymonque.exceptions import (
     TaskValidationError, TaskNotFound,
     DistributionValidationError, DistributionNotFound,
-    VersionMismatch, UnboundDocument
+    VersionMismatch, UnboundDocument, TaskTimeout
 )
 
 
@@ -45,7 +45,7 @@ logger = logging.getLogger("pymonque")
 T = TypeVar("T")
 P = TypeVar("P")
 M = TypeVar("M", bound="Document")
-TASK_STATUS = Literal["pending", "success", "processing", "failed", "canceled", "outdated", "incompatible"]
+TASK_STATUS = Literal["pending", "success", "processing", "failed", "timeout", "canceled", "outdated", "incompatible"]
 # "processing" is no longer written — a scheduler being worked is one with a live
 # lease. It stays in the type so documents from older versions still validate.
 SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
@@ -56,6 +56,8 @@ OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructe
 STALE_ITEMS_POLICY = Literal["retry", "fail"]
 
 LEASE_SECONDS = 300         # how long a claim is held before it is considered abandoned
+BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobody is free
+BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshold disables them
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
 HOSTNAME = socket.gethostname()
@@ -421,6 +423,10 @@ class Task(Document):
     result:         Any | None          = None
     error:          str | None          = None
 
+    # seconds this call may run for before it is written off. None means the
+    # engine's, and the engine's None means the app's. Nearest wins.
+    timeout:        float | None        = None
+
     @model_validator(mode="after")
     def defaultLease(self):
         if self.leaseUntil is None:
@@ -454,13 +460,15 @@ class TaskFactory(Document):
     def _emit(
             self, 
             work:       CallSpec,
-            deadline:   datetime
+            deadline:   datetime,
+            timeout:    float | None = None
         ) -> Task:
 
         return Task(
             work=work,
             deadline=deadline, 
-            factory=self
+            factory=self,
+            timeout=timeout
         )
     
     def __repr__(self) -> str:
@@ -478,6 +486,7 @@ class WorkerLoop:
     leaseSeconds: float
 
     def _initWorkers(self):
+        self.workerCount: int = 0
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._held: set[str] = set()
@@ -559,6 +568,7 @@ class WorkerLoop:
         if workerCount <= 0:
             return
 
+        self.workerCount += workerCount
         self._stop.clear()
 
         threads = [
@@ -598,6 +608,9 @@ class WorkerLoop:
 
         self._threads = [t for t in self._threads if t.is_alive()]
 
+        if not self._threads:
+            self.workerCount = 0
+
         return not self._threads
 
 
@@ -613,11 +626,13 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             defaultFactory:     TaskFactory | None = None,
             leaseSeconds:       float = LEASE_SECONDS,
             taskModel:          type[Task] = Task,
-            extraIndexes:       Sequence[IndexModel] | None = None
+            extraIndexes:       Sequence[IndexModel] | None = None,
+            timeout:            float | None = None
         ):
 
         self.poolInterval = poolInterval
         self.leaseSeconds = leaseSeconds
+        self.timeout: float | None = timeout if timeout is not None else app.taskTimeout
         self.defaultFactory: TaskFactory = defaultFactory or app.defaultFactory
         self.distributionEngine: DistributionEngine = app.distribution
         self.policy: OVERDUE_TASKS_POLICY = policy
@@ -726,11 +741,59 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 {"$set": task.model_dump()}
             )
 
+    def timeoutFor(self, task: Task) -> float | None:
+        """Nearest wins: the task's own, then this engine's, then the app's."""
+
+        return task.timeout if task.timeout is not None else self.timeout
+
+    def _callWithTimeout(self, task: Task, timeout: float) -> Any:
+        """Run the call, and give up waiting for it after `timeout` seconds.
+
+        Python cannot interrupt a running call, so the thread is left to finish in
+        its own time — it is a daemon and does not hold the process open. What the
+        timeout guarantees is that the *worker* is freed and the task is written
+        off, which is the part every other process can see.
+        """
+
+        outcome: dict[str, Any] = {}
+
+        def run():
+            try:
+                outcome["result"] = task.work(self.functions)
+            except BaseException as e:      # carried back to the claiming thread
+                outcome["error"] = e
+
+        thread = threading.Thread(
+            target=run, name=f"pymonque-task-{task.work.functionName}", daemon=True
+        )
+        thread.start()
+        thread.join(timeout)
+
+        if thread.is_alive():
+            raise TaskTimeout(
+                f"{task.work.functionName} did not finish within {timeout}s and was "
+                f"written off; the call itself cannot be interrupted and may still be running"
+            )
+
+        if "error" in outcome:
+            raise outcome["error"]
+
+        return outcome.get("result")
+
     def execute(self, task: Task) -> Task:
+        timeout = self.timeoutFor(task)
         start = time.perf_counter()
+
         try:
-            task.result = task.work(self.functions)
+            task.result = (
+                task.work(self.functions) if timeout is None
+                else self._callWithTimeout(task, timeout)
+            )
             task.status = "success"
+        except TaskTimeout as e:
+            task.status = "timeout"
+            task.error = str(e)
+            logger.warning("%r timed out after %ss", task, timeout)
         except Exception:
             task.status = "failed"
             task.error = traceback.format_exc()
@@ -752,13 +815,15 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             self, 
             work:           CallSpec,
             deadline:       datetime, 
-            factory:        TaskFactory
-        ):
+            factory:        TaskFactory,
+            timeout:        float | None = None
+        ) -> Task:
 
-        self.insert(
+        return self.insert(
             factory._emit(
                 deadline=deadline,
-                work=work
+                work=work,
+                timeout=timeout
             ) 
         )
 
@@ -798,34 +863,40 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             self, 
             work:           CallSpec, 
             deadline:       datetime | None = None,
-            factory:        TaskFactory | None = None
-        ):
+            factory:        TaskFactory | None = None,
+            timeout:        float | None = None
+        ) -> Task:
+
+        """Queue one call. `timeout` overrides the engine's and the app's."""
 
         factory = factory or self.defaultFactory
         deadline = deadline or utc_now()
 
         self.validate(work)
 
-        self._add(
+        return self._add(
             work=work,
             deadline=deadline, 
-            factory=factory
+            factory=factory,
+            timeout=timeout
         )
 
     def scheduleFromDistribution(
             self,
             work:           CallSpec,
             distribution:   CallSpec,
-            factory:        TaskFactory | None = None
-        ):
+            factory:        TaskFactory | None = None,
+            timeout:        float | None = None
+        ) -> Task:
 
         self._app.distribution.validate(distribution)
         deadline = utc_now() + self._app.distribution.gen(distribution)
 
-        self.schedule(
+        return self.schedule(
             work=work,
             deadline=deadline,
-            factory=factory
+            factory=factory,
+            timeout=timeout
         )
 
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
@@ -841,6 +912,7 @@ class Scheduler(TaskFactory):
     distribution:   CallSpec
     deadline:       datetime
     leaseUntil:     datetime | None     = None
+    timeout:        float | None        = None   # stamped onto every task it emits
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -862,7 +934,7 @@ class Scheduler(TaskFactory):
         return self.work
 
     def _emit(self, deadline: datetime) -> Task:
-        return super()._emit(self.emitWork(), deadline)
+        return super()._emit(self.emitWork(), deadline, self.timeout)
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work!r}"
@@ -1694,6 +1766,10 @@ class BaseApp:
     overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
     staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
 
+    # Seconds a task may run before it is written off. None means no limit — a
+    # task engine or an individual task may set a nearer one, never a looser.
+    taskTimeout:                float | None              = None
+
     def __init__(
             self, 
             db:                    Database, 
@@ -1703,7 +1779,9 @@ class BaseApp:
             leaseSeconds:               float = LEASE_SECONDS,
             enforceVersion:             bool = True,
             heartbeatInterval:          float = HEARTBEAT_INTERVAL,
-            workerStaleAfter:           float = WORKER_STALE_AFTER
+            workerStaleAfter:           float = WORKER_STALE_AFTER,
+            backlogWarnAfter:           float | None = BACKLOG_WARN_AFTER,
+            backlogInterval:            float = BACKLOG_INTERVAL
         ):
 
         self.defaultFactory: TaskFactory = TaskFactory(name="default")
@@ -1713,6 +1791,10 @@ class BaseApp:
         self.heartbeatInterval = heartbeatInterval
         self.workerStaleAfter = workerStaleAfter
         self.workerUid: str = uuid4str()
+
+        # local diagnostics, not shared behaviour: two processes may log differently
+        self.backlogWarnAfter = backlogWarnAfter
+        self.backlogInterval = backlogInterval
 
         self._stopping: bool = False
         self._previousHandlers: dict[int, Any] = {}
@@ -1798,7 +1880,78 @@ class BaseApp:
             for engine in (self.task, *self.schedulerEngines.values(), *self.piles.values())
         ]
 
+        parts.append(f"taskTimeout:{self.task.timeout}")
+
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
+
+    # --- is anyone keeping up ---
+
+    def backlog(self) -> tuple[int, float]:
+        """Work that is due and nobody has picked up, and how long the oldest piece
+        has been waiting.
+
+        A free worker claims within one poll interval, so anything waiting much
+        longer than that means every worker is busy.
+        """
+
+        now = utc_now()
+        due = {
+            "status": {"$in": ["pending", "processing"]},
+            "leaseUntil": {"$lte": now},
+            "work.functionName": {"$in": list(self.task.functions)},
+        }
+
+        count = self.task.tasksCollection.count_documents(due)
+
+        if not count:
+            return 0, 0.0
+
+        oldest = self.task.tasksCollection.find_one(due, sort=[("leaseUntil", 1)])
+
+        return count, (now - oldest["leaseUntil"]).total_seconds()
+
+    def taskWorkers(self) -> int:
+        """Task workers across every process that has checked in.
+
+        A scheduler-only process runs none of its own, so counting locally would
+        cry wolf at a perfectly good deployment. Falls back to this process alone
+        when it is not registering.
+        """
+
+        if not self.enforceVersion:
+            return self.task.workerCount
+
+        return sum(w.get("taskWorkers", 0) for w in self.liveWorkers())
+
+    def _checkWorkers(self):
+        """Say plainly when there is work due and nobody free to take it."""
+
+        try:
+            due, waiting = self.backlog()
+            workers = self.taskWorkers()
+        except Exception:
+            logger.exception("backlog check failed")
+            return
+
+        if waiting < self.backlogWarnAfter:
+            return
+
+        if workers:
+            logger.warning(
+                "%d task(s) due, oldest waiting %.0fs, %d task worker(s) running — "
+                "not enough workers, or they are all on long tasks",
+                due, waiting, workers
+            )
+        else:
+            logger.warning(
+                "%d task(s) due, oldest waiting %.0fs, and no process is running task workers",
+                due, waiting
+            )
+
+    def _watchBacklog(self):
+        while not self._stopping:
+            time.sleep(self.backlogInterval)
+            self._checkWorkers()
 
     def liveWorkers(self) -> list[dict]:
         """Worker processes that have checked in recently."""
@@ -1835,6 +1988,7 @@ class BaseApp:
                 "pid":          os.getpid(),
                 "startedAt":    utc_now(),
                 "lastSeen":     utc_now(),
+                "taskWorkers":  0,      # filled in once the engines are up
             }},
             upsert=True
         )
@@ -1899,6 +2053,19 @@ class BaseApp:
 
         for engine in self.schedulerEngines.values():
             engine.startWorkers(schedulerWorkers or 0)
+
+        if self.enforceVersion:
+            self.workersCollection.update_one(
+                {"uid": self.workerUid},
+                {"$set": {"taskWorkers": self.task.workerCount}}
+            )
+
+        if self.backlogWarnAfter is not None:
+            self._checkWorkers()    # say it now if the backlog is already old
+
+            threading.Thread(
+                target=self._watchBacklog, name="pymonque-backlog", daemon=True
+            ).start()
 
     # --- shutting down ---
 
