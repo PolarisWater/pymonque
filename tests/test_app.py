@@ -182,12 +182,12 @@ def test_pool_intervals_reach_the_engines(db):
 
 
 def test_policies_reach_the_engines(db):
-    app = ExampleApp(
-        db,
-        overdueTaskPolicy="skip",
-        overdueSchedulersPolicy="execute once",
-        staleItemsPolicy="fail",
-    )
+    class App(ExampleApp):
+        overdueTaskPolicy       = "skip"
+        overdueSchedulersPolicy = "execute once"
+        staleItemsPolicy        = "fail"
+
+    app = App(db)
 
     assert app.task.policy == "skip"
     assert app.scheduler.policy == "execute once"

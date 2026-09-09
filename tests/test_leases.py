@@ -9,7 +9,7 @@ import pytest
 
 from pymonque import BaseApp, Task, task, pile, utc_now
 
-from conftest import ExampleApp, wait_for
+from conftest import ExampleApp, appWith, wait_for
 
 
 held = threading.Event()
@@ -148,16 +148,17 @@ def test_a_new_instance_does_not_disturb_work_in_flight(long, db):
 
 
 def test_constructing_a_app_runs_no_housekeeping(db):
-    app = ExampleApp(db, overdueTaskPolicy="skip")
+    app = appWith(ExampleApp, db, overdueTaskPolicy="skip")
     app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
 
-    ExampleApp(db, overdueTaskPolicy="skip")     # would have outdated it before
+    appWith(ExampleApp, db, overdueTaskPolicy="skip")   # would have outdated it before
 
     assert app.task.tasksCollection.find_one()["status"] == "pending"
 
 
 def test_starting_workers_does_run_it(db):
-    app = ExampleApp(db, overdueTaskPolicy="skip", enforceVersion=False)
+    app = appWith(ExampleApp, db, overdueTaskPolicy="skip",
+                  _kwargs={"enforceVersion": False})
     app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
 
     app.startWorkers(taskWorkers=0, schedulerWorkers=0)

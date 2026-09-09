@@ -3,16 +3,23 @@
 ## BaseApp
 
 ```python
+class App(BaseApp):
+    overdueTaskPolicy       = "execute now"     # policies are declared, not passed
+    overdueSchedulersPolicy = "execute once"
+    staleItemsPolicy        = "retry"
+
 app = App(
     db,                                         # pymongo Database
     distributionsRegistry   = BaseDistributions,
     taskPoolInterval        = 1,                # seconds between polls
     schedulerPoolInterval   = 1,
-    overdueTaskPolicy       = "execute now",
-    overdueSchedulersPolicy = "execute once",
-    staleItemsPolicy        = "retry",
 )
 ```
+
+Policies are class attributes, never constructor arguments: every process that imports this app
+has to agree on them, or one would retry a stale item while another failed it. They are part of
+the [fingerprint](#one-version-at-a-time), so two that disagree cannot both run workers.
+Pacing and lease lengths are per-process and stay arguments.
 
 | Attribute | What |
 |---|---|
@@ -434,7 +441,7 @@ Workers check in every `heartbeatInterval` seconds and are considered gone after
 cleanup — and a crashed process frees its slot within a minute.
 
 **What the fingerprint can and cannot see.** It sees added, removed, or re-signatured tasks and
-distributions. It does **not** see a changed function body, and cannot: that would require hashing
+distributions, and the policy on every engine. It does **not** see a changed function body, and cannot: that would require hashing
 every transitive dependency. It is a guard against the obvious mistake, not a proof of identity.
 The rule is the guarantee; the hash only enforces the part of it that is mechanically checkable.
 
@@ -488,9 +495,15 @@ away from a running worker.
 
 ## Policies
 
-`overdueTaskPolicy` and `staleItemsPolicy` are applied by `init()`, to whatever the last run
-left behind. `overdueSchedulersPolicy` is applied every time a scheduler is claimed, because a
-scheduler falls behind while an app is running just as easily as while it is down.
+Declared on the app class, and applied where their condition is observed rather than at boot —
+a scheduler falls behind, and a worker dies holding an item, while an app is running just as
+easily as while it is down.
+
+| policy | applied |
+|---|---|
+| `overdueSchedulersPolicy` | every time a scheduler is claimed |
+| `staleItemsPolicy` | every time a pile is claimed from (and at `init()`, for a pile nothing claims from) |
+| `overdueTaskPolicy` | `init()` only — see the note below |
 
 | `overdueTaskPolicy` | |
 |---|---|
@@ -512,7 +525,15 @@ every claim so you can see that happening.
 | `staleItemsPolicy` | what happens to an item whose holder stopped renewing |
 |---|---|
 | `"retry"` | it becomes claimable again on its own (default) — no sweep needed |
-| `"fail"` | it is never retried, and `init()` marks it failed |
+| `"fail"` | it is never retried; the next claim on that pile marks it failed |
+
+A live worker renews its lease, so a lapsed one means nobody is holding the item. Failing it
+cannot take work away from a running worker, which is why any process may do it.
+
+`overdueTaskPolicy` is the one still applied only at `init()`. A task has a one-shot deadline
+and no interval, so there is no self-defining threshold for "too late to bother" — the boot is
+the implicit one. Under `"skip"` that means a second process starting workers will outdate
+pending, overdue tasks the first one had queued. In-flight work is untouched.
 
 `init()` also flags pending tasks whose function is gone as `incompatible`, disables schedulers
 that emit a missing task, and backfills `leaseUntil` onto pre-lease documents.

@@ -7,7 +7,7 @@ import pytest
 from pymonque import BaseApp, CallSpec, Task, TaskFactory, task, utc_now
 from pymonque.exceptions import TaskNotFound, TaskValidationError
 
-from conftest import ExampleApp
+from conftest import ExampleApp, appWith
 
 
 def stored(tasks, name: str) -> Task:
@@ -232,7 +232,7 @@ def test_a_held_lease_is_renewed_while_the_task_runs(db, app, tasks):
 def test_execute_now_keeps_overdue_tasks_pending(db, app, tasks):
     app.task.schedule(ExampleApp.greet(name="Ada"), deadline=utc_now() - timedelta(days=1))
 
-    ExampleApp(db, overdueTaskPolicy="execute now").init()
+    appWith(ExampleApp, db, overdueTaskPolicy="execute now").init()
 
     assert stored(tasks, "greet").status == "pending"
 
@@ -241,7 +241,7 @@ def test_skip_outdates_overdue_tasks(db, app, tasks):
     app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
     app.task.schedule(app.task("greet", name="future"), deadline=utc_now() + timedelta(days=1))
 
-    ExampleApp(db, overdueTaskPolicy="skip").init()
+    appWith(ExampleApp, db, overdueTaskPolicy="skip").init()
 
     assert tasks.find_one({"work.kwargs.name": "old"})["status"] == "outdated"
     assert tasks.find_one({"work.kwargs.name": "future"})["status"] == "pending"

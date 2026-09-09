@@ -226,7 +226,10 @@ def test_per_engine_policy_and_interval(db):
     class Q(BaseApp):
         fast = schedulers(policy="skip", poolInterval=0.5)
 
-    app = Q(db, overdueSchedulersPolicy="execute once", schedulerPoolInterval=9)
+    class App(Q):
+        overdueSchedulersPolicy = "execute once"
+
+    app = App(db, schedulerPoolInterval=9)
 
     assert app.fast.policy == "skip"
     assert app.fast.poolInterval == 0.5

@@ -1256,21 +1256,29 @@ class PileEngine(CollectionEngine):
 
     def init(self):
         """Under "retry" there is nothing to do — an expired lease is claimable
-        again on its own. "fail" is the one that needs saying out loud."""
+        again on its own. "fail" is the one that needs saying out loud, and claim()
+        says it too, so a stale item does not wait for a boot to be resolved."""
 
         self.backfill()
 
         if self.policy == "fail":
-            now = utc_now()
+            self._failStale(utc_now())
 
-            self.collection.update_many(
-                {"status": "claimed", "leaseUntil": {"$lte": now}},
-                {"$set": {
-                    "status": "failed",
-                    "error": "the worker holding this item stopped renewing its lease",
-                    "finishedAt": now,
-                }},
-            )
+    def _failStale(self, now: datetime) -> int:
+        """Finish items whose holder stopped renewing.
+
+        A live worker renews, so a lapsed lease means nobody is holding it — which
+        is why this can run from any process without disturbing another's work.
+        """
+
+        return self.collection.update_many(
+            {"status": "claimed", "leaseUntil": {"$lte": now}},
+            {"$set": {
+                "status": "failed",
+                "error": "the worker holding this item stopped renewing its lease",
+                "finishedAt": now,
+            }},
+        ).modified_count
 
     def createIndexes(self):
         super().createIndexes()  # unique uid
@@ -1298,7 +1306,11 @@ class PileEngine(CollectionEngine):
 
         now = utc_now()
 
-        # "retry" also picks up items whose holder stopped renewing; "fail" does not
+        # "retry" picks up items whose holder stopped renewing; "fail" retires them
+        # here instead, so the policy means the same thing between boots as at one.
+        if self.policy == "fail":
+            self._failStale(now)
+
         claimable = ["pending", "claimed"] if self.policy == "retry" else ["pending"]
 
         query: dict[str, Any] = {
@@ -1675,15 +1687,19 @@ class BaseApp:
     def _getSchedulerEngines(cls) -> dict[str, schedulers]:
         return cls._getDeclared("__is_schedulers__")
 
+    # Policies are declared on the class, never passed in: every process that
+    # imports this app must agree on them, and they are part of the fingerprint
+    # so two that disagree cannot both run workers.
+    overdueTaskPolicy:          OVERDUE_TASKS_POLICY      = "execute now"
+    overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
+    staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
+
     def __init__(
             self, 
             db:                    Database, 
             distributionsRegistry:      type[BaseDistributions] = BaseDistributions,
             taskPoolInterval:           float = 1,
             schedulerPoolInterval:      float = 1,
-            overdueTaskPolicy:          OVERDUE_TASKS_POLICY = "execute now",
-            overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY = "execute once",
-            staleItemsPolicy:           STALE_ITEMS_POLICY = "retry",
             leaseSeconds:               float = LEASE_SECONDS,
             enforceVersion:             bool = True,
             heartbeatInterval:          float = HEARTBEAT_INTERVAL,
@@ -1705,11 +1721,8 @@ class BaseApp:
 
         self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
 
-        self._buildStorage(staleItemsPolicy)
-        self._buildEngines(
-            taskPoolInterval, schedulerPoolInterval,
-            overdueTaskPolicy, overdueSchedulersPolicy
-        )
+        self._buildStorage()
+        self._buildEngines(taskPoolInterval, schedulerPoolInterval)
 
         # NB: init() is deliberately not called here. Constructing an app must be
         # safe from any process at any time; startup housekeeping belongs to a
@@ -1724,7 +1737,7 @@ class BaseApp:
         self.workersCollection.create_index([("lastSeen", 1)])
         self.workersCollection.create_index([("uid", 1)], unique=True)
 
-    def _buildStorage(self, staleItemsPolicy: STALE_ITEMS_POLICY):
+    def _buildStorage(self):
         """Collections and piles, resolved before the engines so tasks can reach them."""
 
         self.collections: dict[str, CollectionEngine] = {
@@ -1733,32 +1746,26 @@ class BaseApp:
         }
 
         self.piles: dict[str, PileEngine] = {
-            name: spec._engine(self, staleItemsPolicy, self.leaseSeconds)
+            name: spec._engine(self, self.staleItemsPolicy, self.leaseSeconds)
             for name, spec in type(self)._getPiles().items()
         }
 
-    def _buildEngines(
-            self,
-            taskPoolInterval:           float,
-            schedulerPoolInterval:      float,
-            overdueTaskPolicy:          OVERDUE_TASKS_POLICY,
-            overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY
-        ):
+    def _buildEngines(self, taskPoolInterval: float, schedulerPoolInterval: float):
 
         self.task: TaskEngine = TaskEngine(
-            self, poolInterval=taskPoolInterval, policy=overdueTaskPolicy,
+            self, poolInterval=taskPoolInterval, policy=self.overdueTaskPolicy,
             leaseSeconds=self.leaseSeconds
         )
 
         self.schedulerEngines: dict[str, SchedulerEngine] = {
-            name: spec._engine(self, overdueSchedulersPolicy, schedulerPoolInterval, self.leaseSeconds)
+            name: spec._engine(self, self.overdueSchedulersPolicy, schedulerPoolInterval, self.leaseSeconds)
             for name, spec in type(self)._getSchedulerEngines().items()
         }
 
         # a declaration named `scheduler` replaces the default engine
         if "scheduler" not in self.schedulerEngines:
             self.scheduler: SchedulerEngine = SchedulerEngine(
-                self, poolInterval=schedulerPoolInterval, policy=overdueSchedulersPolicy,
+                self, poolInterval=schedulerPoolInterval, policy=self.overdueSchedulersPolicy,
                 leaseSeconds=self.leaseSeconds
             )
             self.schedulerEngines["scheduler"] = self.scheduler
@@ -1767,19 +1774,28 @@ class BaseApp:
 
     @property
     def fingerprint(self) -> str:
-        """Identifies the executable surface of this app: its task and
-        distribution names, with their signatures.
+        """Identifies the executable surface of this app: its task and distribution
+        names with their signatures, and the policies its engines apply.
 
         Two processes that disagree on this are running different code and must
         not work the same collections. It cannot see a changed function *body* —
         nothing can, reliably — so this is a guard, not a proof. Deploy one
         version at a time.
+
+        Policies are in here because they are shared behaviour: one process
+        retrying stale pile items while another fails them is a split brain over
+        the same documents, not two harmless local settings.
         """
 
         parts = [
             f"{name}{inspect.signature(func)}"
             for registry in (self.task.functions, self.distribution.functions)
             for name, func in sorted(registry.items())
+        ]
+
+        parts += [
+            f"{engine.name}:{engine.policy}"
+            for engine in (self.task, *self.schedulerEngines.values(), *self.piles.values())
         ]
 
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]

@@ -7,7 +7,7 @@ import pytest
 from pymonque import BaseApp, task, utc_now
 from pymonque.exceptions import VersionMismatch
 
-from conftest import ExampleApp, WORKER_POOL_INTERVAL, wait_for
+from conftest import ExampleApp, WORKER_POOL_INTERVAL, appWith, wait_for
 
 
 class V1(BaseApp):
@@ -195,3 +195,54 @@ def test_the_heartbeat_keeps_a_worker_live(db):
 
     time.sleep(0.5)   # longer than workerStaleAfter, but it keeps checking in
     assert len(app.liveWorkers()) == 1
+
+
+# --- policies are shared behaviour, so they are part of the fingerprint ---
+
+def test_two_apps_of_one_class_always_agree_on_policy(db):
+    class App(ExampleApp):
+        staleItemsPolicy = "fail"
+
+    a, b = App(db), App(db)
+
+    assert a.outbox.policy == b.outbox.policy == "fail"
+    assert a.fingerprint == b.fingerprint
+
+
+def test_a_policy_change_is_a_different_fingerprint(db):
+    class Retrying(ExampleApp):
+        staleItemsPolicy = "retry"
+
+    class Failing(ExampleApp):
+        staleItemsPolicy = "fail"
+
+    assert Retrying(db).fingerprint != Failing(db).fingerprint
+
+
+@pytest.mark.parametrize("policy", ["overdueTaskPolicy", "overdueSchedulersPolicy"])
+def test_every_policy_reaches_the_fingerprint(db, policy):
+    changed = {"overdueTaskPolicy": "skip", "overdueSchedulersPolicy": "skip"}[policy]
+
+    assert ExampleApp(db).fingerprint != appWith(ExampleApp, db, **{policy: changed}).fingerprint
+
+
+def test_a_policy_mismatch_cannot_run_workers_alongside(db):
+    class Retrying(ExampleApp):
+        staleItemsPolicy = "retry"
+
+    class Failing(ExampleApp):
+        staleItemsPolicy = "fail"
+
+    running = Retrying(db)
+    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        with pytest.raises(VersionMismatch):
+            Failing(db).startWorkers(taskWorkers=1, schedulerWorkers=0)
+    finally:
+        running.stopWorkers()
+
+
+def test_a_policy_is_not_a_constructor_argument(db):
+    with pytest.raises(TypeError):
+        ExampleApp(db, staleItemsPolicy="fail")

@@ -8,7 +8,7 @@ import pytest
 from pymonque import BaseApp, CallSpec, Scheduler, Task, task, utc_now
 from pymonque.exceptions import TaskNotFound, DistributionNotFound
 
-from conftest import ExampleApp
+from conftest import ExampleApp, appWith
 
 
 HOURLY = {"functionName": "constant", "kwargs": {"dailyFrequency": 24}}
@@ -217,7 +217,7 @@ def test_a_scheduler_with_a_live_lease_is_left_alone(db, app):
 def behindByADay(db, policy):
     """An hourly scheduler that has not been served for a day: 24 beats missed."""
 
-    app = ExampleApp(db, overdueSchedulersPolicy=policy)
+    app = appWith(ExampleApp, db, overdueSchedulersPolicy=policy)
     scheduler = addScheduler(app, dailyFrequency=24)
     setDeadline(app, scheduler, utc_now() - timedelta(days=1))
 
@@ -258,7 +258,7 @@ def test_skip_emits_nothing_and_resumes_from_now(db, tasks):
 
 @pytest.mark.parametrize("policy", ["execute reconstructed", "execute once", "skip"])
 def test_a_scheduler_that_is_merely_due_emits_under_every_policy(db, tasks, policy):
-    app = ExampleApp(db, overdueSchedulersPolicy=policy)
+    app = appWith(ExampleApp, db, overdueSchedulersPolicy=policy)
     scheduler = addScheduler(app, dailyFrequency=24)
     setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
 
@@ -272,7 +272,7 @@ def test_a_scheduler_set_faster_than_it_can_be_served_stops_accumulating(db, tas
     """The bug this policy exists for: a 1s scheduler down for an hour used to emit
     an unbounded burst trying to catch up."""
 
-    app = ExampleApp(db, overdueSchedulersPolicy="execute once")
+    app = appWith(ExampleApp, db, overdueSchedulersPolicy="execute once")
     scheduler = addScheduler(app, dailyFrequency=86400)      # one second apart
     setDeadline(app, scheduler, utc_now() - timedelta(hours=1))
 
@@ -287,7 +287,7 @@ def test_the_policy_still_applies_after_startup(db, tasks):
     """init() no longer owns the policy, so a scheduler that falls behind while
     the app is up is treated the same as one that fell behind while it was down."""
 
-    app = ExampleApp(db, overdueSchedulersPolicy="skip")
+    app = appWith(ExampleApp, db, overdueSchedulersPolicy="skip")
     app.init()
 
     scheduler = addScheduler(app, dailyFrequency=24)

@@ -7,7 +7,7 @@ from pydantic import BaseModel, ValidationError
 
 from pymonque import BaseApp, Item, PileEngine, task, pile, utc_now
 
-from conftest import Email, ExampleApp
+from conftest import Email, ExampleApp, appWith
 
 
 def fill(app, count: int = 3):
@@ -349,21 +349,46 @@ def test_a_held_item_lease_can_be_renewed(app):
     assert app.outbox.claim() is None                    # so nobody else may take it
 
 
-def test_under_fail_an_abandoned_item_is_never_retried(db):
-    app = ExampleApp(db, staleItemsPolicy="fail")
-    app.outbox.add(to="a@b.c")
+def abandoned(app, to="a@b.c"):
+    """An item whose holder was claimed and then stopped renewing."""
+
+    app.outbox.add(to=to)
     item = app.outbox.claim()
     app.outbox.itemsCollection.update_one(
         {"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
     )
+    return item
+
+
+def test_under_fail_an_abandoned_item_is_written_off_at_the_next_claim(db):
+    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
+    abandoned(app)
 
     assert app.outbox.claim() is None      # not handed to anyone else
 
-    app.init()                             # a worker starting up writes it off
-    after = app.outbox.find()[0]
-
+    after = app.outbox.find()[0]           # and not left hanging until a reboot
     assert after.status == "failed"
     assert "lease" in after.error
+
+
+def test_under_fail_a_live_holder_is_not_written_off(db):
+    """A worker that is still renewing must survive another worker's claim."""
+
+    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
+    app.outbox.add(to="a@b.c")
+    held = app.outbox.claim()              # lease is live, being renewed
+
+    assert app.outbox.claim() is None
+    assert app.outbox.find({"uid": held.uid})[0].status == "claimed"
+
+
+def test_under_fail_init_still_tidies_a_pile_nobody_claims_from(db):
+    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
+    abandoned(app)
+
+    appWith(ExampleApp, db, staleItemsPolicy="fail").init()
+
+    assert app.outbox.count(status="failed") == 1
 
 
 def test_a_pile_can_override_the_app_policy(db):
@@ -371,7 +396,7 @@ def test_a_pile_can_override_the_app_policy(db):
         strict = pile(policy="fail")
         lenient = pile()
 
-    first = Q(db, staleItemsPolicy="retry")
+    first = Q(db)
     first.strict.add({"n": 1})
     first.lenient.add({"n": 1})
     strictItem = first.strict.claim()
@@ -382,7 +407,7 @@ def test_a_pile_can_override_the_app_policy(db):
             {}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
         )
 
-    Q(db, staleItemsPolicy="retry").init()
+    Q(db).init()
 
     assert first.strict.count(status="failed") == 1     # its own policy wins
     assert first.lenient.claim() is not None     # claimable again
