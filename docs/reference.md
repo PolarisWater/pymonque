@@ -190,17 +190,18 @@ app.task.schedule(App.retain(days=0))    # TaskValidationError, before it is eve
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None, timeout=None)` | Store a task, and return it. Deadline defaults to now. |
-| `scheduleFromDistribution(work, distribution, factory=None, timeout=None)` | Deadline is now + one interval. |
+| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None)` | Store a task, and return it. Deadline defaults to now. |
+| `scheduleFromDistribution(work, distribution, ...)` | Same, deadline is now + one interval. |
 | `__call__(functionName, **kwargs)` | Build and validate a `CallSpec`. |
 | `validate(work)` | Raises `TaskNotFound` / `TaskValidationError`. |
 | `execute(task)` | Run one task, return it filled in. |
-| `timeoutFor(task)` | The limit that applies to it. |
+| `timeoutFor(task)` / `skipAfterFor(task)` | The limits that apply to it. |
 | `backlog()` | `(due, secondsTheOldestHasWaited)` — on `BaseApp`. |
 | `startWorkers(n)` | Poll, claim, execute. |
 
-Claiming is `find_one_and_update` on `{status: "pending", deadline: {$lte: now}}` sorted by
-deadline, so the oldest due task goes first and no task runs twice.
+Claiming is one `find_one_and_update` on `{status: {$in: ["pending", "processing"]}, leaseUntil:
+{$lte: now}}`, sorted by `leaseUntil`, so the longest-waiting task goes first and no task runs
+twice. See [Leases](#leases) for why one field covers both due and abandoned.
 
 ### Task document
 
@@ -215,6 +216,7 @@ deadline, so the oldest due task goes first and no task runs twice.
 | `result` | anything BSON can encode |
 | `error` | traceback, on failure |
 | `timeout` | `float` seconds, or `None` for the engine's |
+| `skipAfter` | `float` seconds past the deadline, or `None` for the engine's |
 
 ```
 pending ─→ processing ─→ success
@@ -222,7 +224,7 @@ pending ─→ processing ─→ success
                 ├──────→ timeout       the call outlived its limit
                 └──────→ processing    lease lapsed; another worker claimed it
 
-pending ─→ outdated       overdue, under the "skip" policy
+pending ─→ outdated       due before a cold start, or claimed past skipAfter
 pending ─→ incompatible   the function no longer exists on the app
 ```
 
@@ -260,6 +262,26 @@ appears when a limit applies.
 
 Timeouts are part of the [fingerprint](#one-version-at-a-time), like the policies: whether a task
 ends up `timeout` must not depend on which process picked it up.
+
+### skipAfter
+
+The same three levels, for a task that went stale *waiting* rather than while running:
+
+```python
+class App(BaseApp):
+    taskSkipAfter = 3600            # app
+
+app.task.skipAfter = 600            # engine
+app.task.schedule(App.send(...), skipAfter=60)      # task
+app.scheduler.add(App.sync(), daily, skipAfter=120) # stamped on what it emits
+```
+
+If a worker claims a task more than `skipAfter` seconds past its deadline, it is written
+`outdated` with how late it was, and never run. `None` — the default — means run however late.
+
+This is the companion to `overdueTaskPolicy`, not a replacement: that one is about a **cold start
+after downtime**, this one about a **queue nobody is keeping up with**. Set both if you want both.
+It is in the fingerprint for the same reason timeouts are.
 
 ## Not enough workers
 
@@ -624,7 +646,7 @@ easily as while it is down.
 |---|---|
 | `overdueSchedulersPolicy` | every time a scheduler is claimed |
 | `staleItemsPolicy` | every time a pile is claimed from (and at `init()`, for a pile nothing claims from) |
-| `overdueTaskPolicy` | `init()` only — see the note below |
+| `overdueTaskPolicy` | `init()`, and only on a cold start — see below |
 
 | `overdueTaskPolicy` | |
 |---|---|
@@ -651,10 +673,20 @@ every claim so you can see that happening.
 A live worker renews its lease, so a lapsed one means nobody is holding the item. Failing it
 cannot take work away from a running worker, which is why any process may do it.
 
-`overdueTaskPolicy` is the one still applied only at `init()`. A task has a one-shot deadline
-and no interval, so there is no self-defining threshold for "too late to bother" — the boot is
-the implicit one. Under `"skip"` that means a second process starting workers will outdate
-pending, overdue tasks the first one had queued. In-flight work is untouched.
+`overdueTaskPolicy` belongs at `init()`, because what it is about — *coming back from downtime* —
+only happens at a start. It applies on a **cold start** only: a process whose `liveWorkers()` shows
+nobody else running. A worker joining a cluster that never went down leaves the backlog alone,
+since that work belongs to its colleagues.
+
+```python
+app.coldStart()          # True when nothing else has checked in
+app.otherLiveWorkers()   # everyone but this process
+```
+
+With `enforceVersion=False` there is no registry to ask, so every start looks cold.
+
+For work that goes stale while the app is *up*, use [`skipAfter`](#skipafter) — the two are
+independent and compose.
 
 `init()` also flags pending tasks whose function is gone as `incompatible`, disables schedulers
 that emit a missing task, and backfills `leaseUntil` onto pre-lease documents.

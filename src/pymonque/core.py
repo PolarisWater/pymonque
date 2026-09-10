@@ -474,9 +474,10 @@ class Task(Document):
     result:         Any | None          = None
     error:          str | None          = None
 
-    # seconds this call may run for before it is written off. None means the
-    # engine's, and the engine's None means the app's. Nearest wins.
-    timeout:        float | None        = None
+    # Both None means the engine's, and the engine's None means the app's.
+    # Nearest wins.
+    timeout:        float | None        = None   # seconds this call may run for
+    skipAfter:      float | None        = None   # seconds past the deadline it stops being worth running
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -512,14 +513,16 @@ class TaskFactory(Document):
             self, 
             work:       CallSpec,
             deadline:   datetime,
-            timeout:    float | None = None
+            timeout:    float | None = None,
+            skipAfter:  float | None = None
         ) -> Task:
 
         return Task(
             work=work,
             deadline=deadline, 
             factory=self,
-            timeout=timeout
+            timeout=timeout,
+            skipAfter=skipAfter
         )
     
     def __repr__(self) -> str:
@@ -678,12 +681,14 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             leaseSeconds:       float = LEASE_SECONDS,
             taskModel:          type[Task] = Task,
             extraIndexes:       Sequence[IndexModel] | None = None,
-            timeout:            float | None = None
+            timeout:            float | None = None,
+            skipAfter:          float | None = None
         ):
 
         self.poolInterval = poolInterval
         self.leaseSeconds = leaseSeconds
         self.timeout: float | None = timeout if timeout is not None else app.taskTimeout
+        self.skipAfter: float | None = skipAfter if skipAfter is not None else app.taskSkipAfter
         self.defaultFactory: TaskFactory = defaultFactory or app.defaultFactory
         self.distributionEngine: DistributionEngine = app.distribution
         self.policy: OVERDUE_TASKS_POLICY = policy
@@ -738,14 +743,19 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             {"$set": {"status": "incompatible", "error": "Function for this task does not exist in this app"}},
         )  # flag pending tasks that can no longer be executed
 
-        if self.policy == "execute now":
-            return
-        
-        if self.policy == "skip":
-            self.tasksCollection.update_many(
+        # Only the first workers back apply it: joining a running cluster is not a
+        # return from downtime, and the backlog there belongs to somebody.
+        if self.policy == "skip" and self._app.coldStart():
+            skipped = self.tasksCollection.update_many(
                 {"status": "pending", "deadline": {"$lte": now}},
                 {"$set": {"status": "outdated"}},
-            )
+            ).modified_count
+
+            if skipped:
+                logger.warning(
+                    "%d task(s) were due before this cold start and are outdated "
+                    "(overdueTaskPolicy)", skipped
+                )
 
     def createIndexes(self):
         super().createIndexes()  # unique uid
@@ -771,6 +781,9 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         task = self.load(raw)
         task.leaseUntil = now + timedelta(seconds=self.leaseSeconds)  # raw is the pre-claim image
 
+        if self._tooLate(task, now):
+            return self._outdate(task, now)
+
         self._hold(task.uid)
         try:
             task = self.execute(task)
@@ -792,6 +805,37 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         """Nearest wins: the task's own, then this engine's, then the app's."""
 
         return task.timeout if task.timeout is not None else self.timeout
+
+    def skipAfterFor(self, task: Task) -> float | None:
+        """Nearest wins, the same way."""
+
+        return task.skipAfter if task.skipAfter is not None else self.skipAfter
+
+    def _tooLate(self, task: Task, now: datetime) -> bool:
+        """Whether this task went stale waiting to be claimed.
+
+        The companion to overdueTaskPolicy, for the other way work goes stale:
+        that one is about a cold start after downtime, this one about a queue
+        nobody is keeping up with.
+        """
+
+        limit = self.skipAfterFor(task)
+
+        return limit is not None and (now - task.deadline).total_seconds() > limit
+
+    def _outdate(self, task: Task, now: datetime) -> Task:
+        late = (now - task.deadline).total_seconds()
+
+        task.status = "outdated"
+        task.error = (
+            f"claimed {late:.0f}s after its deadline, past the "
+            f"{self.skipAfterFor(task)}s it was worth running for"
+        )
+
+        self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+        logger.warning("%r was outdated: %s", task, task.error)
+
+        return task
 
     def _callWithTimeout(self, task: Task, timeout: float) -> Any:
         """Run the call, and give up waiting for it after `timeout` seconds.
@@ -863,14 +907,16 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             work:           CallSpec,
             deadline:       datetime, 
             factory:        TaskFactory,
-            timeout:        float | None = None
+            timeout:        float | None = None,
+            skipAfter:      float | None = None
         ) -> Task:
 
         return self.insert(
             factory._emit(
                 deadline=deadline,
                 work=work,
-                timeout=timeout
+                timeout=timeout,
+                skipAfter=skipAfter
             ) 
         )
 
@@ -911,10 +957,11 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             work:           CallSpec, 
             deadline:       datetime | None = None,
             factory:        TaskFactory | None = None,
-            timeout:        float | None = None
+            timeout:        float | None = None,
+            skipAfter:      float | None = None
         ) -> Task:
 
-        """Queue one call. `timeout` overrides the engine's and the app's."""
+        """Queue one call. `timeout` and `skipAfter` override the engine's and the app's."""
 
         factory = factory or self.defaultFactory
         deadline = deadline or utc_now()
@@ -925,7 +972,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             work=work,
             deadline=deadline, 
             factory=factory,
-            timeout=timeout
+            timeout=timeout,
+            skipAfter=skipAfter
         )
 
     def scheduleFromDistribution(
@@ -933,7 +981,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             work:           CallSpec,
             distribution:   CallSpec,
             factory:        TaskFactory | None = None,
-            timeout:        float | None = None
+            timeout:        float | None = None,
+            skipAfter:      float | None = None
         ) -> Task:
 
         self._app.distribution.validate(distribution)
@@ -943,7 +992,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             work=work,
             deadline=deadline,
             factory=factory,
-            timeout=timeout
+            timeout=timeout,
+            skipAfter=skipAfter
         )
 
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
@@ -959,7 +1009,8 @@ class Scheduler(TaskFactory):
     distribution:   CallSpec
     deadline:       datetime
     leaseUntil:     datetime | None     = None
-    timeout:        float | None        = None   # stamped onto every task it emits
+    timeout:        float | None        = None   # both stamped onto every task it emits
+    skipAfter:      float | None        = None
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -981,7 +1032,7 @@ class Scheduler(TaskFactory):
         return self.work
 
     def _emit(self, deadline: datetime) -> Task:
-        return super()._emit(self.emitWork(), deadline, self.timeout)
+        return super()._emit(self.emitWork(), deadline, self.timeout, self.skipAfter)
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work!r}"
@@ -1830,9 +1881,11 @@ class BaseApp:
     overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
     staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
 
-    # Seconds a task may run before it is written off. None means no limit — a
-    # task engine or an individual task may set a nearer one, never a looser.
+    # Seconds a task may run before it is written off, and seconds past its
+    # deadline before it stops being worth running at all. None means no limit;
+    # an engine or an individual task may set its own.
     taskTimeout:                float | None              = None
+    taskSkipAfter:              float | None              = None
 
     def __init__(
             self, 
@@ -1947,6 +2000,7 @@ class BaseApp:
         ]
 
         parts.append(f"taskTimeout:{self.task.timeout}")
+        parts.append(f"taskSkipAfter:{self.task.skipAfter}")
 
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 
@@ -1975,6 +2029,22 @@ class BaseApp:
         oldest = self.task.tasksCollection.find_one(due, sort=[("leaseUntil", 1)])
 
         return count, (now - oldest["leaseUntil"]).total_seconds()
+
+    def otherLiveWorkers(self) -> list[dict]:
+        """Every process checked in but this one."""
+
+        return [w for w in self.liveWorkers() if w.get("uid") != self.workerUid]
+
+    def coldStart(self) -> bool:
+        """True when nothing else is running.
+
+        overdueTaskPolicy is about coming back from downtime, so it must not fire
+        for a worker joining a cluster that never went down — that one would drop
+        work its colleagues were about to run. With enforceVersion off there is no
+        registry to ask, and every start looks cold.
+        """
+
+        return not self.otherLiveWorkers()
 
     def taskWorkers(self) -> int:
         """Task workers across every process that has checked in.
