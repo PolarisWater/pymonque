@@ -57,8 +57,9 @@ A stop is checked **between** iterations, never inside one, so work already clai
 to completion. Anything not yet claimed stays `pending` for the next process. Workers wait on the
 stop event rather than sleeping, so a shutdown doesn't sit through a poll interval.
 
-`stopWorkers` deregisters the process, which frees its version slot immediately — the replacement
-deployment can start without waiting out `workerStaleAfter`.
+`stopWorkers` marks the process stopped, which frees its version slot immediately — the
+replacement deployment can start without waiting out `workerStaleAfter`. The record itself stays
+a while, so the next start can tell a restart from [downtime](#policies).
 
 ### Signals
 
@@ -674,14 +675,27 @@ A live worker renews its lease, so a lapsed one means nobody is holding the item
 cannot take work away from a running worker, which is why any process may do it.
 
 `overdueTaskPolicy` belongs at `init()`, because what it is about — *coming back from downtime* —
-only happens at a start. It applies on a **cold start** only: a process whose `liveWorkers()` shows
-nobody else running. A worker joining a cluster that never went down leaves the backlog alone,
-since that work belongs to its colleagues.
+only happens at a start. It applies on a **cold start** only: nobody else is running, **and**
+nobody has checked in for `coldStartAfter` seconds (default 300). So neither of these drops
+anything:
+
+- a worker joining a running cluster — that backlog belongs to its colleagues
+- a restart or rolling deploy — everyone stopped, but only a moment ago
 
 ```python
-app.coldStart()          # True when nothing else has checked in
-app.otherLiveWorkers()   # everyone but this process
+class App(BaseApp):
+    overdueTaskPolicy = "skip"
+    coldStartAfter = 600     # ten quiet minutes means the app was down; 0 means any gap does
+
+app.coldStart()          # the question init() asks
+app.lastActive()         # when any other process last checked in, running or stopped
+app.otherLiveWorkers()   # everyone running but this process
 ```
+
+Stopping a worker marks its record `stoppedAt` rather than deleting it, so the time survives a
+graceful shutdown; a crashed one is dated by its last heartbeat. Records older than both
+`coldStartAfter` and `workerStaleAfter` are pruned when a worker starts. `coldStartAfter` is in the
+fingerprint, like the policy it qualifies.
 
 With `enforceVersion=False` there is no registry to ask, so every start looks cold.
 

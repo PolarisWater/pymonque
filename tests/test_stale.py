@@ -65,15 +65,119 @@ def test_a_worker_joining_a_running_cluster_is_not_a_cold_start(db):
         running.stopWorkers(timeout=5)
 
 
-def test_a_start_after_everyone_stopped_is_a_cold_start_again(db):
+def goQuiet(db, seconds):
+    """Pretend every process last checked in `seconds` ago."""
+
+    db["pymonque_workers"].update_many({}, {"$set": {"lastSeen": utc_now() - timedelta(seconds=seconds)}})
+
+
+def test_a_restart_is_not_a_cold_start(db):
+    """Everyone stopped, but only a moment ago — a deploy, not downtime."""
+
     first = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
     first.startWorkers(taskWorkers=1, schedulerWorkers=0)
     first.stopWorkers(timeout=5)
 
     overdue(first, count=3)
+    restarted = Skipping(db, backlogWarnAfter=None)
+
+    assert restarted.coldStart() is False
+    restarted.init()
+    assert counts(first) == {"pending": 3, "success": 0, "outdated": 0}
+
+
+def test_a_start_after_coldStartAfter_of_silence_is_a_cold_start(db):
+    first = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
+    first.startWorkers(taskWorkers=1, schedulerWorkers=0)
+    first.stopWorkers(timeout=5)
+
+    goQuiet(db, Skipping.coldStartAfter + 1)
+    overdue(first, count=3)
     Skipping(db, backlogWarnAfter=None).init()
 
     assert counts(first)["outdated"] == 3
+
+
+def test_a_crashed_cluster_counts_from_its_last_heartbeat(db):
+    """No deregistration, no stoppedAt — only lastSeen says when it died."""
+
+    crashed = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
+    crashed._claimVersion()
+
+    goQuiet(db, 120)        # past workerStaleAfter, so gone — but only recently
+    assert Skipping(db).coldStart() is False
+
+    goQuiet(db, Skipping.coldStartAfter + 1)
+    assert Skipping(db).coldStart() is True
+
+
+def test_the_threshold_is_declared_on_the_class(db):
+    class Eager(App):
+        overdueTaskPolicy = "skip"
+        coldStartAfter = 0
+
+    first = Eager(db, taskPoolInterval=99, backlogWarnAfter=None)
+    first.startWorkers(taskWorkers=1, schedulerWorkers=0)
+    first.stopWorkers(timeout=5)
+
+    assert Eager(db).coldStart() is True       # any gap at all is downtime
+
+
+def test_a_short_threshold_never_mistakes_a_live_worker_for_downtime(db):
+    """A running worker between heartbeats has an old lastSeen, but it is running."""
+
+    class Eager(App):
+        coldStartAfter = 0
+
+    running = Eager(db, taskPoolInterval=99, backlogWarnAfter=None)
+    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        goQuiet(db, 5)
+        assert Eager(db).coldStart() is False
+    finally:
+        running.stopWorkers(timeout=5)
+
+
+def test_a_first_ever_start_is_a_cold_start(db):
+    app = Skipping(db)
+
+    assert app.lastActive() is None
+    assert app.coldStart() is True
+
+
+def test_a_stopped_worker_is_remembered_but_not_live(db):
+    app = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
+    app.startWorkers(taskWorkers=1, schedulerWorkers=0)
+    app.stopWorkers(timeout=5)
+
+    other = Skipping(db)
+
+    assert other.liveWorkers() == []
+    assert other.taskWorkers() == 0
+    assert other.lastActive() is not None
+
+
+def test_records_too_old_to_matter_are_pruned(db):
+    old = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
+    old.startWorkers(taskWorkers=1, schedulerWorkers=0)
+    old.stopWorkers(timeout=5)
+    goQuiet(db, Skipping.coldStartAfter + 1)
+
+    new = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
+    new.startWorkers(taskWorkers=1, schedulerWorkers=0)
+
+    try:
+        assert [w["uid"] for w in db["pymonque_workers"].find()] == [new.workerUid]
+    finally:
+        new.stopWorkers(timeout=5)
+
+
+def test_a_threshold_change_is_a_different_fingerprint(db):
+    class Short(App):
+        coldStartAfter = 10
+
+    assert Short(db).fingerprint != App(db).fingerprint
 
 
 def test_cold_start_is_about_other_processes_not_this_one(db):

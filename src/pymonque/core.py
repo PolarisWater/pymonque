@@ -60,6 +60,7 @@ BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobod
 BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshold disables them
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
+COLD_START_AFTER = 300      # after this long with nobody checked in, the app was down
 HOSTNAME = socket.gethostname()
 
 def utc_now() -> datetime:
@@ -1881,6 +1882,10 @@ class BaseApp:
     overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
     staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
 
+    # Seconds nothing may have checked in for before a start counts as a return
+    # from downtime. Shorter gaps — a restart, a rolling deploy — are not.
+    coldStartAfter:             float                     = COLD_START_AFTER
+
     # Seconds a task may run before it is written off, and seconds past its
     # deadline before it stops being worth running at all. None means no limit;
     # an engine or an individual task may set its own.
@@ -1999,6 +2004,7 @@ class BaseApp:
             for engine in (self.task, *self.schedulerEngines.values(), *self.piles.values())
         ]
 
+        parts.append(f"coldStartAfter:{self.coldStartAfter}")
         parts.append(f"taskTimeout:{self.task.timeout}")
         parts.append(f"taskSkipAfter:{self.task.skipAfter}")
 
@@ -2035,16 +2041,33 @@ class BaseApp:
 
         return [w for w in self.liveWorkers() if w.get("uid") != self.workerUid]
 
+    def lastActive(self) -> datetime | None:
+        """When any other process last checked in, running or since stopped."""
+
+        latest = self.workersCollection.find_one(
+            {"uid": {"$ne": self.workerUid}}, {"lastSeen": 1}, sort=[("lastSeen", -1)]
+        )
+
+        return None if latest is None else latest["lastSeen"]
+
     def coldStart(self) -> bool:
-        """True when nothing else is running.
+        """True when nothing else is running, and nothing has been for coldStartAfter.
 
         overdueTaskPolicy is about coming back from downtime, so it must not fire
         for a worker joining a cluster that never went down — that one would drop
-        work its colleagues were about to run. With enforceVersion off there is no
-        registry to ask, and every start looks cold.
+        work its colleagues were about to run — nor for a restart or a rolling
+        deploy, which leave a gap but no downtime. With enforceVersion off there
+        is no registry to ask, and every start looks cold.
         """
 
-        return not self.otherLiveWorkers()
+        if self.otherLiveWorkers():
+            return False
+
+        recent = utc_now() - timedelta(seconds=self.coldStartAfter)
+
+        return not self.workersCollection.count_documents(
+            {"uid": {"$ne": self.workerUid}, "lastSeen": {"$gte": recent}}
+        )
 
     def taskWorkers(self) -> int:
         """Task workers across every process that has checked in.
@@ -2089,10 +2112,13 @@ class BaseApp:
             self._checkWorkers()
 
     def liveWorkers(self) -> list[dict]:
-        """Worker processes that have checked in recently."""
+        """Worker processes that have checked in recently and not stopped."""
 
         return list(self.workersCollection.find(
-            {"lastSeen": {"$gte": utc_now() - timedelta(seconds=self.workerStaleAfter)}},
+            {
+                "lastSeen": {"$gte": utc_now() - timedelta(seconds=self.workerStaleAfter)},
+                "stoppedAt": None,
+            },
             {"_id": 0}
         ))
 
@@ -2124,6 +2150,10 @@ class BaseApp:
 
         self._verifyVersion()
 
+        # records old enough to answer neither liveWorkers() nor coldStart()
+        forgotten = utc_now() - timedelta(seconds=max(self.coldStartAfter, self.workerStaleAfter))
+        self.workersCollection.delete_many({"lastSeen": {"$lt": forgotten}})
+
         self.workersCollection.update_one(
             {"uid": self.workerUid},
             {"$set": {
@@ -2133,16 +2163,25 @@ class BaseApp:
                 "pid":          os.getpid(),
                 "startedAt":    utc_now(),
                 "lastSeen":     utc_now(),
+                "stoppedAt":    None,
                 "taskWorkers":  0,      # filled in once the engines are up
             }},
             upsert=True
         )
 
     def _deregisterWorker(self):
-        """Free this process's slot immediately, rather than waiting for it to go stale."""
+        """Free this process's slot immediately, rather than waiting for it to go stale.
+
+        The record stays, marked stopped: when this process was last alive is what
+        tells the next start whether the app was down or only restarting.
+        """
 
         try:
-            self.workersCollection.delete_one({"uid": self.workerUid})
+            now = utc_now()
+            self.workersCollection.update_one(
+                {"uid": self.workerUid},
+                {"$set": {"stoppedAt": now, "lastSeen": now, "taskWorkers": 0}}
+            )
         except Exception:
             logger.exception("could not deregister worker")
 
