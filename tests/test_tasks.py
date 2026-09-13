@@ -167,7 +167,7 @@ def test_an_instance_task_runs_with_its_app(app, tasks):
 # --- failure handling ---
 
 def test_a_raising_task_is_marked_failed(app, tasks):
-    app.task.schedule(ExampleApp.boom())
+    app.task.schedule(ExampleApp.boom(), maxAttempts=1)     # retries: test_retries.py
     app.task._work()
     entry = stored(tasks, "boom")
 
@@ -227,24 +227,6 @@ def test_a_held_lease_is_renewed_while_the_task_runs(db, app, tasks):
 
     assert app.task.renewLeases() == 1
     assert stored(tasks, "greet").leaseUntil > before
-
-
-def test_execute_now_keeps_overdue_tasks_pending(db, app, tasks):
-    app.task.schedule(ExampleApp.greet(name="Ada"), deadline=utc_now() - timedelta(days=1))
-
-    appWith(ExampleApp, db, overdueTaskPolicy="execute now").init()
-
-    assert stored(tasks, "greet").status == "pending"
-
-
-def test_skip_outdates_overdue_tasks(db, app, tasks):
-    app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
-    app.task.schedule(app.task("greet", name="future"), deadline=utc_now() + timedelta(days=1))
-
-    appWith(ExampleApp, db, overdueTaskPolicy="skip").init()
-
-    assert tasks.find_one({"work.kwargs.name": "old"})["status"] == "outdated"
-    assert tasks.find_one({"work.kwargs.name": "future"})["status"] == "pending"
 
 
 def test_a_task_whose_function_vanished_is_flagged_incompatible(db, app, tasks):

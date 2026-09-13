@@ -12,7 +12,7 @@ from pymonque import (
 from pymonque.core import schedulerUid
 from pymonque.exceptions import TaskValidationError, TaskNotFound, DistributionNotFound
 
-from conftest import wait_for, WORKER_POOL_INTERVAL
+from conftest import wait_for, WORKER_POLL_INTERVAL
 
 
 # --- the shape a real app has: context on the scheduler, stamped onto every task ---
@@ -224,17 +224,17 @@ def test_a_subclass_can_override_an_engine(db):
 
 def test_per_engine_policy_and_interval(db):
     class Q(BaseApp):
-        fast = schedulers(policy="skip", poolInterval=0.5)
+        fast = schedulers(policy="skip", pollInterval=0.5)
 
     class App(Q):
         overdueSchedulersPolicy = "execute once"
 
-    app = App(db, schedulerPoolInterval=9)
+    app = App(db, schedulerPollInterval=9)
 
     assert app.fast.policy == "skip"
-    assert app.fast.poolInterval == 0.5
+    assert app.fast.pollInterval == 0.5
     assert app.scheduler.policy == "execute once"
-    assert app.scheduler.poolInterval == 9
+    assert app.scheduler.pollInterval == 9
 
 
 def test_extra_indexes_are_created(ops):
@@ -255,7 +255,7 @@ def test_init_reaches_every_engine(db, ops):
 
 
 def test_startWorkers_covers_every_engine(db):
-    app = OpsApp(db, schedulerPoolInterval=WORKER_POOL_INTERVAL, taskPoolInterval=WORKER_POOL_INTERVAL)
+    app = OpsApp(db, schedulerPollInterval=WORKER_POLL_INTERVAL, taskPollInterval=WORKER_POLL_INTERVAL)
     a = app.accountOps.add(OpsApp.sync(), hourly(app), accountId=7)
     g = app.groupOps.add(OpsApp.announce(), hourly(app), groupId="g1")
     due(app.accountOps, a)

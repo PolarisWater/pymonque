@@ -132,7 +132,8 @@ the same item. `work()` wraps that: claim, mark done, or mark failed if the bloc
 
 **Workers.** `startWorkers()` starts daemon threads that poll, claim atomically, run, and write
 results back. A worker sleeps only when it finds nothing to do, so a backlog drains at full
-speed.
+speed. A task that raises is retried up to `taskMaxAttempts` (3) times; one that crashes its
+worker counts too, so it can't take every worker down in turn.
 
 **Leases.** A claim is held for `leaseSeconds` and renewed while the work runs. If a worker dies,
 its lease lapses and the next worker picks the work up — no restart, no sweep. Because a live
@@ -145,8 +146,8 @@ claiming new work and lets what's in flight finish; a second exits immediately. 
 
 **One version at a time.** A task document names a function and nothing more, so two deployments
 that disagree about what that function does cannot safely share a database. `startWorkers()` hashes
-the app's task and distribution signatures and refuses to start if a live worker reports a
-different hash. Stop the old workers before starting the new ones.
+the app's task and distribution signatures, its policies and its task limits, and refuses to start
+if a live worker reports a different hash. Stop the old workers before starting the new ones.
 
 ## Docs
 

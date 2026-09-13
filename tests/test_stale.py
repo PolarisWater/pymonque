@@ -1,10 +1,12 @@
-"""Two ways work goes stale: a cold start after downtime, and a queue nobody keeps up with."""
+"""skipAfter: a task claimed too long after its deadline is outdated instead of run.
 
-import logging
-import time
+It is the one rule for work going stale, whether the app was down or nobody kept up.
+"""
+
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from pymonque import BaseApp, task, utc_now
 
@@ -15,202 +17,6 @@ class App(BaseApp):
     def ping() -> str:
         return "pong"
 
-
-class Skipping(App):
-    overdueTaskPolicy = "skip"
-
-
-def overdue(app, seconds=300, count=1):
-    for _ in range(count):
-        app.task.schedule(App.ping(), deadline=utc_now() - timedelta(seconds=seconds))
-
-
-def counts(app):
-    return {s: app.task.count({"status": s}) for s in ("pending", "success", "outdated")}
-
-
-# --- coming back from downtime: overdueTaskPolicy, at init() ---
-
-def test_a_cold_start_skips_what_piled_up_while_it_was_down(db):
-    app = Skipping(db, backlogWarnAfter=None)
-    overdue(app, count=3)
-
-    app.init()
-
-    assert counts(app) == {"pending": 0, "success": 0, "outdated": 3}
-
-
-def test_execute_now_runs_the_backlog_instead(db):
-    app = App(db, backlogWarnAfter=None)      # the default policy
-    overdue(app, count=3)
-
-    app.init()
-
-    assert counts(app) == {"pending": 3, "success": 0, "outdated": 0}
-
-
-def test_a_worker_joining_a_running_cluster_is_not_a_cold_start(db):
-    """It would drop work its colleagues were about to run."""
-
-    running = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
-
-    try:
-        overdue(running, count=3)
-        joining = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-        joining.init()
-
-        assert counts(running) == {"pending": 3, "success": 0, "outdated": 0}
-    finally:
-        running.stopWorkers(timeout=5)
-
-
-def goQuiet(db, seconds):
-    """Pretend every process last checked in `seconds` ago."""
-
-    db["pymonque_workers"].update_many({}, {"$set": {"lastSeen": utc_now() - timedelta(seconds=seconds)}})
-
-
-def test_a_restart_is_not_a_cold_start(db):
-    """Everyone stopped, but only a moment ago — a deploy, not downtime."""
-
-    first = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    first.startWorkers(taskWorkers=1, schedulerWorkers=0)
-    first.stopWorkers(timeout=5)
-
-    overdue(first, count=3)
-    restarted = Skipping(db, backlogWarnAfter=None)
-
-    assert restarted.coldStart() is False
-    restarted.init()
-    assert counts(first) == {"pending": 3, "success": 0, "outdated": 0}
-
-
-def test_a_start_after_coldStartAfter_of_silence_is_a_cold_start(db):
-    first = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    first.startWorkers(taskWorkers=1, schedulerWorkers=0)
-    first.stopWorkers(timeout=5)
-
-    goQuiet(db, Skipping.coldStartAfter + 1)
-    overdue(first, count=3)
-    Skipping(db, backlogWarnAfter=None).init()
-
-    assert counts(first)["outdated"] == 3
-
-
-def test_a_crashed_cluster_counts_from_its_last_heartbeat(db):
-    """No deregistration, no stoppedAt — only lastSeen says when it died."""
-
-    crashed = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    crashed._claimVersion()
-
-    goQuiet(db, 120)        # past workerStaleAfter, so gone — but only recently
-    assert Skipping(db).coldStart() is False
-
-    goQuiet(db, Skipping.coldStartAfter + 1)
-    assert Skipping(db).coldStart() is True
-
-
-def test_the_threshold_is_declared_on_the_class(db):
-    class Eager(App):
-        overdueTaskPolicy = "skip"
-        coldStartAfter = 0
-
-    first = Eager(db, taskPoolInterval=99, backlogWarnAfter=None)
-    first.startWorkers(taskWorkers=1, schedulerWorkers=0)
-    first.stopWorkers(timeout=5)
-
-    assert Eager(db).coldStart() is True       # any gap at all is downtime
-
-
-def test_a_short_threshold_never_mistakes_a_live_worker_for_downtime(db):
-    """A running worker between heartbeats has an old lastSeen, but it is running."""
-
-    class Eager(App):
-        coldStartAfter = 0
-
-    running = Eager(db, taskPoolInterval=99, backlogWarnAfter=None)
-    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
-
-    try:
-        goQuiet(db, 5)
-        assert Eager(db).coldStart() is False
-    finally:
-        running.stopWorkers(timeout=5)
-
-
-def test_a_first_ever_start_is_a_cold_start(db):
-    app = Skipping(db)
-
-    assert app.lastActive() is None
-    assert app.coldStart() is True
-
-
-def test_a_stopped_worker_is_remembered_but_not_live(db):
-    app = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    app.startWorkers(taskWorkers=1, schedulerWorkers=0)
-    app.stopWorkers(timeout=5)
-
-    other = Skipping(db)
-
-    assert other.liveWorkers() == []
-    assert other.taskWorkers() == 0
-    assert other.lastActive() is not None
-
-
-def test_records_too_old_to_matter_are_pruned(db):
-    old = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    old.startWorkers(taskWorkers=1, schedulerWorkers=0)
-    old.stopWorkers(timeout=5)
-    goQuiet(db, Skipping.coldStartAfter + 1)
-
-    new = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    new.startWorkers(taskWorkers=1, schedulerWorkers=0)
-
-    try:
-        assert [w["uid"] for w in db["pymonque_workers"].find()] == [new.workerUid]
-    finally:
-        new.stopWorkers(timeout=5)
-
-
-def test_a_threshold_change_is_a_different_fingerprint(db):
-    class Short(App):
-        coldStartAfter = 10
-
-    assert Short(db).fingerprint != App(db).fingerprint
-
-
-def test_cold_start_is_about_other_processes_not_this_one(db):
-    running = Skipping(db, taskPoolInterval=99, backlogWarnAfter=None)
-    running.startWorkers(taskWorkers=1, schedulerWorkers=0)
-
-    try:
-        assert running.coldStart() is True           # it is the only one
-        assert running.otherLiveWorkers() == []
-
-        joining = Skipping(db, backlogWarnAfter=None)
-        joining.startWorkers(taskWorkers=1, schedulerWorkers=0)
-
-        try:
-            assert joining.coldStart() is False
-            assert len(joining.otherLiveWorkers()) == 1
-        finally:
-            joining.stopWorkers(timeout=5)
-    finally:
-        running.stopWorkers(timeout=5)
-
-
-def test_a_cold_start_says_what_it_dropped(db, caplog):
-    app = Skipping(db, backlogWarnAfter=None)
-    overdue(app, count=3)
-
-    with caplog.at_level(logging.WARNING, logger="pymonque"):
-        app.init()
-
-    assert "3 task(s) were due before this cold start" in caplog.text
-
-
-# --- nobody keeping up: skipAfter, at the claim ---
 
 @pytest.fixture
 def app(db):
@@ -260,6 +66,46 @@ def test_a_task_overrides_the_engine_in_both_directions(db):
     assert run(limited, late=10, skipAfter=1).status == "outdated"
 
 
+def test_minus_one_makes_a_task_unskippable(db):
+    class Limited(App):
+        taskSkipAfter = 60
+
+    limited = Limited(db, enforceVersion=False, backlogWarnAfter=None)
+
+    assert run(limited, late=86400, skipAfter=-1).status == "success"
+
+
+def test_minus_one_on_the_app_is_the_same_as_no_limit(db):
+    class Unlimited(App):
+        taskSkipAfter = -1
+
+    assert run(Unlimited(db, enforceVersion=False, backlogWarnAfter=None), late=86400).status == "success"
+
+
+def test_minus_one_lifts_a_timeout_too(db):
+    class Limited(App):
+        taskTimeout = 0.01
+
+    limited = Limited(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = limited.task.schedule(App.ping(), timeout=-1)
+
+    assert limited.task.timeoutFor(stored) is None
+
+
+@pytest.mark.parametrize("field", ["skipAfter", "timeout"])
+def test_any_other_negative_is_a_mistake(app, field):
+    with pytest.raises(ValidationError):
+        app.task.schedule(App.ping(), **{field: -5})
+
+
+def test_a_negative_app_limit_is_a_mistake_too(db):
+    class Broken(App):
+        taskSkipAfter = -5
+
+    with pytest.raises(ValueError):
+        Broken(db)
+
+
 def test_an_outdated_task_records_how_late_it_was(app):
     app.task.skipAfter = 60
     finished = run(app, late=300)
@@ -291,27 +137,14 @@ def test_an_outdated_task_is_not_run(db):
 
 def test_a_scheduler_stamps_its_limit_onto_what_it_emits(app):
     stored = app.scheduler.add(
-        App.ping(), app.distribution("constant", dailyFrequency=1), skipAfter=90
+        App.ping(), app.distribution("constant", dailyFrequency=1), skipAfter=-1
     )
     app.scheduler.collection.update_one(
         {"uid": stored.uid}, {"$set": {"deadline": utc_now(), "leaseUntil": utc_now()}}
     )
     app.scheduler._work()
 
-    assert app.task.find()[0].skipAfter == 90
-
-
-def test_the_two_are_independent(db):
-    """A queue that goes stale while the app is up is not a cold start."""
-
-    class Both(App):
-        overdueTaskPolicy = "skip"
-        taskSkipAfter = 60
-
-    app = Both(db, enforceVersion=False, backlogWarnAfter=None)
-
-    assert app.task.policy == "skip"
-    assert app.task.skipAfter == 60
+    assert app.task.find()[0].skipAfter == -1
 
 
 def test_a_limit_change_is_a_different_fingerprint(db):

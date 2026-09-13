@@ -5,7 +5,7 @@ from .core import (
     Scheduler, SchedulerEngine,
     Item, PileEngine,
     Document, CollectionEngine,
-    task, pile, schedulers, collection, utc_now
+    task, pile, schedulers, collection, utc_now, NO_LIMIT
 )
 
 import pymonque.exceptions
@@ -30,5 +30,6 @@ __all__ = [
     "schedulers",
     "collection",
     "utc_now",
+    "NO_LIMIT",
 ]
 

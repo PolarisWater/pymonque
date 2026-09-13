@@ -158,6 +158,21 @@ def test_a_scheduler_that_missed_a_beat_warns(app, caplog):
     assert "missed a beat" in caplog.text
 
 
+def test_a_disabled_scheduler_walks_its_deadline_without_warning(app, tasks, caplog):
+    """It keeps its distribution's shape for when it is enabled again, but owes nothing."""
+
+    scheduler = addScheduler(app)                    # hourly
+    setDeadline(app, scheduler, utc_now() - timedelta(hours=3))
+    app.scheduler.collection.update_one({"uid": scheduler.uid}, {"$set": {"status": "disabled"}})
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        app.scheduler._work()
+
+    assert caplog.text == ""
+    assert tasks.count_documents({}) == 0
+    assert app.scheduler.get(scheduler.uid).deadline > utc_now()
+
+
 def test_a_scheduler_that_is_merely_due_does_not_warn(app, caplog):
     scheduler = addScheduler(app)                    # hourly
     setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))

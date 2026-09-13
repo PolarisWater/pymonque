@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from pymonque import BaseApp, task, pile
 
 
-WORKER_POOL_INTERVAL = 0.02
+WORKER_POLL_INTERVAL = 0.02
 
 
 def wait_for(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:

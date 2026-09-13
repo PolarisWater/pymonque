@@ -106,7 +106,7 @@ def test_a_timeout_warns(slow, caplog):
 
 
 def test_a_raise_inside_a_timed_task_is_still_a_failure(slow):
-    finished = run(slow, Slow.boom(), timeout=5)
+    finished = run(slow, Slow.boom(), timeout=5, maxAttempts=1)
 
     assert finished.status == "failed"
     assert "ValueError" in finished.error

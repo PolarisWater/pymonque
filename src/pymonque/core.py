@@ -46,12 +46,9 @@ T = TypeVar("T")
 P = TypeVar("P")
 M = TypeVar("M", bound="Document")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "timeout", "canceled", "outdated", "incompatible"]
-# "processing" is no longer written — a scheduler being worked is one with a live
-# lease. It stays in the type so documents from older versions still validate.
-SCHEDULER_STATUS = Literal["enabled", "disabled", "processing"]
+SCHEDULER_STATUS = Literal["enabled", "disabled"]   # being worked is the lease's job, not a status
 ITEM_STATUS = Literal["pending", "claimed", "done", "failed"]
 
-OVERDUE_TASKS_POLICY = Literal["skip", "execute now"]
 OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
 STALE_ITEMS_POLICY = Literal["retry", "fail"]
 
@@ -60,7 +57,17 @@ BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobod
 BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshold disables them
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
-COLD_START_AFTER = 300      # after this long with nobody checked in, the app was down
+MAX_ATTEMPTS = 3            # runs a task gets before a failure is final
+NO_LIMIT = -1               # a timeout or skipAfter of this overrides any limit set further out
+
+
+def checkLimit(value: float | None) -> float | None:
+    """A limit is seconds, None to inherit the next one out, or NO_LIMIT."""
+
+    if value is not None and value < 0 and value != NO_LIMIT:
+        raise ValueError(f"a limit is seconds, None to inherit, or {NO_LIMIT} for none — not {value}")
+
+    return value
 HOSTNAME = socket.gethostname()
 
 def utc_now() -> datetime:
@@ -475,10 +482,13 @@ class Task(Document):
     result:         Any | None          = None
     error:          str | None          = None
 
-    # Both None means the engine's, and the engine's None means the app's.
-    # Nearest wins.
+    attempts:       int                 = 0      # claims so far, including ones that crashed
+
+    # None means the engine's, and the engine's None means the app's. Nearest
+    # wins, and NO_LIMIT (-1) on a timeout or skipAfter means none at all.
     timeout:        float | None        = None   # seconds this call may run for
     skipAfter:      float | None        = None   # seconds past the deadline it stops being worth running
+    maxAttempts:    int | None          = Field(default=None, ge=1)  # runs before a failure is final
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -486,6 +496,11 @@ class Task(Document):
             self.leaseUntil = self.deadline
 
         return self
+
+    @field_validator("timeout", "skipAfter")
+    @staticmethod
+    def validate_limit(value: float | None) -> float | None:
+        return checkLimit(value)
 
     @field_serializer("executionTime")
     @staticmethod
@@ -515,7 +530,8 @@ class TaskFactory(Document):
             work:       CallSpec,
             deadline:   datetime,
             timeout:    float | None = None,
-            skipAfter:  float | None = None
+            skipAfter:  float | None = None,
+            maxAttempts: int | None = None
         ) -> Task:
 
         return Task(
@@ -523,7 +539,8 @@ class TaskFactory(Document):
             deadline=deadline, 
             factory=self,
             timeout=timeout,
-            skipAfter=skipAfter
+            skipAfter=skipAfter,
+            maxAttempts=maxAttempts
         )
     
     def __repr__(self) -> str:
@@ -537,7 +554,7 @@ class WorkerLoop:
     """
 
     workerLabel: str = "worker"
-    poolInterval: float
+    pollInterval: float
     leaseSeconds: float
 
     def _initWorkers(self):
@@ -606,7 +623,7 @@ class WorkerLoop:
         to sit through a whole poll interval.
         """
 
-        self._stop.wait(self.poolInterval * (0.9 + random.random() * 0.2))
+        self._stop.wait(self.pollInterval * (0.9 + random.random() * 0.2))
 
     def work(self):
         while not self._stop.is_set():
@@ -676,23 +693,26 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             self, 
             app:              BaseApp,
             tasksCollection:    Collection | str | None = None,
-            poolInterval:       float = 1,
-            policy:             OVERDUE_TASKS_POLICY = "execute now",
+            pollInterval:       float = 1,
             defaultFactory:     TaskFactory | None = None,
             leaseSeconds:       float = LEASE_SECONDS,
             taskModel:          type[Task] = Task,
             extraIndexes:       Sequence[IndexModel] | None = None,
             timeout:            float | None = None,
-            skipAfter:          float | None = None
+            skipAfter:          float | None = None,
+            maxAttempts:        int | None = None
         ):
 
-        self.poolInterval = poolInterval
+        self.pollInterval = pollInterval
         self.leaseSeconds = leaseSeconds
-        self.timeout: float | None = timeout if timeout is not None else app.taskTimeout
-        self.skipAfter: float | None = skipAfter if skipAfter is not None else app.taskSkipAfter
+        self.timeout: float | None = checkLimit(timeout if timeout is not None else app.taskTimeout)
+        self.skipAfter: float | None = checkLimit(skipAfter if skipAfter is not None else app.taskSkipAfter)
+        self.maxAttempts: int = maxAttempts if maxAttempts is not None else app.taskMaxAttempts
         self.defaultFactory: TaskFactory = defaultFactory or app.defaultFactory
         self.distributionEngine: DistributionEngine = app.distribution
-        self.policy: OVERDUE_TASKS_POLICY = policy
+
+        if self.maxAttempts < 1:
+            raise ValueError(f"maxAttempts must be at least 1, not {self.maxAttempts}")
 
         # resolve tasks
         self.functions: dict[str, Callable] = {
@@ -724,44 +744,18 @@ class TaskEngine(CollectionEngine, WorkerLoop):
     def workCollection(self) -> Collection:
         return self.collection
 
-    def backfill(self):
-        """Give documents written before leases existed one, so they stay claimable."""
-
-        self.tasksCollection.update_many(
-            {"leaseUntil": None},   # missing or null
-            [{"$set": {"leaseUntil": "$deadline"}}],
-        )
-
     def init(self):
         """Startup housekeeping. Only ever run by a process that starts workers —
         never on construction, where it would disturb whatever else is running."""
-
-        now = utc_now()
-        self.backfill()
 
         self.tasksCollection.update_many(
             {"status": "pending", "work.functionName": {"$nin": list(self.functions)}},
             {"$set": {"status": "incompatible", "error": "Function for this task does not exist in this app"}},
         )  # flag pending tasks that can no longer be executed
 
-        # Only the first workers back apply it: joining a running cluster is not a
-        # return from downtime, and the backlog there belongs to somebody.
-        if self.policy == "skip" and self._app.coldStart():
-            skipped = self.tasksCollection.update_many(
-                {"status": "pending", "deadline": {"$lte": now}},
-                {"$set": {"status": "outdated"}},
-            ).modified_count
-
-            if skipped:
-                logger.warning(
-                    "%d task(s) were due before this cold start and are outdated "
-                    "(overdueTaskPolicy)", skipped
-                )
-
     def createIndexes(self):
         super().createIndexes()  # unique uid
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])  # _work() claim
-        self.collection.create_index([("status", 1), ("deadline", 1)])  # init() skip/outdate
 
     def _work(self):
         now = utc_now()
@@ -772,24 +766,41 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 "leaseUntil": {"$lte": now},
                 "work.functionName": {"$in": list(self.functions)},  # never claim what we cannot run
             },
-            {"$set": {"status": "processing", "leaseUntil": now + timedelta(seconds=self.leaseSeconds)}},
-            sort=[("leaseUntil", 1)]
+            {
+                "$set": {"status": "processing", "leaseUntil": now + timedelta(seconds=self.leaseSeconds)},
+                "$inc": {"attempts": 1},
+            },
+            sort=[("leaseUntil", 1)],
+            return_document=ReturnDocument.AFTER
         )
 
         if not raw:
             return
 
         task = self.load(raw)
-        task.leaseUntil = now + timedelta(seconds=self.leaseSeconds)  # raw is the pre-claim image
 
         if self._tooLate(task, now):
             return self._outdate(task, now)
+
+        # A failure is retried by writing it back as pending, so running out of
+        # attempts at the claim means the last one never reported back at all:
+        # its worker died. Running it again is how a task kills every worker.
+        if task.attempts > self.maxAttemptsFor(task):
+            return self._giveUp(task)
 
         self._hold(task.uid)
         try:
             task = self.execute(task)
         finally:
             self._releaseHold(task.uid)
+
+        if task.status == "failed" and task.attempts < self.maxAttemptsFor(task):
+            logger.warning(
+                "%r failed on attempt %d of %d, retrying",
+                task, task.attempts, self.maxAttemptsFor(task)
+            )
+            task.status = "pending"
+            task.leaseUntil = utc_now()     # claimable again, behind what is already due
 
         try:
             self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
@@ -802,23 +813,40 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         return task     # truthy, so the worker loop knows not to sleep
 
-    def timeoutFor(self, task: Task) -> float | None:
-        """Nearest wins: the task's own, then this engine's, then the app's."""
+    @staticmethod
+    def _nearest(own: float | None, engine: float | None) -> float | None:
+        """The task's own limit if it set one, else the engine's (which already
+        fell back to the app's). NO_LIMIT counts as set, and means none."""
 
-        return task.timeout if task.timeout is not None else self.timeout
+        limit = own if own is not None else engine
+
+        return None if limit == NO_LIMIT else limit
+
+    def timeoutFor(self, task: Task) -> float | None:
+        return self._nearest(task.timeout, self.timeout)
 
     def skipAfterFor(self, task: Task) -> float | None:
-        """Nearest wins, the same way."""
+        return self._nearest(task.skipAfter, self.skipAfter)
 
-        return task.skipAfter if task.skipAfter is not None else self.skipAfter
+    def maxAttemptsFor(self, task: Task) -> int:
+        return task.maxAttempts if task.maxAttempts is not None else self.maxAttempts
+
+    def _giveUp(self, task: Task) -> Task:
+        task.status = "failed"
+        task.error = (
+            f"gave up after {task.attempts - 1} attempt(s): the worker running the last "
+            f"one stopped renewing its lease without reporting back, so the task may be "
+            f"what is killing it"
+        )
+
+        self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+        logger.error("%r %s", task, task.error)
+
+        return task
 
     def _tooLate(self, task: Task, now: datetime) -> bool:
-        """Whether this task went stale waiting to be claimed.
-
-        The companion to overdueTaskPolicy, for the other way work goes stale:
-        that one is about a cold start after downtime, this one about a queue
-        nobody is keeping up with.
-        """
+        """Whether this task went stale waiting to be claimed — after downtime, or
+        in a queue nobody is keeping up with; it is the same condition."""
 
         limit = self.skipAfterFor(task)
 
@@ -882,6 +910,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 else self._callWithTimeout(task, timeout)
             )
             task.status = "success"
+            task.error = None       # from an earlier attempt
         except TaskTimeout as e:
             task.status = "timeout"
             task.error = str(e)
@@ -909,7 +938,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             deadline:       datetime, 
             factory:        TaskFactory,
             timeout:        float | None = None,
-            skipAfter:      float | None = None
+            skipAfter:      float | None = None,
+            maxAttempts:    int | None = None
         ) -> Task:
 
         return self.insert(
@@ -917,8 +947,9 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 deadline=deadline,
                 work=work,
                 timeout=timeout,
-                skipAfter=skipAfter
-            ) 
+                skipAfter=skipAfter,
+                maxAttempts=maxAttempts
+            )
         )
 
     def _notStarted(self) -> dict[str, Any]:
@@ -959,10 +990,12 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             deadline:       datetime | None = None,
             factory:        TaskFactory | None = None,
             timeout:        float | None = None,
-            skipAfter:      float | None = None
+            skipAfter:      float | None = None,
+            maxAttempts:    int | None = None
         ) -> Task:
 
-        """Queue one call. `timeout` and `skipAfter` override the engine's and the app's."""
+        """Queue one call. `timeout`, `skipAfter` and `maxAttempts` override the
+        engine's and the app's."""
 
         factory = factory or self.defaultFactory
         deadline = deadline or utc_now()
@@ -974,7 +1007,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             deadline=deadline, 
             factory=factory,
             timeout=timeout,
-            skipAfter=skipAfter
+            skipAfter=skipAfter,
+            maxAttempts=maxAttempts
         )
 
     def scheduleFromDistribution(
@@ -983,7 +1017,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             distribution:   CallSpec,
             factory:        TaskFactory | None = None,
             timeout:        float | None = None,
-            skipAfter:      float | None = None
+            skipAfter:      float | None = None,
+            maxAttempts:    int | None = None
         ) -> Task:
 
         self._app.distribution.validate(distribution)
@@ -994,7 +1029,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             deadline=deadline,
             factory=factory,
             timeout=timeout,
-            skipAfter=skipAfter
+            skipAfter=skipAfter,
+            maxAttempts=maxAttempts
         )
 
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
@@ -1010,8 +1046,9 @@ class Scheduler(TaskFactory):
     distribution:   CallSpec
     deadline:       datetime
     leaseUntil:     datetime | None     = None
-    timeout:        float | None        = None   # both stamped onto every task it emits
+    timeout:        float | None        = None   # all three stamped onto every task it emits
     skipAfter:      float | None        = None
+    maxAttempts:    int | None          = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -1019,6 +1056,11 @@ class Scheduler(TaskFactory):
             self.leaseUntil = self.deadline
 
         return self
+
+    @field_validator("timeout", "skipAfter")
+    @staticmethod
+    def validate_limit(value: float | None) -> float | None:
+        return checkLimit(value)
 
     def emitWork(self) -> CallSpec:
         """The call this scheduler emits. Override to stamp context onto every task.
@@ -1033,7 +1075,10 @@ class Scheduler(TaskFactory):
         return self.work
 
     def _emit(self, deadline: datetime) -> Task:
-        return super()._emit(self.emitWork(), deadline, self.timeout, self.skipAfter)
+        return super()._emit(
+            self.emitWork(), deadline,
+            timeout=self.timeout, skipAfter=self.skipAfter, maxAttempts=self.maxAttempts
+        )
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work!r}"
@@ -1046,14 +1091,14 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             app:                  BaseApp,
             schedulersCollection:   Collection | str | None = None,
             taskEngine:             TaskEngine | None = None,
-            poolInterval:           float = 1,
+            pollInterval:           float = 1,
             policy:                 OVERDUE_SCHEDULES_POLICY = "execute once",
             schedulerModel:         type[Scheduler] = Scheduler,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float = LEASE_SECONDS
         ):
 
-        self.poolInterval = poolInterval
+        self.pollInterval = pollInterval
         self.leaseSeconds = leaseSeconds
         self.taskEngine: TaskEngine = taskEngine or app.task
         self.policy: OVERDUE_SCHEDULES_POLICY = policy
@@ -1087,19 +1132,6 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         return {"deadline": deadline, "leaseUntil": deadline}
 
-    def backfill(self):
-        self.schedulersCollection.update_many(
-            {"leaseUntil": None},   # missing or null
-            [{"$set": {"leaseUntil": "$deadline"}}],
-        )
-
-        # "processing" used to mean "being worked"; the lease says that now, so a
-        # document left in it by an older version would otherwise never emit again
-        self.schedulersCollection.update_many(
-            {"status": "processing"},
-            {"$set": {"status": "enabled"}},
-        )
-
     def init(self):
         """Startup housekeeping. Only run by a process that starts workers.
 
@@ -1107,8 +1139,6 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         running just as easily as while nothing runs, so _work() applies it every
         time it claims one.
         """
-
-        self.backfill()
 
         self.schedulersCollection.update_many(
             {"status": "enabled", "work.functionName": {"$nin": list(self.taskEngine.functions)}},
@@ -1160,7 +1190,10 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             {"$set": self._deadline(deadline)}
         )
 
-        if behind:
+        # a disabled scheduler still walks its deadline, so its distribution keeps
+        # its shape for when it is enabled again — but it owes nothing, so it
+        # has nothing to warn about
+        if behind and scheduler.status == "enabled":
             logger.warning(
                 "%r missed a beat of %s (policy: %s)", scheduler, interval, self.policy
             )
@@ -1419,18 +1452,10 @@ class PileEngine(CollectionEngine):
     def itemsCollection(self) -> Collection:
         return self.collection
 
-    def backfill(self):
-        self.collection.update_many(
-            {"leaseUntil": None},   # missing or null
-            [{"$set": {"leaseUntil": "$createdAt"}}],
-        )
-
     def init(self):
         """Under "retry" there is nothing to do — an expired lease is claimable
         again on its own. "fail" is the one that needs saying out loud, and claim()
         says it too, so a stale item does not wait for a boot to be resolved."""
-
-        self.backfill()
 
         if self.policy == "fail":
             self._failStale(utc_now())
@@ -1776,7 +1801,7 @@ class schedulers:
             schedulerModel:         type[Scheduler] = Scheduler,
             schedulersCollection:   Collection | str | None = None,
             policy:                 OVERDUE_SCHEDULES_POLICY | None = None,
-            poolInterval:           float | None = None,
+            pollInterval:           float | None = None,
             taskEngine:             TaskEngine | None = None,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float | None = None
@@ -1793,7 +1818,7 @@ class schedulers:
         self.schedulerModel = schedulerModel
         self.schedulersCollection = schedulersCollection
         self.policy = policy
-        self.poolInterval = poolInterval
+        self.pollInterval = pollInterval
         self.taskEngine = taskEngine
         self.extraIndexes = extraIndexes
         self.name: str = ""
@@ -1805,7 +1830,7 @@ class schedulers:
             self,
             app:          BaseApp,
             policy:         OVERDUE_SCHEDULES_POLICY,
-            poolInterval:   float,
+            pollInterval:   float,
             leaseSeconds:   float
         ) -> SchedulerEngine:
 
@@ -1817,7 +1842,7 @@ class schedulers:
             app,
             schedulersCollection=collection,
             taskEngine=self.taskEngine,
-            poolInterval=self.poolInterval if self.poolInterval is not None else poolInterval,
+            pollInterval=self.pollInterval if self.pollInterval is not None else pollInterval,
             policy=self.policy or policy,
             schedulerModel=self.schedulerModel,
             extraIndexes=self.extraIndexes,
@@ -1878,26 +1903,26 @@ class BaseApp:
     # Policies are declared on the class, never passed in: every process that
     # imports this app must agree on them, and they are part of the fingerprint
     # so two that disagree cannot both run workers.
-    overdueTaskPolicy:          OVERDUE_TASKS_POLICY      = "execute now"
     overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
     staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
 
-    # Seconds nothing may have checked in for before a start counts as a return
-    # from downtime. Shorter gaps — a restart, a rolling deploy — are not.
-    coldStartAfter:             float                     = COLD_START_AFTER
-
     # Seconds a task may run before it is written off, and seconds past its
     # deadline before it stops being worth running at all. None means no limit;
-    # an engine or an individual task may set its own.
+    # an engine or an individual task may set its own, and a task's NO_LIMIT
+    # lifts whatever is set out here.
     taskTimeout:                float | None              = None
     taskSkipAfter:              float | None              = None
+
+    # How many times a task runs before a failure is final. A crash counts: a
+    # task that takes its worker down with it is given up on, not rerun forever.
+    taskMaxAttempts:            int                       = MAX_ATTEMPTS
 
     def __init__(
             self, 
             db:                    Database, 
             distributionsRegistry:      type[BaseDistributions] = BaseDistributions,
-            taskPoolInterval:           float = 1,
-            schedulerPoolInterval:      float = 1,
+            taskPollInterval:           float = 1,
+            schedulerPollInterval:      float = 1,
             leaseSeconds:               float = LEASE_SECONDS,
             enforceVersion:             bool = True,
             heartbeatInterval:          float = HEARTBEAT_INTERVAL,
@@ -1928,7 +1953,7 @@ class BaseApp:
         self.distribution: DistributionEngine = DistributionEngine(distributionsRegistry)
 
         self._buildStorage()
-        self._buildEngines(taskPoolInterval, schedulerPoolInterval)
+        self._buildEngines(taskPollInterval, schedulerPollInterval)
 
         # NB: init() is deliberately not called here. Constructing an app must be
         # safe from any process at any time; startup housekeeping belongs to a
@@ -1956,22 +1981,21 @@ class BaseApp:
             for name, spec in type(self)._getPiles().items()
         }
 
-    def _buildEngines(self, taskPoolInterval: float, schedulerPoolInterval: float):
+    def _buildEngines(self, taskPollInterval: float, schedulerPollInterval: float):
 
         self.task: TaskEngine = TaskEngine(
-            self, poolInterval=taskPoolInterval, policy=self.overdueTaskPolicy,
-            leaseSeconds=self.leaseSeconds
+            self, pollInterval=taskPollInterval, leaseSeconds=self.leaseSeconds
         )
 
         self.schedulerEngines: dict[str, SchedulerEngine] = {
-            name: spec._engine(self, self.overdueSchedulersPolicy, schedulerPoolInterval, self.leaseSeconds)
+            name: spec._engine(self, self.overdueSchedulersPolicy, schedulerPollInterval, self.leaseSeconds)
             for name, spec in type(self)._getSchedulerEngines().items()
         }
 
         # a declaration named `scheduler` replaces the default engine
         if "scheduler" not in self.schedulerEngines:
             self.scheduler: SchedulerEngine = SchedulerEngine(
-                self, poolInterval=schedulerPoolInterval, policy=self.overdueSchedulersPolicy,
+                self, pollInterval=schedulerPollInterval, policy=self.overdueSchedulersPolicy,
                 leaseSeconds=self.leaseSeconds
             )
             self.schedulerEngines["scheduler"] = self.scheduler
@@ -2001,12 +2025,12 @@ class BaseApp:
 
         parts += [
             f"{engine.name}:{engine.policy}"
-            for engine in (self.task, *self.schedulerEngines.values(), *self.piles.values())
+            for engine in (*self.schedulerEngines.values(), *self.piles.values())
         ]
 
-        parts.append(f"coldStartAfter:{self.coldStartAfter}")
         parts.append(f"taskTimeout:{self.task.timeout}")
         parts.append(f"taskSkipAfter:{self.task.skipAfter}")
+        parts.append(f"taskMaxAttempts:{self.task.maxAttempts}")
 
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 
@@ -2036,49 +2060,12 @@ class BaseApp:
 
         return count, (now - oldest["leaseUntil"]).total_seconds()
 
-    def otherLiveWorkers(self) -> list[dict]:
-        """Every process checked in but this one."""
-
-        return [w for w in self.liveWorkers() if w.get("uid") != self.workerUid]
-
-    def lastActive(self) -> datetime | None:
-        """When any other process last checked in, running or since stopped."""
-
-        latest = self.workersCollection.find_one(
-            {"uid": {"$ne": self.workerUid}}, {"lastSeen": 1}, sort=[("lastSeen", -1)]
-        )
-
-        return None if latest is None else latest["lastSeen"]
-
-    def coldStart(self) -> bool:
-        """True when nothing else is running, and nothing has been for coldStartAfter.
-
-        overdueTaskPolicy is about coming back from downtime, so it must not fire
-        for a worker joining a cluster that never went down — that one would drop
-        work its colleagues were about to run — nor for a restart or a rolling
-        deploy, which leave a gap but no downtime. With enforceVersion off there
-        is no registry to ask, and every start looks cold.
-        """
-
-        if self.otherLiveWorkers():
-            return False
-
-        recent = utc_now() - timedelta(seconds=self.coldStartAfter)
-
-        return not self.workersCollection.count_documents(
-            {"uid": {"$ne": self.workerUid}, "lastSeen": {"$gte": recent}}
-        )
-
     def taskWorkers(self) -> int:
         """Task workers across every process that has checked in.
 
         A scheduler-only process runs none of its own, so counting locally would
-        cry wolf at a perfectly good deployment. Falls back to this process alone
-        when it is not registering.
+        cry wolf at a perfectly good deployment.
         """
-
-        if not self.enforceVersion:
-            return self.task.workerCount
 
         return sum(w.get("taskWorkers", 0) for w in self.liveWorkers())
 
@@ -2112,13 +2099,10 @@ class BaseApp:
             self._checkWorkers()
 
     def liveWorkers(self) -> list[dict]:
-        """Worker processes that have checked in recently and not stopped."""
+        """Worker processes that have checked in recently."""
 
         return list(self.workersCollection.find(
-            {
-                "lastSeen": {"$gte": utc_now() - timedelta(seconds=self.workerStaleAfter)},
-                "stoppedAt": None,
-            },
+            {"lastSeen": {"$gte": utc_now() - timedelta(seconds=self.workerStaleAfter)}},
             {"_id": 0}
         ))
 
@@ -2145,14 +2129,9 @@ class BaseApp:
                 f"stop the old workers before starting these."
             )
 
-    def _claimVersion(self):
-        """Verify, then register this process as a worker."""
-
-        self._verifyVersion()
-
-        # records old enough to answer neither liveWorkers() nor coldStart()
-        forgotten = utc_now() - timedelta(seconds=max(self.coldStartAfter, self.workerStaleAfter))
-        self.workersCollection.delete_many({"lastSeen": {"$lt": forgotten}})
+    def _register(self):
+        """Check this process in, so others can count its workers and check their
+        version against it. Every worker process does, whether or not it enforces."""
 
         self.workersCollection.update_one(
             {"uid": self.workerUid},
@@ -2163,25 +2142,16 @@ class BaseApp:
                 "pid":          os.getpid(),
                 "startedAt":    utc_now(),
                 "lastSeen":     utc_now(),
-                "stoppedAt":    None,
                 "taskWorkers":  0,      # filled in once the engines are up
             }},
             upsert=True
         )
 
     def _deregisterWorker(self):
-        """Free this process's slot immediately, rather than waiting for it to go stale.
-
-        The record stays, marked stopped: when this process was last alive is what
-        tells the next start whether the app was down or only restarting.
-        """
+        """Free this process's slot immediately, rather than waiting for it to go stale."""
 
         try:
-            now = utc_now()
-            self.workersCollection.update_one(
-                {"uid": self.workerUid},
-                {"$set": {"stoppedAt": now, "lastSeen": now, "taskWorkers": 0}}
-            )
+            self.workersCollection.delete_one({"uid": self.workerUid})
         except Exception:
             logger.exception("could not deregister worker")
 
@@ -2214,7 +2184,7 @@ class BaseApp:
         return [self.task, *self.schedulerEngines.values()]
 
     def init(self):
-        """Startup housekeeping: backfill leases, and resolve documents whose task
+        """Startup housekeeping: resolve documents whose task
         no longer exists on this app.
 
         Run by startWorkers(), not by the constructor — a process that only
@@ -2243,22 +2213,19 @@ class BaseApp:
         self._stopping = False
         self._quit.clear()
 
-        if self.enforceVersion:
-            self._claimVersion()
-            self._monitor("heartbeat", self._heartbeat)
-
-        self.init()
+        self.init()             # refuses here if a live worker is running other code
+        self._register()
+        self._monitor("heartbeat", self._heartbeat)
 
         self.task.startWorkers(taskWorkers or 0)
 
         for engine in self.schedulerEngines.values():
             engine.startWorkers(schedulerWorkers or 0)
 
-        if self.enforceVersion:
-            self.workersCollection.update_one(
-                {"uid": self.workerUid},
-                {"$set": {"taskWorkers": self.task.workerCount}}
-            )
+        self.workersCollection.update_one(
+            {"uid": self.workerUid},
+            {"$set": {"taskWorkers": self.task.workerCount}}
+        )
 
         if self.backlogWarnAfter is not None:
             self._checkWorkers()    # say it now if the backlog is already old

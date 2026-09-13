@@ -24,7 +24,7 @@ class Slow(BaseApp):
 
 def app(db, **kwargs):
     return Slow(db, **{"enforceVersion": False, "backlogWarnAfter": 1,
-                       "backlogInterval": 60, "taskPoolInterval": 0.02, **kwargs})
+                       "backlogInterval": 60, "taskPollInterval": 0.02, **kwargs})
 
 
 def overdue(a, spec, count=1, seconds=5):
@@ -118,7 +118,7 @@ def test_a_drained_queue_says_nothing(db, caplog):
 def test_the_count_spans_processes(db):
     """A scheduler-only process must not report that nobody is working."""
 
-    worker = Slow(db, backlogWarnAfter=None, taskPoolInterval=0.02)
+    worker = Slow(db, backlogWarnAfter=None, taskPollInterval=0.02)
     worker.startWorkers(taskWorkers=3, schedulerWorkers=0)
 
     try:

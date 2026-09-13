@@ -89,7 +89,7 @@ def test_an_inserted_document_is_bound_to_its_key(store):
 # --- what a process leaves running ---
 
 def test_starting_twice_does_not_leave_two_heartbeats(db):
-    app = Store(db, taskPoolInterval=0.02, heartbeatInterval=30, backlogInterval=30)
+    app = Store(db, taskPollInterval=0.02, heartbeatInterval=30, backlogInterval=30)
 
     try:
         app.startWorkers(taskWorkers=1, schedulerWorkers=0)
@@ -106,7 +106,7 @@ def test_starting_twice_does_not_leave_two_heartbeats(db):
 def test_stopping_takes_the_monitor_threads_with_it(db):
     """They used to wait out a whole interval, so a stop left them running."""
 
-    app = Store(db, taskPoolInterval=0.02, heartbeatInterval=30, backlogInterval=30)
+    app = Store(db, taskPollInterval=0.02, heartbeatInterval=30, backlogInterval=30)
     app.startWorkers(taskWorkers=1, schedulerWorkers=0)
     monitors = list(app._monitors.values())
 
@@ -137,7 +137,7 @@ def test_a_stopped_process_does_not_block_the_next_version(db):
 
 
 def test_workers_can_be_started_again_after_a_stop(db):
-    app = Store(db, taskPoolInterval=0.02, backlogWarnAfter=None)
+    app = Store(db, taskPollInterval=0.02, backlogWarnAfter=None)
     app.startWorkers(taskWorkers=1, schedulerWorkers=0)
     app.stopWorkers(timeout=5)
 

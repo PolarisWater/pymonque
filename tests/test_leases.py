@@ -48,7 +48,7 @@ def gates():
 @pytest.fixture
 def long(db):
     # renewal runs every max(1, leaseSeconds/3), so 3s means once a second
-    return LongApp(db, taskPoolInterval=0.05, leaseSeconds=3, enforceVersion=False)
+    return LongApp(db, taskPollInterval=0.05, leaseSeconds=3, enforceVersion=False)
 
 
 # --- a claim is exclusive while it is held ---
@@ -145,60 +145,6 @@ def test_a_new_instance_does_not_disturb_work_in_flight(long, db):
     release.set()
     assert wait_for(lambda: db["pymonque_tasks"].find_one()["status"] == "success", timeout=5)
     long.stopWorkers(timeout=5)
-
-
-def test_constructing_a_app_runs_no_housekeeping(db):
-    app = appWith(ExampleApp, db, overdueTaskPolicy="skip")
-    app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
-
-    appWith(ExampleApp, db, overdueTaskPolicy="skip")   # would have outdated it before
-
-    assert app.task.tasksCollection.find_one()["status"] == "pending"
-
-
-def test_starting_workers_does_run_it(db):
-    app = appWith(ExampleApp, db, overdueTaskPolicy="skip",
-                  _kwargs={"enforceVersion": False})
-    app.task.schedule(app.task("greet", name="old"), deadline=utc_now() - timedelta(days=1))
-
-    app.startWorkers(taskWorkers=0, schedulerWorkers=0)
-
-    assert app.task.tasksCollection.find_one()["status"] == "outdated"
-
-
-# --- documents written before leases existed ---
-
-def test_a_task_without_a_lease_is_backfilled(db, app, tasks):
-    app.task.schedule(ExampleApp.greet(name="Ada"))
-    tasks.update_many({}, {"$unset": {"leaseUntil": ""}})
-
-    assert app.task._work() is None          # invisible to the claim until backfilled
-
-    app.init()
-
-    assert app.task._work() is not None
-
-
-def test_a_scheduler_left_processing_by_an_old_version_is_revived(db, app, schedulers):
-    app.scheduler.add(ExampleApp.greet(name="Ada"), app.distribution("constant", dailyFrequency=24))
-    schedulers.update_many({}, {"$set": {"status": "processing"}, "$unset": {"leaseUntil": ""}})
-
-    app.init()
-    revived = app.scheduler.find()[0]
-
-    assert revived.status == "enabled"
-    assert revived.leaseUntil == revived.deadline
-
-
-def test_an_item_without_a_lease_is_backfilled(db, app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.itemsCollection.update_many({}, {"$unset": {"leaseUntil": ""}})
-
-    assert app.outbox.claim() is None
-
-    app.init()
-
-    assert app.outbox.claim() is not None
 
 
 # --- scheduler leases ---

@@ -41,7 +41,7 @@ def resetGates():
 
 @pytest.fixture
 def slow(db):
-    return SlowApp(db, taskPoolInterval=0.02, enforceVersion=False)
+    return SlowApp(db, taskPollInterval=0.02, enforceVersion=False)
 
 
 # --- stopping ---
@@ -56,7 +56,7 @@ def test_stopWorkers_stops_the_loops(slow):
 
 
 def test_stopping_is_not_delayed_by_the_poll_interval(db):
-    app = ExampleApp(db, taskPoolInterval=5, enforceVersion=False)   # a full sleep would be obvious
+    app = ExampleApp(db, taskPollInterval=5, enforceVersion=False)   # a full sleep would be obvious
     app.startWorkers(taskWorkers=2, schedulerWorkers=1)
     time.sleep(0.05)   # let them reach the idle wait
 
@@ -115,7 +115,7 @@ def test_requestStop_does_not_block(slow):
 
 
 def test_workers_can_be_started_again_after_a_stop(db):
-    app = ExampleApp(db, taskPoolInterval=0.02, enforceVersion=False)
+    app = ExampleApp(db, taskPollInterval=0.02, enforceVersion=False)
     app.startWorkers(taskWorkers=1)
     app.stopWorkers(timeout=3)
 

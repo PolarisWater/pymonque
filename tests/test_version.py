@@ -7,7 +7,7 @@ import pytest
 from pymonque import BaseApp, task, utc_now
 from pymonque.exceptions import VersionMismatch
 
-from conftest import ExampleApp, WORKER_POOL_INTERVAL, appWith, wait_for
+from conftest import ExampleApp, WORKER_POLL_INTERVAL, appWith, wait_for
 
 
 class V1(BaseApp):
@@ -145,7 +145,7 @@ def test_a_registered_worker_reports_itself(db):
 # --- the worker loop no longer sleeps between tasks ---
 
 def test_a_backlog_drains_without_waiting_per_task(db):
-    app = ExampleApp(db, taskPoolInterval=5)   # a sleep this long would be obvious
+    app = ExampleApp(db, taskPollInterval=5)   # a sleep this long would be obvious
     for n in range(20):
         app.task.schedule(app.task("greet", name=str(n)))
 
@@ -161,9 +161,9 @@ def test_a_backlog_drains_without_waiting_per_task(db):
 
 
 def test_an_idle_worker_still_waits(db):
-    app = ExampleApp(db, taskPoolInterval=WORKER_POOL_INTERVAL)
+    app = ExampleApp(db, taskPollInterval=WORKER_POLL_INTERVAL)
     app.startWorkers(taskWorkers=1)
-    time.sleep(WORKER_POOL_INTERVAL * 2)
+    time.sleep(WORKER_POLL_INTERVAL * 2)
 
     app.task.schedule(app.task("greet", name="late"))
 
@@ -219,11 +219,10 @@ def test_a_policy_change_is_a_different_fingerprint(db):
     assert Retrying(db).fingerprint != Failing(db).fingerprint
 
 
-@pytest.mark.parametrize("policy", ["overdueTaskPolicy", "overdueSchedulersPolicy"])
-def test_every_policy_reaches_the_fingerprint(db, policy):
-    changed = {"overdueTaskPolicy": "skip", "overdueSchedulersPolicy": "skip"}[policy]
+def test_the_scheduler_policy_reaches_the_fingerprint(db):
+    changed = appWith(ExampleApp, db, overdueSchedulersPolicy="skip")
 
-    assert ExampleApp(db).fingerprint != appWith(ExampleApp, db, **{policy: changed}).fingerprint
+    assert ExampleApp(db).fingerprint != changed.fingerprint
 
 
 def test_a_policy_mismatch_cannot_run_workers_alongside(db):

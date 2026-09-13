@@ -10,7 +10,7 @@ from pymonque import (
     PileEngine, Task, task, pile, utc_now,
 )
 
-from conftest import ExampleApp, WORKER_POOL_INTERVAL, wait_for
+from conftest import ExampleApp, WORKER_POLL_INTERVAL, wait_for
 
 
 @pytest.fixture
@@ -19,8 +19,8 @@ def fast(db):
 
     return ExampleApp(
         db,
-        taskPoolInterval=WORKER_POOL_INTERVAL,
-        schedulerPoolInterval=WORKER_POOL_INTERVAL,
+        taskPollInterval=WORKER_POLL_INTERVAL,
+        schedulerPollInterval=WORKER_POLL_INTERVAL,
     )
 
 
@@ -97,7 +97,7 @@ def test_workers_never_run_a_task_twice(fast, db):
     fast.task.schedule(ExampleApp.greet(name="Ada"))
     fast.startWorkers(taskWorkers=4, schedulerWorkers=0)
     wait_for(lambda: db["pymonque_tasks"].count_documents({"status": "success"}) == 1)
-    time.sleep(WORKER_POOL_INTERVAL * 3)
+    time.sleep(WORKER_POLL_INTERVAL * 3)
 
     assert db["pymonque_tasks"].count_documents({}) == 1
     assert Task.model_validate(db["pymonque_tasks"].find_one()).executionTime is not None
@@ -133,7 +133,7 @@ def test_a_scheduler_feeds_a_pile_draining_task(fast, db):
 def test_startWorkers_defaults_to_no_workers(app):
     app.task.schedule(ExampleApp.greet(name="Ada"))
     app.startWorkers()
-    time.sleep(WORKER_POOL_INTERVAL * 2)
+    time.sleep(WORKER_POLL_INTERVAL * 2)
 
     assert app.task.tasksCollection.count_documents({"status": "pending"}) == 1
 
@@ -150,7 +150,7 @@ def test_a_worker_survives_a_failing_iteration(app, engine, monkeypatch):
             time.sleep(60)  # park the thread; the loop has no stop signal
 
     target = getattr(app, engine)
-    target.poolInterval = WORKER_POOL_INTERVAL
+    target.pollInterval = WORKER_POLL_INTERVAL
     monkeypatch.setattr(target, "_work", flaky)
     target.startWorkers(1)
 
@@ -162,7 +162,7 @@ def test_a_failing_iteration_is_logged(app, engine, monkeypatch, caplog):
     import logging
 
     target = getattr(app, engine)
-    target.poolInterval = 60  # one iteration is enough
+    target.pollInterval = 60  # one iteration is enough
     monkeypatch.setattr(target, "_work", lambda: (_ for _ in ()).throw(RuntimeError("bang")))
 
     with caplog.at_level(logging.ERROR, logger="pymonque"):
@@ -174,22 +174,20 @@ def test_a_failing_iteration_is_logged(app, engine, monkeypatch, caplog):
 
 # --- construction options ---
 
-def test_pool_intervals_reach_the_engines(db):
-    app = ExampleApp(db, taskPoolInterval=2, schedulerPoolInterval=3)
+def test_poll_intervals_reach_the_engines(db):
+    app = ExampleApp(db, taskPollInterval=2, schedulerPollInterval=3)
 
-    assert app.task.poolInterval == 2
-    assert app.scheduler.poolInterval == 3
+    assert app.task.pollInterval == 2
+    assert app.scheduler.pollInterval == 3
 
 
 def test_policies_reach_the_engines(db):
     class App(ExampleApp):
-        overdueTaskPolicy       = "skip"
         overdueSchedulersPolicy = "execute once"
         staleItemsPolicy        = "fail"
 
     app = App(db)
 
-    assert app.task.policy == "skip"
     assert app.scheduler.policy == "execute once"
     assert app.outbox.policy == "fail"
 

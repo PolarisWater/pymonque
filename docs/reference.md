@@ -4,15 +4,17 @@
 
 ```python
 class App(BaseApp):
-    overdueTaskPolicy       = "execute now"     # policies are declared, not passed
-    overdueSchedulersPolicy = "execute once"
+    overdueSchedulersPolicy = "execute once"    # policies are declared, not passed
     staleItemsPolicy        = "retry"
+    taskTimeout             = None              # and so are the task limits
+    taskSkipAfter           = None
+    taskMaxAttempts         = 3
 
 app = App(
     db,                                         # pymongo Database
     distributionsRegistry   = BaseDistributions,
-    taskPoolInterval        = 1,                # seconds between polls
-    schedulerPoolInterval   = 1,
+    taskPollInterval        = 1,                # seconds between polls
+    schedulerPollInterval   = 1,
 )
 ```
 
@@ -57,9 +59,8 @@ A stop is checked **between** iterations, never inside one, so work already clai
 to completion. Anything not yet claimed stays `pending` for the next process. Workers wait on the
 stop event rather than sleeping, so a shutdown doesn't sit through a poll interval.
 
-`stopWorkers` marks the process stopped, which frees its version slot immediately — the
-replacement deployment can start without waiting out `workerStaleAfter`. The record itself stays
-a while, so the next start can tell a restart from [downtime](#policies).
+`stopWorkers` deregisters the process, which frees its version slot immediately — the replacement
+deployment can start without waiting out `workerStaleAfter`.
 
 ### Signals
 
@@ -191,12 +192,12 @@ app.task.schedule(App.retain(days=0))    # TaskValidationError, before it is eve
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None)` | Store a task, and return it. Deadline defaults to now. |
+| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None, maxAttempts=None)` | Store a task, and return it. Deadline defaults to now. |
 | `scheduleFromDistribution(work, distribution, ...)` | Same, deadline is now + one interval. |
 | `__call__(functionName, **kwargs)` | Build and validate a `CallSpec`. |
 | `validate(work)` | Raises `TaskNotFound` / `TaskValidationError`. |
 | `execute(task)` | Run one task, return it filled in. |
-| `timeoutFor(task)` / `skipAfterFor(task)` | The limits that apply to it. |
+| `timeoutFor(task)` / `skipAfterFor(task)` / `maxAttemptsFor(task)` | The limits that apply to it, resolved. |
 | `backlog()` | `(due, secondsTheOldestHasWaited)` — on `BaseApp`. |
 | `startWorkers(n)` | Poll, claim, execute. |
 
@@ -215,22 +216,24 @@ twice. See [Leases](#leases) for why one field covers both due and abandoned.
 | `factory` | `TaskFactory` — `{uid, name}` |
 | `executionTime` | `timedelta`, stored as seconds |
 | `result` | anything BSON can encode |
-| `error` | traceback, on failure |
-| `timeout` | `float` seconds, or `None` for the engine's |
-| `skipAfter` | `float` seconds past the deadline, or `None` for the engine's |
+| `error` | traceback of the last failure |
+| `attempts` | `int`, bumped on every claim — a crashed run counts |
+| `timeout` | `float` seconds, `None` for the engine's, `-1` for none |
+| `skipAfter` | `float` seconds past the deadline, `None` for the engine's, `-1` for never |
+| `maxAttempts` | `int` ≥ 1, or `None` for the engine's |
 
 ```
 pending ─→ processing ─→ success
-                ├──────→ failed        the call raised
-                ├──────→ timeout       the call outlived its limit
+                ├──────→ pending       the call raised, attempts are left
+                ├──────→ failed        the call raised on the last attempt
+                ├──────→ timeout       the call outlived its limit (never retried)
                 └──────→ processing    lease lapsed; another worker claimed it
+                                       (or failed, if that was the last attempt)
 
-pending ─→ outdated       due before a cold start, or claimed past skipAfter
+pending ─→ outdated       claimed past skipAfter
+pending ─→ canceled       cancel() before it started
 pending ─→ incompatible   the function no longer exists on the app
 ```
-
-`canceled` is no longer written — an abandoned task is recovered by its lease rather than being
-cancelled at startup. It stays in the type so older documents still validate.
 
 A result the driver cannot encode is stored as a `failed` task, not left claimed.
 
@@ -259,7 +262,10 @@ and the document stop waiting on it, which is what every other process can see. 
 actually stop needs to check something itself.
 
 With no timeout set, the call runs on the worker thread exactly as before; the extra thread only
-appears when a limit applies.
+appears when a limit applies. `timeout=-1` on a task (`NO_LIMIT`) lifts the engine's and the app's.
+
+A timed-out task is **not retried**: its call may still be running, and a second attempt would run
+it twice at once.
 
 Timeouts are part of the [fingerprint](#one-version-at-a-time), like the policies: whether a task
 ends up `timeout` must not depend on which process picked it up.
@@ -280,9 +286,38 @@ app.scheduler.add(App.sync(), daily, skipAfter=120) # stamped on what it emits
 If a worker claims a task more than `skipAfter` seconds past its deadline, it is written
 `outdated` with how late it was, and never run. `None` — the default — means run however late.
 
-This is the companion to `overdueTaskPolicy`, not a replacement: that one is about a **cold start
-after downtime**, this one about a **queue nobody is keeping up with**. Set both if you want both.
-It is in the fingerprint for the same reason timeouts are.
+It is the one rule for stale work, whatever made it stale: the app was down, or nobody kept up.
+A task that must run no matter how late opts out with `skipAfter=-1`:
+
+```python
+app.task.schedule(App.charge(...), skipAfter=-1)    # never skipped, whatever the app says
+```
+
+A retry keeps its original deadline, so a task that keeps failing can age past `skipAfter` and be
+outdated between attempts. It is in the fingerprint for the same reason timeouts are.
+
+## Retries
+
+A task that raises is put back as `pending` and run again, until it has run `maxAttempts` times;
+the last failure is final. Same three levels, nearest wins:
+
+```python
+class App(BaseApp):
+    taskMaxAttempts = 3             # app (the default)
+
+app.task.maxAttempts = 5            # engine
+app.task.schedule(App.charge(...), maxAttempts=1)   # task: never retried
+```
+
+A retry is claimable at once, behind whatever is already due. `error` holds the last failure, and
+is cleared if a later attempt succeeds.
+
+**A crash counts as an attempt.** A worker that dies mid-task leaves it `processing` with a lapsing
+lease, and the next worker reclaims it — but if that claim would exceed `maxAttempts`, the task is
+written `failed` instead of run. So a task that takes its worker down with it (out of memory, a
+segfault, a killed container) is given up on rather than taking every worker down in turn.
+
+Retries assume a task is safe to run again — which leases already require.
 
 ## Not enough workers
 
@@ -310,10 +345,10 @@ or they are all on long tasks
 | `backlogInterval=30` | seconds between checks |
 
 The count spans processes — a scheduler-only box reports the workers on the worker boxes, not
-zero. That needs `enforceVersion=True` (the default), since that is what registers a process;
-without it the count is local.
+zero. Every worker process registers, whether or not it enforces the version.
 
-Schedulers have their own version of this: one that cannot keep its cadence logs `missed a beat`.
+Schedulers have their own version of this: an enabled one that cannot keep its cadence logs
+`missed a beat`.
 
 ### TaskFactory
 
@@ -344,7 +379,7 @@ class App(BaseApp):
 schedulers(schedulerModel: type[Scheduler] = Scheduler,
            schedulersCollection: Collection | str | None = None,
            policy: OVERDUE_SCHEDULES_POLICY | None = None,   # default: the app's
-           poolInterval: float | None = None,                # default: the app's
+           pollInterval: float | None = None,                # default: the app's
            taskEngine: TaskEngine | None = None,             # default: app.task
            extraIndexes: Sequence[IndexModel] | None = None)
 ```
@@ -431,13 +466,15 @@ happens against the real emitted call rather than a placeholder.
 |---|---|
 | `uid` | `str` — derived from the name when created by `ensure` |
 | `name` | `str`, default `"Scheduler"` |
-| `status` | `enabled` `disabled` `processing` |
+| `status` | `enabled` `disabled` |
 | `work` | `CallSpec` emitted on each fire |
 | `distribution` | `CallSpec` producing the interval |
 | `deadline` | `datetime` |
+| `timeout` / `skipAfter` / `maxAttempts` | stamped onto every task it emits |
 
-A scheduler's `status` is only ever `enabled` or `disabled`; being worked is a live lease, not a
-status. `processing` is no longer written and remains only so older documents validate.
+Being worked is a live lease, not a status. A disabled scheduler is still claimed and still walks
+its deadline, so its distribution keeps its shape for when it is enabled again — it just emits
+nothing, and has nothing to warn about.
 
 ## Distributions
 
@@ -557,14 +594,14 @@ at a time — stop the old workers before starting these.
 |---|---|
 | `app.fingerprint` | the hash for this process |
 | `app.liveWorkers()` | worker processes that have checked in recently |
-| `enforceVersion=False` | skip the check entirely |
+| `enforceVersion=False` | skip the check; the process still registers, so it is still counted |
 
 Workers check in every `heartbeatInterval` seconds and are considered gone after
 `workerStaleAfter`. So a stopped deployment stops blocking the next one on its own — no manual
 cleanup — and a crashed process frees its slot within a minute.
 
 **What the fingerprint can and cannot see.** It sees added, removed, or re-signatured tasks and
-distributions, and the policy on every engine. It does **not** see a changed function body, and cannot: that would require hashing
+distributions, the policy on every engine, and the task limits. It does **not** see a changed function body, and cannot: that would require hashing
 every transitive dependency. It is a guard against the obvious mistake, not a proof of identity.
 The rule is the guarantee; the hash only enforces the part of it that is mechanically checkable.
 
@@ -620,16 +657,14 @@ resolved where it is observed rather than at boot:
 | a scheduler fell behind | continuously | at the claim |
 | a worker died holding a pile item | continuously | at the claim |
 | a lease lapsed | continuously | at the claim |
+| a task went stale (`skipAfter`) | continuously | at the claim |
+| a task ran out of attempts | continuously | at the claim |
 | **the set of tasks that exist** | **only at boot** | **`init()`** |
-| a task is overdue, under `"skip"` | continuously | `init()` — the [open one](#policies) |
 
-What `init()` still does:
+What `init()` still does: **flags pending tasks whose function is gone** as `incompatible`, and
+**disables schedulers** that emit one.
 
-- **backfills `leaseUntil`** onto documents written before leases existed
-- **flags pending tasks whose function is gone** as `incompatible`, and **disables schedulers**
-  that emit one
-
-Those two belong at boot rather than at a claim, and not as a compromise: the fingerprint forces
+That belongs at boot rather than at a claim, and not as a compromise: the fingerprint forces
 a full restart to change an app's task list, so boot is the only moment that set can change.
 
 `init()` is **version-checked**, like `startWorkers()`. It decides what is runnable from *this*
@@ -647,12 +682,9 @@ easily as while it is down.
 |---|---|
 | `overdueSchedulersPolicy` | every time a scheduler is claimed |
 | `staleItemsPolicy` | every time a pile is claimed from (and at `init()`, for a pile nothing claims from) |
-| `overdueTaskPolicy` | `init()`, and only on a cold start — see below |
 
-| `overdueTaskPolicy` | |
-|---|---|
-| `"execute now"` | run overdue tasks as normal (default) |
-| `"skip"` | mark overdue pending tasks `outdated` |
+Tasks have no policy: a late one is governed by [`skipAfter`](#skipafter), a failing one by
+[`maxAttempts`](#retries).
 
 | `overdueSchedulersPolicy` | when a whole beat has gone by unworked |
 |---|---|
@@ -673,37 +705,6 @@ every claim so you can see that happening.
 
 A live worker renews its lease, so a lapsed one means nobody is holding the item. Failing it
 cannot take work away from a running worker, which is why any process may do it.
-
-`overdueTaskPolicy` belongs at `init()`, because what it is about — *coming back from downtime* —
-only happens at a start. It applies on a **cold start** only: nobody else is running, **and**
-nobody has checked in for `coldStartAfter` seconds (default 300). So neither of these drops
-anything:
-
-- a worker joining a running cluster — that backlog belongs to its colleagues
-- a restart or rolling deploy — everyone stopped, but only a moment ago
-
-```python
-class App(BaseApp):
-    overdueTaskPolicy = "skip"
-    coldStartAfter = 600     # ten quiet minutes means the app was down; 0 means any gap does
-
-app.coldStart()          # the question init() asks
-app.lastActive()         # when any other process last checked in, running or stopped
-app.otherLiveWorkers()   # everyone running but this process
-```
-
-Stopping a worker marks its record `stoppedAt` rather than deleting it, so the time survives a
-graceful shutdown; a crashed one is dated by its last heartbeat. Records older than both
-`coldStartAfter` and `workerStaleAfter` are pruned when a worker starts. `coldStartAfter` is in the
-fingerprint, like the policy it qualifies.
-
-With `enforceVersion=False` there is no registry to ask, so every start looks cold.
-
-For work that goes stale while the app is *up*, use [`skipAfter`](#skipafter) — the two are
-independent and compose.
-
-`init()` also flags pending tasks whose function is gone as `incompatible`, disables schedulers
-that emit a missing task, and backfills `leaseUntil` onto pre-lease documents.
 
 A worker never claims a task it cannot run — the claim filters on the function names it has — so
 an unrecognised task waits rather than failing.
@@ -743,5 +744,5 @@ for raw in app.task.tasksCollection.find({"status": "failed"}):
   can be cleared.
 - Workers are daemon threads. `stopWorkers()` lets work in flight finish; a process killed
   outright leaves its leases to lapse, and the next worker reclaims them.
-- Nothing caps retries. A pile item that kills its worker is retried on every restart;
-  `attempts` is there to build a cap on.
+- Tasks cap their attempts; pile items do not. An item that kills its worker is reclaimed each
+  time its lease lapses under `"retry"` — its `attempts` count shows it, and `"fail"` stops it.
