@@ -132,8 +132,9 @@ the same item. `work()` wraps that: claim, mark done, or mark failed if the bloc
 
 **Workers.** `startWorkers()` starts daemon threads that poll, claim atomically, run, and write
 results back. A worker sleeps only when it finds nothing to do, so a backlog drains at full
-speed. A task that raises is retried up to `taskMaxAttempts` (3) times; one that crashes its
-worker counts too, so it can't take every worker down in turn.
+speed. A task runs once unless you opt in to retries (`taskMaxAttempts`, `retryDelay`); a crash
+counts as an attempt, so a task that kills its worker can't take every worker down in turn.
+`app.task.wait(task)` blocks until one finishes, from any process.
 
 **Leases.** A claim is held for `leaseSeconds` and renewed while the work runs. If a worker dies,
 its lease lapses and the next worker picks the work up — no restart, no sweep. Because a live

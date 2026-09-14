@@ -8,7 +8,8 @@ class App(BaseApp):
     staleItemsPolicy        = "retry"
     taskTimeout             = None              # and so are the task limits
     taskSkipAfter           = None
-    taskMaxAttempts         = 3
+    taskMaxAttempts         = 1
+    taskRetryDelay          = 60
 
 app = App(
     db,                                         # pymongo Database
@@ -192,12 +193,13 @@ app.task.schedule(App.retain(days=0))    # TaskValidationError, before it is eve
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None, maxAttempts=None)` | Store a task, and return it. Deadline defaults to now. |
+| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None, maxAttempts=None, retryDelay=None)` | Store a task, and return it. Deadline defaults to now. |
 | `scheduleFromDistribution(work, distribution, ...)` | Same, deadline is now + one interval. |
 | `__call__(functionName, **kwargs)` | Build and validate a `CallSpec`. |
 | `validate(work)` | Raises `TaskNotFound` / `TaskValidationError`. |
 | `execute(task)` | Run one task, return it filled in. |
-| `timeoutFor(task)` / `skipAfterFor(task)` / `maxAttemptsFor(task)` | The limits that apply to it, resolved. |
+| `timeoutFor(task)` / `skipAfterFor(task)` / `maxAttemptsFor(task)` / `retryDelayFor(task)` | The limits that apply to it, resolved. |
+| `wait(task, timeout=None, interval=0.1)` | Block until it finishes and return it. `TimeoutError` if it doesn't in time. From any process. |
 | `backlog()` | `(due, secondsTheOldestHasWaited)` — on `BaseApp`. |
 | `startWorkers(n)` | Poll, claim, execute. |
 
@@ -221,6 +223,7 @@ twice. See [Leases](#leases) for why one field covers both due and abandoned.
 | `timeout` | `float` seconds, `None` for the engine's, `-1` for none |
 | `skipAfter` | `float` seconds past the deadline, `None` for the engine's, `-1` for never |
 | `maxAttempts` | `int` ≥ 1, or `None` for the engine's |
+| `retryDelay` | `float` seconds before a retry is claimable, or `None` for the engine's |
 
 ```
 pending ─→ processing ─→ success
@@ -298,26 +301,30 @@ outdated between attempts. It is in the fingerprint for the same reason timeouts
 
 ## Retries
 
-A task that raises is put back as `pending` and run again, until it has run `maxAttempts` times;
-the last failure is final. Same three levels, nearest wins:
+**Off by default.** A task runs once, and a failure is final: rerunning a side effect nobody asked
+to rerun — an upload, a payment — is worse than a failure you can see. Opt in where a task is safe
+to run again. Same three levels, nearest wins:
 
 ```python
 class App(BaseApp):
-    taskMaxAttempts = 3             # app (the default)
+    taskMaxAttempts = 3             # app
+    taskRetryDelay = 30             # seconds before a retry (default 60)
 
 app.task.maxAttempts = 5            # engine
-app.task.schedule(App.charge(...), maxAttempts=1)   # task: never retried
+app.task.schedule(App.sync(...), maxAttempts=4, retryDelay=5)   # task
+app.task.schedule(App.charge(...), maxAttempts=1)               # task: never retried
 ```
 
-A retry is claimable at once, behind whatever is already due. `error` holds the last failure, and
-is cleared if a later attempt succeeds.
+A task that raises with attempts left is put back as `pending`, claimable after `retryDelay`
+seconds. `error` holds the last failure, and is cleared if a later attempt succeeds. Schedulers
+stamp both onto what they emit. `wait()` treats a task waiting for a retry as unfinished.
 
 **A crash counts as an attempt.** A worker that dies mid-task leaves it `processing` with a lapsing
 lease, and the next worker reclaims it — but if that claim would exceed `maxAttempts`, the task is
 written `failed` instead of run. So a task that takes its worker down with it (out of memory, a
-segfault, a killed container) is given up on rather than taking every worker down in turn.
-
-Retries assume a task is safe to run again — which leases already require.
+segfault, a killed container) is given up on rather than taking every worker down in turn. Under
+the default of one attempt, that means a hard-killed task is failed, not rerun — nobody knows how
+far it got. A graceful shutdown lets work in flight finish, so only a kill leaves one behind.
 
 ## Not enough workers
 
@@ -470,7 +477,7 @@ happens against the real emitted call rather than a placeholder.
 | `work` | `CallSpec` emitted on each fire |
 | `distribution` | `CallSpec` producing the interval |
 | `deadline` | `datetime` |
-| `timeout` / `skipAfter` / `maxAttempts` | stamped onto every task it emits |
+| `timeout` / `skipAfter` / `maxAttempts` / `retryDelay` | stamped onto every task it emits |
 
 Being worked is a live lease, not a status. A disabled scheduler is still claimed and still walks
 its deadline, so its distribution keeps its shape for when it is enabled again — it just emits
@@ -528,7 +535,7 @@ Each pile gets `pymonque_pile_<name>` unless told otherwise.
 | `addMany(iterable)` | Insert many; validates all before inserting any. |
 | `claim(where=None)` | Atomically take the oldest pending item, or `None`. |
 | `work(where=None)` | Context manager: claim, then done, or failed if the block raises. |
-| `done(item, result=None)` | `True`, or `False` if there is no such item. |
+| `done(item, result=None)` | `True`, or `False` if nothing matched: no such item, or — given the claimed `Item` — its claim has since passed to another worker. A bare uid acts whatever the claim. |
 | `fail(item, error=None)` | Same. |
 | `release(item)` | Put it back as pending. Same. |
 | `count(where=None, status=None)` / `counts()` | |
@@ -556,6 +563,7 @@ scheduler.
 | `data` | the payload |
 | `createdAt` / `claimedAt` / `finishedAt` | `datetime` |
 | `attempts` | `int`, bumped on every claim |
+| `claimId` | `str`, new on every claim. `done`/`fail`/`release`/`renewLease` given an `Item` only apply while it still matches, so a worker whose lease lapsed cannot overwrite the worker that took over; `work()` logs when that happens |
 | `result` / `error` | |
 
 ```

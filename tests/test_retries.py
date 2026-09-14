@@ -14,6 +14,7 @@ calls: list[str] = []
 
 class App(BaseApp):
     taskMaxAttempts = 3
+    taskRetryDelay = 0          # retries claimable at once, so a test can drain them
 
     @task
     @staticmethod
@@ -87,14 +88,63 @@ def test_a_task_overrides_the_app(app):
     assert calls == ["broken"]
 
 
-def test_the_default_retries(db):
-    class Default(BaseApp):
-        @task
-        @staticmethod
-        def broken() -> None:
-            raise RuntimeError
+class Default(BaseApp):
+    @task
+    @staticmethod
+    def broken() -> None:
+        calls.append("broken")
+        raise RuntimeError("nope")
 
-    assert Default(db).task.maxAttempts == 3
+
+def test_by_default_a_failure_is_final(db):
+    app = Default(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Default.broken())
+    app.task._work()
+
+    assert app.task.maxAttempts == 1
+    assert app.task.get(stored.uid).status == "failed"
+    assert app.task._work() is None
+
+
+def test_by_default_a_crashed_task_is_not_rerun(db):
+    """Under the default, a task whose worker died is failed: nobody knows how far it got."""
+
+    app = Default(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Default.broken())
+    app.task.collection.update_one({"uid": stored.uid}, {"$set": {
+        "status": "processing", "attempts": 1, "leaseUntil": utc_now() - timedelta(seconds=1),
+    }})
+    app.task._work()
+
+    assert calls == []
+    assert app.task.get(stored.uid).status == "failed"
+
+
+def test_a_retry_waits_retryDelay(db):
+    class Delayed(App):
+        taskRetryDelay = 60
+
+    app = Delayed(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(App.broken())
+    app.task._work()
+    retrying = app.task.get(stored.uid)
+
+    assert retrying.status == "pending"
+    assert retrying.leaseUntil > utc_now() + timedelta(seconds=50)
+    assert app.task._work() is None             # not yet
+    assert calls == ["broken"]
+
+
+def test_a_task_overrides_the_retry_delay(db):
+    class Delayed(App):
+        taskRetryDelay = 60
+
+    app = Delayed(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(App.broken(), retryDelay=0)
+    drain(app)
+
+    assert app.task.get(stored.uid).status == "failed"
+    assert calls == ["broken"] * 3
 
 
 def crashed(app, attempts):
@@ -176,3 +226,33 @@ def test_max_attempts_is_part_of_the_fingerprint(db):
         taskMaxAttempts = 5
 
     assert More(db).fingerprint != App(db).fingerprint
+
+
+def test_retry_delay_is_part_of_the_fingerprint(db):
+    class Slower(App):
+        taskRetryDelay = 300
+
+    assert Slower(db).fingerprint != App(db).fingerprint
+
+
+def test_a_scheduler_stamps_retry_delay_onto_what_it_emits(app):
+    stored = app.scheduler.add(
+        App.broken(), app.distribution("constant", dailyFrequency=1), retryDelay=5
+    )
+    app.scheduler.collection.update_one(
+        {"uid": stored.uid}, {"$set": {"deadline": utc_now(), "leaseUntil": utc_now()}}
+    )
+    app.scheduler._work()
+
+    assert app.task.find()[0].retryDelay == 5
+
+
+def test_a_negative_retry_delay_is_a_mistake(app, db):
+    with pytest.raises(ValidationError):
+        app.task.schedule(App.broken(), retryDelay=-1)
+
+    class Backwards(App):
+        taskRetryDelay = -1
+
+    with pytest.raises(ValueError):
+        Backwards(db)

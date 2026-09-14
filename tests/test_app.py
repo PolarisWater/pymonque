@@ -15,13 +15,16 @@ from conftest import ExampleApp, WORKER_POLL_INTERVAL, wait_for
 
 @pytest.fixture
 def fast(db):
-    """A app whose workers poll fast enough to test."""
+    """An app whose workers poll fast enough to test, stopped afterwards so its
+    threads don't go on logging into later tests."""
 
-    return ExampleApp(
+    app = ExampleApp(
         db,
         taskPollInterval=WORKER_POLL_INTERVAL,
         schedulerPollInterval=WORKER_POLL_INTERVAL,
     )
+    yield app
+    app.stopWorkers(timeout=5)
 
 
 # --- wiring ---

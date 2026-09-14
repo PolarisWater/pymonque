@@ -48,6 +48,7 @@ M = TypeVar("M", bound="Document")
 TASK_STATUS = Literal["pending", "success", "processing", "failed", "timeout", "canceled", "outdated", "incompatible"]
 SCHEDULER_STATUS = Literal["enabled", "disabled"]   # being worked is the lease's job, not a status
 ITEM_STATUS = Literal["pending", "claimed", "done", "failed"]
+FINAL_TASK_STATUSES = ("success", "failed", "timeout", "canceled", "outdated", "incompatible")
 
 OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
 STALE_ITEMS_POLICY = Literal["retry", "fail"]
@@ -57,7 +58,8 @@ BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobod
 BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshold disables them
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
-MAX_ATTEMPTS = 3            # runs a task gets before a failure is final
+MAX_ATTEMPTS = 1            # runs a task gets before a failure is final: retrying is opt-in
+RETRY_DELAY = 60            # seconds a failed task waits before it is claimable again
 NO_LIMIT = -1               # a timeout or skipAfter of this overrides any limit set further out
 
 
@@ -489,6 +491,7 @@ class Task(Document):
     timeout:        float | None        = None   # seconds this call may run for
     skipAfter:      float | None        = None   # seconds past the deadline it stops being worth running
     maxAttempts:    int | None          = Field(default=None, ge=1)  # runs before a failure is final
+    retryDelay:     float | None        = Field(default=None, ge=0)  # seconds before a retry is claimable
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -531,7 +534,8 @@ class TaskFactory(Document):
             deadline:   datetime,
             timeout:    float | None = None,
             skipAfter:  float | None = None,
-            maxAttempts: int | None = None
+            maxAttempts: int | None = None,
+            retryDelay: float | None = None
         ) -> Task:
 
         return Task(
@@ -540,7 +544,8 @@ class TaskFactory(Document):
             factory=self,
             timeout=timeout,
             skipAfter=skipAfter,
-            maxAttempts=maxAttempts
+            maxAttempts=maxAttempts,
+            retryDelay=retryDelay
         )
     
     def __repr__(self) -> str:
@@ -700,7 +705,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             extraIndexes:       Sequence[IndexModel] | None = None,
             timeout:            float | None = None,
             skipAfter:          float | None = None,
-            maxAttempts:        int | None = None
+            maxAttempts:        int | None = None,
+            retryDelay:         float | None = None
         ):
 
         self.pollInterval = pollInterval
@@ -708,11 +714,15 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         self.timeout: float | None = checkLimit(timeout if timeout is not None else app.taskTimeout)
         self.skipAfter: float | None = checkLimit(skipAfter if skipAfter is not None else app.taskSkipAfter)
         self.maxAttempts: int = maxAttempts if maxAttempts is not None else app.taskMaxAttempts
+        self.retryDelay: float = retryDelay if retryDelay is not None else app.taskRetryDelay
         self.defaultFactory: TaskFactory = defaultFactory or app.defaultFactory
         self.distributionEngine: DistributionEngine = app.distribution
 
         if self.maxAttempts < 1:
             raise ValueError(f"maxAttempts must be at least 1, not {self.maxAttempts}")
+
+        if self.retryDelay < 0:
+            raise ValueError(f"retryDelay is seconds and cannot be negative, not {self.retryDelay}")
 
         # resolve tasks
         self.functions: dict[str, Callable] = {
@@ -795,12 +805,13 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             self._releaseHold(task.uid)
 
         if task.status == "failed" and task.attempts < self.maxAttemptsFor(task):
+            delay = self.retryDelayFor(task)
             logger.warning(
-                "%r failed on attempt %d of %d, retrying",
-                task, task.attempts, self.maxAttemptsFor(task)
+                "%r failed on attempt %d of %d, retrying in %ss",
+                task, task.attempts, self.maxAttemptsFor(task), delay
             )
             task.status = "pending"
-            task.leaseUntil = utc_now()     # claimable again, behind what is already due
+            task.leaseUntil = utc_now() + timedelta(seconds=delay)
 
         try:
             self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
@@ -830,6 +841,9 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
     def maxAttemptsFor(self, task: Task) -> int:
         return task.maxAttempts if task.maxAttempts is not None else self.maxAttempts
+
+    def retryDelayFor(self, task: Task) -> float:
+        return task.retryDelay if task.retryDelay is not None else self.retryDelay
 
     def _giveUp(self, task: Task) -> Task:
         task.status = "failed"
@@ -939,7 +953,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             factory:        TaskFactory,
             timeout:        float | None = None,
             skipAfter:      float | None = None,
-            maxAttempts:    int | None = None
+            maxAttempts:    int | None = None,
+            retryDelay:     float | None = None
         ) -> Task:
 
         return self.insert(
@@ -948,7 +963,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 work=work,
                 timeout=timeout,
                 skipAfter=skipAfter,
-                maxAttempts=maxAttempts
+                maxAttempts=maxAttempts,
+                retryDelay=retryDelay
             )
         )
 
@@ -984,6 +1000,38 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             {"$set": {"status": "canceled"}}
         ).modified_count
 
+    def wait(self, task: Task | str, timeout: float | None = None, interval: float = 0.1) -> Task:
+        """Block until a task has finished, and return it as it finished.
+
+        Reads the document, so it works from any process — the one that queued
+        the task need not be the one running it. A task waiting to be retried has
+        not finished. Raises TimeoutError if `timeout` runs out first, and
+        TaskNotFound if there is no such task.
+        """
+
+        uid = task if isinstance(task, str) else task.uid
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            current = self.get(uid)
+
+            if current is None:
+                raise TaskNotFound(f"there is no task {uid}")
+
+            if current.status in FINAL_TASK_STATUSES:
+                return current
+
+            if deadline is None:
+                time.sleep(interval)
+                continue
+
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                raise TimeoutError(f"{current!r} is still {current.status} after {timeout}s")
+
+            time.sleep(min(interval, remaining))
+
     def schedule(
             self, 
             work:           CallSpec, 
@@ -991,11 +1039,12 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             factory:        TaskFactory | None = None,
             timeout:        float | None = None,
             skipAfter:      float | None = None,
-            maxAttempts:    int | None = None
+            maxAttempts:    int | None = None,
+            retryDelay:     float | None = None
         ) -> Task:
 
-        """Queue one call. `timeout`, `skipAfter` and `maxAttempts` override the
-        engine's and the app's."""
+        """Queue one call. `timeout`, `skipAfter`, `maxAttempts` and `retryDelay`
+        override the engine's and the app's."""
 
         factory = factory or self.defaultFactory
         deadline = deadline or utc_now()
@@ -1008,7 +1057,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             factory=factory,
             timeout=timeout,
             skipAfter=skipAfter,
-            maxAttempts=maxAttempts
+            maxAttempts=maxAttempts,
+            retryDelay=retryDelay
         )
 
     def scheduleFromDistribution(
@@ -1018,7 +1068,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             factory:        TaskFactory | None = None,
             timeout:        float | None = None,
             skipAfter:      float | None = None,
-            maxAttempts:    int | None = None
+            maxAttempts:    int | None = None,
+            retryDelay:     float | None = None
         ) -> Task:
 
         self._app.distribution.validate(distribution)
@@ -1030,7 +1081,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             factory=factory,
             timeout=timeout,
             skipAfter=skipAfter,
-            maxAttempts=maxAttempts
+            maxAttempts=maxAttempts,
+            retryDelay=retryDelay
         )
 
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
@@ -1049,6 +1101,7 @@ class Scheduler(TaskFactory):
     timeout:        float | None        = None   # all three stamped onto every task it emits
     skipAfter:      float | None        = None
     maxAttempts:    int | None          = Field(default=None, ge=1)
+    retryDelay:     float | None        = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -1077,7 +1130,8 @@ class Scheduler(TaskFactory):
     def _emit(self, deadline: datetime) -> Task:
         return super()._emit(
             self.emitWork(), deadline,
-            timeout=self.timeout, skipAfter=self.skipAfter, maxAttempts=self.maxAttempts
+            timeout=self.timeout, skipAfter=self.skipAfter,
+            maxAttempts=self.maxAttempts, retryDelay=self.retryDelay
         )
     
     def __repr__(self) -> str:
@@ -1397,6 +1451,7 @@ class Item(Document, Generic[P]):
     finishedAt:     datetime | None     = None
     leaseUntil:     datetime | None     = None
     attempts:       int                 = 0
+    claimId:        str | None          = None   # which claim holds it; a new one on every claim
 
     result:         Any | None          = None
     error:          str | None          = None
@@ -1472,6 +1527,7 @@ class PileEngine(CollectionEngine):
             {"$set": {
                 "status": "failed",
                 "error": "the worker holding this item stopped renewing its lease",
+                "claimId": None,    # that worker can no longer finish it
                 "finishedAt": now,
             }},
         ).modified_count
@@ -1521,6 +1577,7 @@ class PileEngine(CollectionEngine):
             {
                 "$set": {
                     "status": "claimed",
+                    "claimId": uuid4str(),
                     "claimedAt": now,
                     "leaseUntil": now + timedelta(seconds=self.leaseSeconds),
                 },
@@ -1539,6 +1596,20 @@ class PileEngine(CollectionEngine):
     @staticmethod
     def _uid(item: Item | str) -> str:
         return item if isinstance(item, str) else item.uid
+
+    @staticmethod
+    def _matching(item: Item | str) -> dict[str, Any]:
+        """Which document an action on `item` may touch.
+
+        An Item stands for the claim it came from, so a worker whose lease lapsed
+        cannot finish work another worker has since taken over. A bare uid is an
+        operator acting on the item whatever state it is in.
+        """
+
+        if isinstance(item, str):
+            return {"uid": item}
+
+        return {"uid": item.uid, "claimId": item.claimId}
 
     def _finish(
             self,
@@ -1559,7 +1630,7 @@ class PileEngine(CollectionEngine):
         # matched, not modified: the question is whether there is such an item,
         # not whether the bytes happened to change
         return self.collection.update_one(
-            {"uid": self._uid(item)},
+            self._matching(item),
             {"$set": update}
         ).matched_count > 0
 
@@ -1575,30 +1646,30 @@ class PileEngine(CollectionEngine):
         """Put a claimed item back on the pile without consuming an outcome."""
 
         return self.collection.update_one(
-            {"uid": self._uid(item)},
+            self._matching(item),
             # back to its own place in the pile, not the end of it
-            [{"$set": {"status": "pending", "claimedAt": None, "leaseUntil": "$createdAt"}}]
+            [{"$set": {"status": "pending", "claimId": None, "claimedAt": None, "leaseUntil": "$createdAt"}}]
         ).matched_count > 0
 
     def renewLease(self, item: Item | str) -> bool:
         """Hold on to an item for another lease period."""
 
         return self.collection.update_one(
-            {"uid": self._uid(item)},
+            self._matching(item),
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
         ).matched_count > 0
 
     def renewLeases(self) -> int:
-        """Push back the lease on every item this process is working on."""
+        """Push back the lease on every item this process is still holding."""
 
         with self._heldLock:
-            uids = list(self._held)
+            claims = list(self._held)
 
-        if not uids:
+        if not claims:
             return 0
 
         return self.collection.update_many(
-            {"uid": {"$in": uids}},
+            {"claimId": {"$in": claims}},   # not one another worker has taken since
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
         ).modified_count
 
@@ -1623,7 +1694,7 @@ class PileEngine(CollectionEngine):
 
     def _hold(self, item: Item):
         with self._heldLock:
-            self._held.add(item.uid)
+            self._held.add(item.claimId)
 
             if self._renewer is None:
                 self._renewer = threading.Thread(
@@ -1635,7 +1706,7 @@ class PileEngine(CollectionEngine):
 
     def _releaseHold(self, item: Item):
         with self._heldLock:
-            self._held.discard(item.uid)
+            self._held.discard(item.claimId)
 
     @contextmanager
     def work(self, where: Mapping[str, Any] | None = None):
@@ -1656,12 +1727,20 @@ class PileEngine(CollectionEngine):
         try:
             yield item
         except Exception:
-            self.fail(item, traceback.format_exc())
+            if not self.fail(item, traceback.format_exc()):
+                self._lostClaim(item)
             raise
         else:
-            self.done(item)
+            if not self.done(item):
+                self._lostClaim(item)
         finally:
             self._releaseHold(item)
+
+    def _lostClaim(self, item: Item):
+        logger.warning(
+            "%s item %s finished after its claim passed to another worker; "
+            "this outcome was not recorded", self.name, item.uid
+        )
 
     # --- managing the collection ---
 
@@ -1913,9 +1992,12 @@ class BaseApp:
     taskTimeout:                float | None              = None
     taskSkipAfter:              float | None              = None
 
-    # How many times a task runs before a failure is final. A crash counts: a
-    # task that takes its worker down with it is given up on, not rerun forever.
+    # How many times a task runs before a failure is final, and how long a retry
+    # waits. One by default: rerunning a side effect nobody asked to rerun is
+    # worse than a failure you can see. A crash counts as an attempt, so a task
+    # that takes its worker down with it is given up on, not rerun forever.
     taskMaxAttempts:            int                       = MAX_ATTEMPTS
+    taskRetryDelay:             float                     = RETRY_DELAY
 
     def __init__(
             self, 
@@ -2031,6 +2113,7 @@ class BaseApp:
         parts.append(f"taskTimeout:{self.task.timeout}")
         parts.append(f"taskSkipAfter:{self.task.skipAfter}")
         parts.append(f"taskMaxAttempts:{self.task.maxAttempts}")
+        parts.append(f"taskRetryDelay:{self.task.retryDelay}")
 
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 
