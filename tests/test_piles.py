@@ -197,13 +197,6 @@ def test_release_puts_the_item_back(app):
     assert app.outbox.claim().uid == item.uid  # claimable again
 
 
-def test_a_released_item_keeps_its_attempt_count(app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.release(app.outbox.claim())
-
-    assert app.outbox.claim().attempts == 2
-
-
 def test_an_item_can_be_finished_by_uid(app):
     item = app.outbox.add(to="a@b.c")
     app.outbox.claim()
@@ -310,21 +303,6 @@ def test_indexes_back_the_claim_query(app):
 
 # --- restart policies ---
 
-def test_an_abandoned_item_is_claimable_again_when_its_lease_lapses(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-
-    assert app.outbox.claim() is None      # while the lease is live, nobody else gets it
-
-    app.outbox.itemsCollection.update_one(
-        {"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
-    )
-    again = app.outbox.claim()             # no restart needed
-
-    assert again.uid == item.uid
-    assert again.attempts == 2           # and we can tell it was tried before
-
-
 def test_a_live_lease_survives_a_new_instance(db, app):
     app.outbox.add(to="a@b.c")
     item = app.outbox.claim()
@@ -360,57 +338,154 @@ def abandoned(app, to="a@b.c"):
     return item
 
 
-def test_under_fail_an_abandoned_item_is_written_off_at_the_next_claim(db):
-    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
+def test_an_abandoned_item_is_given_up_on_at_the_next_claim(app):
     abandoned(app)
 
-    assert app.outbox.claim() is None      # not handed to anyone else
+    assert app.outbox.claim() is None      # its one attempt went down with its worker
 
-    after = app.outbox.find()[0]           # and not left hanging until a reboot
+    after = app.outbox.find()[0]
     assert after.status == "failed"
-    assert "lease" in after.error
+    assert "gave up after 1 attempt(s)" in after.error
+    assert after.claimId is None
 
 
-def test_under_fail_a_live_holder_is_not_written_off(db):
+def test_an_abandoned_item_with_attempts_left_is_claimed_again(db):
+    app = appWith(ExampleApp, db, itemMaxAttempts=2)
+    first = abandoned(app)
+
+    again = app.outbox.claim()
+
+    assert again.uid == first.uid
+    assert again.attempts == 2
+
+
+def test_a_given_up_item_does_not_block_the_next_one(app):
+    abandoned(app, to="dead@b.c")
+    app.outbox.add(to="live@b.c")
+
+    assert app.outbox.claim().data.to == "live@b.c"
+    assert app.outbox.count(status="failed") == 1
+
+
+def test_a_live_holder_is_not_taken_over(app):
     """A worker that is still renewing must survive another worker's claim."""
 
-    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
     app.outbox.add(to="a@b.c")
     held = app.outbox.claim()              # lease is live, being renewed
 
     assert app.outbox.claim() is None
-    assert app.outbox.find({"uid": held.uid})[0].status == "claimed"
+    assert app.outbox.get(held.uid).status == "claimed"
 
 
-def test_under_fail_init_still_tidies_a_pile_nobody_claims_from(db):
-    app = appWith(ExampleApp, db, staleItemsPolicy="fail")
-    abandoned(app)
+# --- retries: the same rule as tasks ---
 
-    appWith(ExampleApp, db, staleItemsPolicy="fail").init()
+def test_a_failure_is_final_by_default(app):
+    app.outbox.add(to="a@b.c")
+
+    with pytest.raises(ValueError):
+        with app.outbox.work():
+            raise ValueError("nope")
 
     assert app.outbox.count(status="failed") == 1
+    assert app.outbox.claim() is None
 
 
-def test_a_pile_can_override_the_app_policy(db):
+def test_a_failure_with_attempts_left_goes_back_on_the_pile(db):
     class Q(BaseApp):
-        strict = pile(policy="fail")
+        jobs = pile(maxAttempts=3, retryDelay=0)
+
+    app = Q(db)
+    app.jobs.add({"n": 1})
+
+    for _ in range(3):
+        with pytest.raises(ValueError):
+            with app.jobs.work():
+                raise ValueError("nope")
+
+    after = app.jobs.find()[0]
+    assert after.status == "failed"
+    assert after.attempts == 3
+    assert "nope" in after.error
+    assert app.jobs.claim() is None
+
+
+def test_a_retry_waits_its_delay(db):
+    class Q(BaseApp):
+        jobs = pile(maxAttempts=2, retryDelay=60)
+
+    app = Q(db)
+    item = app.jobs.add({"n": 1})
+
+    assert app.jobs.fail(app.jobs.claim(), error="nope") is True
+
+    assert app.jobs.get(item.uid).status == "pending"
+    assert app.jobs.claim() is None        # not for another minute
+
+
+def test_a_success_after_a_retry_is_done(db):
+    class Q(BaseApp):
+        jobs = pile(maxAttempts=2, retryDelay=0)
+
+    app = Q(db)
+    item = app.jobs.add({"n": 1})
+    app.jobs.fail(app.jobs.claim(), error="nope")
+
+    with app.jobs.work() as again:
+        pass
+
+    assert again.attempts == 2
+    assert app.jobs.get(item.uid).status == "done"
+
+
+def test_failing_by_uid_is_final(db):
+    class Q(BaseApp):
+        jobs = pile(maxAttempts=3)
+
+    app = Q(db)
+    item = app.jobs.add({"n": 1})
+    app.jobs.claim()
+
+    assert app.jobs.fail(item.uid, error="by hand") is True
+    assert app.jobs.get(item.uid).status == "failed"
+
+
+def test_releasing_does_not_use_up_an_attempt(app):
+    app.outbox.add(to="a@b.c")
+    app.outbox.release(app.outbox.claim())
+
+    again = app.outbox.claim()             # one attempt allowed, and it is still unused
+
+    assert again is not None
+    assert again.attempts == 1
+
+
+def test_only_a_claimed_item_can_be_released(app):
+    item = app.outbox.add(to="a@b.c")
+
+    assert app.outbox.release(item.uid) is False
+    assert app.outbox.get(item.uid).attempts == 0
+
+
+def test_a_pile_can_override_the_app_limits(db):
+    class Q(BaseApp):
+        itemMaxAttempts = 5
+        itemRetryDelay = 30
+        strict = pile(maxAttempts=1, retryDelay=0)
         lenient = pile()
 
-    first = Q(db)
-    first.strict.add({"n": 1})
-    first.lenient.add({"n": 1})
-    strictItem = first.strict.claim()
-    first.lenient.claim()
+    app = Q(db)
 
-    for engine in (first.strict, first.lenient):   # both holders died
-        engine.itemsCollection.update_many(
-            {}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
-        )
+    assert (app.strict.maxAttempts, app.strict.retryDelay) == (1, 0)
+    assert (app.lenient.maxAttempts, app.lenient.retryDelay) == (5, 30)
 
-    Q(db).init()
 
-    assert first.strict.count(status="failed") == 1     # its own policy wins
-    assert first.lenient.claim() is not None     # claimable again
+@pytest.mark.parametrize("limits", [{"maxAttempts": 0}, {"retryDelay": -1}])
+def test_invalid_item_limits_are_rejected(db, limits):
+    class Q(BaseApp):
+        jobs = pile(**limits)
+
+    with pytest.raises(ValueError):
+        Q(db)
 
 
 def test_finished_items_survive_a_restart(db, app):

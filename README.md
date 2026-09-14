@@ -128,7 +128,8 @@ app.accountOps.add(App.sync(), dist, accountId=42)   # emits sync(accountId=42)
 
 **Piles.** A pile is a backlog in its own collection. Items carry no function and no deadline;
 something claims them. `claim()` is a single `find_one_and_update`, so two workers never get
-the same item. `work()` wraps that: claim, mark done, or mark failed if the block raises.
+the same item. `work()` wraps that: claim, mark done, or mark failed if the block raises — and
+items retry by the same rule as tasks (`itemMaxAttempts`, or per pile).
 
 **Workers.** `startWorkers()` starts daemon threads that poll, claim atomically, run, and write
 results back. A worker sleeps only when it finds nothing to do, so a backlog drains at full
@@ -137,7 +138,9 @@ counts as an attempt, so a task that kills its worker can't take every worker do
 `app.task.wait(task)` blocks until one finishes, from any process.
 
 **Leases.** A claim is held for `leaseSeconds` and renewed while the work runs. If a worker dies,
-its lease lapses and the next worker picks the work up — no restart, no sweep. Because a live
+its lease lapses and the next worker picks the work up — no restart, no sweep: a scheduler's beat
+is emitted once, and a task or pile item counts the dead run as an attempt. Only the current claim can write an
+outcome, so a worker that lost its claim cannot overwrite the one that took over. Because a live
 lease is visible in the document, constructing an app never disturbs work in flight, so an API
 process, a script and a worker container can all share one database safely.
 

@@ -155,7 +155,7 @@ def test_a_clean_stop_frees_the_version_slot(db):
 
 def test_sigterm_starts_a_graceful_shutdown(slow, db):
     slow.task.schedule(SlowApp.slow())
-    slow.handleSignals(timeout=5, signals=(signal.SIGTERM,))
+    slow.handleSignals(signals=(signal.SIGTERM,))
     slow.startWorkers(taskWorkers=1)
 
     try:

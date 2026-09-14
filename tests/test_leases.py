@@ -157,4 +157,4 @@ def test_a_scheduler_lease_can_be_renewed(app, schedulers):
     app.scheduler._hold(scheduler.uid)
 
     assert app.scheduler.renewLeases() == 1
-    assert app.scheduler.byUid(scheduler.uid).leaseUntil > utc_now()
+    assert app.scheduler.get(scheduler.uid).leaseUntil > utc_now()

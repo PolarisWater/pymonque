@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from pymonque import BaseApp, task, utc_now
+from pymonque import BaseApp, pile, task, utc_now
 from pymonque.exceptions import VersionMismatch
 
 from conftest import ExampleApp, WORKER_POLL_INTERVAL, appWith, wait_for
@@ -199,24 +199,28 @@ def test_the_heartbeat_keeps_a_worker_live(db):
 
 # --- policies are shared behaviour, so they are part of the fingerprint ---
 
-def test_two_apps_of_one_class_always_agree_on_policy(db):
+def test_two_apps_of_one_class_always_agree_on_limits(db):
     class App(ExampleApp):
-        staleItemsPolicy = "fail"
+        itemMaxAttempts = 3
 
     a, b = App(db), App(db)
 
-    assert a.outbox.policy == b.outbox.policy == "fail"
+    assert a.outbox.maxAttempts == b.outbox.maxAttempts == 3
     assert a.fingerprint == b.fingerprint
 
 
-def test_a_policy_change_is_a_different_fingerprint(db):
-    class Retrying(ExampleApp):
-        staleItemsPolicy = "retry"
+def test_an_item_limit_change_is_a_different_fingerprint(db):
+    class Once(ExampleApp):
+        itemMaxAttempts = 1
 
-    class Failing(ExampleApp):
-        staleItemsPolicy = "fail"
+    class Thrice(ExampleApp):
+        itemMaxAttempts = 3
 
-    assert Retrying(db).fingerprint != Failing(db).fingerprint
+    class OwnDelay(ExampleApp):
+        scraps = pile(retryDelay=5)
+
+    assert Once(db).fingerprint != Thrice(db).fingerprint
+    assert Once(db).fingerprint != OwnDelay(db).fingerprint
 
 
 def test_the_scheduler_policy_reaches_the_fingerprint(db):
@@ -225,26 +229,27 @@ def test_the_scheduler_policy_reaches_the_fingerprint(db):
     assert ExampleApp(db).fingerprint != changed.fingerprint
 
 
-def test_a_policy_mismatch_cannot_run_workers_alongside(db):
-    class Retrying(ExampleApp):
-        staleItemsPolicy = "retry"
+def test_a_limit_mismatch_cannot_run_workers_alongside(db):
+    class Once(ExampleApp):
+        itemMaxAttempts = 1
 
-    class Failing(ExampleApp):
-        staleItemsPolicy = "fail"
+    class Thrice(ExampleApp):
+        itemMaxAttempts = 3
 
-    running = Retrying(db)
+    running = Once(db)
     running.startWorkers(taskWorkers=1, schedulerWorkers=0)
 
     try:
         with pytest.raises(VersionMismatch):
-            Failing(db).startWorkers(taskWorkers=1, schedulerWorkers=0)
+            Thrice(db).startWorkers(taskWorkers=1, schedulerWorkers=0)
     finally:
         running.stopWorkers()
 
 
-def test_a_policy_is_not_a_constructor_argument(db):
+@pytest.mark.parametrize("setting", [{"overdueSchedulersPolicy": "skip"}, {"itemMaxAttempts": 3}])
+def test_a_policy_or_limit_is_not_a_constructor_argument(db, setting):
     with pytest.raises(TypeError):
-        ExampleApp(db, staleItemsPolicy="fail")
+        ExampleApp(db, **setting)
 
 
 # --- housekeeping is guarded the same as starting workers ---
@@ -263,15 +268,12 @@ def test_init_is_refused_when_a_different_version_is_live(db):
         full.stopWorkers()
 
 
-def test_a_refused_process_cannot_disable_another_versions_scheduler(db):
+def test_a_refused_process_cannot_flag_another_versions_tasks(db):
     full = ExampleApp(db)
-    full.startWorkers(taskWorkers=1, schedulerWorkers=0)
+    full.startWorkers(taskWorkers=0, schedulerWorkers=0)     # registered, working nothing
 
     try:
-        stored = full.scheduler.ensure(
-            "nightly", ExampleApp.greet(name="Ada"),
-            full.distribution("constant", dailyFrequency=1),
-        )
+        stored = full.task.schedule(ExampleApp.greet(name="Ada"))
 
         class Smaller(BaseApp):
             @task
@@ -281,7 +283,7 @@ def test_a_refused_process_cannot_disable_another_versions_scheduler(db):
         with pytest.raises(VersionMismatch):
             Smaller(db).init()
 
-        assert full.scheduler.byUid(stored.uid).status == "enabled"
+        assert full.task.get(stored.uid).status == "pending"
     finally:
         full.stopWorkers()
 

@@ -121,7 +121,7 @@ def test_the_emitted_task_actually_runs(ops, tasks):
 def test_the_stored_work_stays_uncontextualised(ops):
     scheduler = ops.accountOps.add(OpsApp.sync(), hourly(ops), accountId=7)
 
-    assert ops.accountOps.byUid(scheduler.uid).work.kwargs == {}  # context applied at emit
+    assert ops.accountOps.get(scheduler.uid).work.kwargs == {}  # context applied at emit
 
 
 # --- validation goes through emitWork ---
@@ -174,7 +174,7 @@ def test_context_survives_a_fire(ops):
     due(ops.accountOps, scheduler)
     ops.accountOps._work()
 
-    assert ops.accountOps.byUid(scheduler.uid).accountId == 7
+    assert ops.accountOps.get(scheduler.uid).accountId == 7
 
 
 # --- the registry ---
@@ -251,7 +251,7 @@ def test_init_reaches_every_engine(db, ops):
 
     OpsApp(db).init()
 
-    assert ops.accountOps.byUid(scheduler.uid).leaseUntil is not None
+    assert ops.accountOps.get(scheduler.uid).leaseUntil is not None
 
 
 def test_startWorkers_covers_every_engine(db):
@@ -276,7 +276,7 @@ def test_upsert_creates_then_replaces(ops):
     ops.accountOps.upsert(scheduler)
 
     assert ops.accountOps.count() == 1
-    assert ops.accountOps.byUid(scheduler.uid).accountId == 7
+    assert ops.accountOps.get(scheduler.uid).accountId == 7
 
 
 def test_upsert_validates(ops):
@@ -297,8 +297,8 @@ def test_find_and_count_filter(ops):
     assert [s.accountId for s in ops.accountOps.find({"accountId": 8})] == [8]
 
 
-def test_byUid_misses_cleanly(ops):
-    assert ops.accountOps.byUid("nope") is None
+def test_get_misses_cleanly(ops):
+    assert ops.accountOps.get("nope") is None
 
 
 def test_update_changes_the_work(ops):
@@ -337,7 +337,7 @@ def test_update_validates_the_merged_scheduler(ops):
     with pytest.raises(TaskValidationError):
         ops.accountOps.update(scheduler.uid, work=CallSpec.new("sync", nope=1))
 
-    assert ops.accountOps.byUid(scheduler.uid).work.kwargs == {}  # nothing written
+    assert ops.accountOps.get(scheduler.uid).work.kwargs == {}  # nothing written
 
 
 def test_update_toggles_enabled(ops):

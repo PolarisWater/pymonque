@@ -15,6 +15,7 @@ from pymongo.database import Database
 from pymongo.collection import Collection
 from pymongo import ReturnDocument, IndexModel
 from pymongo.errors import DuplicateKeyError
+import bson
 
 from datetime import datetime, timedelta, timezone
 
@@ -51,14 +52,13 @@ ITEM_STATUS = Literal["pending", "claimed", "done", "failed"]
 FINAL_TASK_STATUSES = ("success", "failed", "timeout", "canceled", "outdated", "incompatible")
 
 OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
-STALE_ITEMS_POLICY = Literal["retry", "fail"]
 
 LEASE_SECONDS = 300         # how long a claim is held before it is considered abandoned
 BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobody is free
 BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshold disables them
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
-MAX_ATTEMPTS = 1            # runs a task gets before a failure is final: retrying is opt-in
+MAX_ATTEMPTS = 1            # runs a task or item gets before a failure is final: retrying is opt-in
 RETRY_DELAY = 60            # seconds a failed task waits before it is claimable again
 NO_LIMIT = -1               # a timeout or skipAfter of this overrides any limit set further out
 
@@ -132,6 +132,12 @@ def schedulerUid(name: str) -> str:
     """A stable uid for a named scheduler, so declaring it twice declares it once."""
 
     return str(uuid.uuid5(SCHEDULER_NAMESPACE, name))
+
+def beatUid(scheduler: str, deadline: datetime) -> str:
+    """The uid of the task a scheduler emits for one deadline. Fixed, so a worker
+    that dies after emitting but before moving the deadline on cannot emit it twice."""
+
+    return str(uuid.uuid5(SCHEDULER_NAMESPACE, f"{scheduler}@{deadline.isoformat()}"))
 
 
 MONGO_CONFIG = ConfigDict(serialize_by_alias=True)  # aliases are how a model matches an existing schema
@@ -814,15 +820,31 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             task.leaseUntil = utc_now() + timedelta(seconds=delay)
 
         try:
-            self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
-        except Exception:  # e.g. a result the driver cannot encode
+            bson.encode(task.model_dump())
+        except Exception:  # a result the driver cannot encode: checked before writing, not after a half-write
             task.status = "failed"
             task.result = None
             task.error = traceback.format_exc()
 
-            self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+        if not self._record(task):
+            logger.warning(
+                "%r finished after its claim was lost — canceled, or taken over by another "
+                "worker when its lease lapsed; this outcome was not recorded", task
+            )
 
         return task     # truthy, so the worker loop knows not to sleep
+
+    def _record(self, task: Task) -> bool:
+        """Write a claimed task back, but only while this claim still holds it.
+
+        Every claim bumps `attempts`, so it identifies the claim: a worker whose
+        lease lapsed cannot overwrite a cancel, or the worker that took over.
+        """
+
+        return self.tasksCollection.update_one(
+            {"uid": task.uid, "status": "processing", "attempts": task.attempts},
+            {"$set": task.model_dump()}
+        ).matched_count > 0
 
     @staticmethod
     def _nearest(own: float | None, engine: float | None) -> float | None:
@@ -849,11 +871,10 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         task.status = "failed"
         task.error = (
             f"gave up after {task.attempts - 1} attempt(s): the worker running the last "
-            f"one stopped renewing its lease without reporting back, so the task may be "
-            f"what is killing it"
+            f"one died without reporting back — killed, or taken down by the task itself"
         )
 
-        self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+        self._record(task)
         logger.error("%r %s", task, task.error)
 
         return task
@@ -875,7 +896,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             f"{self.skipAfterFor(task)}s it was worth running for"
         )
 
-        self.tasksCollection.update_one({"uid": task.uid}, {"$set": task.model_dump()})
+        self._record(task)
         logger.warning("%r was outdated: %s", task, task.error)
 
         return task
@@ -1149,7 +1170,8 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             policy:                 OVERDUE_SCHEDULES_POLICY = "execute once",
             schedulerModel:         type[Scheduler] = Scheduler,
             extraIndexes:           Sequence[IndexModel] | None = None,
-            leaseSeconds:           float = LEASE_SECONDS
+            leaseSeconds:           float = LEASE_SECONDS,
+            name:                   str = "scheduler"
         ):
 
         self.pollInterval = pollInterval
@@ -1161,7 +1183,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         super().__init__(
             app,
-            name="schedulers",
+            name=name,          # the attribute it is declared as, so engines tell apart
             model=schedulerModel,
             collection=schedulersCollection if schedulersCollection is not None else app.schedulersCollection,
             extraIndexes=extraIndexes
@@ -1185,19 +1207,6 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         so every write of one has to move the lease with it."""
 
         return {"deadline": deadline, "leaseUntil": deadline}
-
-    def init(self):
-        """Startup housekeeping. Only run by a process that starts workers.
-
-        The overdue policy is not applied here: a scheduler falls behind while
-        running just as easily as while nothing runs, so _work() applies it every
-        time it claims one.
-        """
-
-        self.schedulersCollection.update_many(
-            {"status": "enabled", "work.functionName": {"$nin": list(self.taskEngine.functions)}},
-            {"$set": {"status": "disabled"}},
-        )  # disable schedulers emitting tasks that can no longer be executed
 
     def createIndexes(self):
         super().createIndexes()  # unique uid: one scheduler per ensure() name
@@ -1229,9 +1238,21 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         self._hold(scheduler.uid)
         try:
             if scheduler.status == "enabled" and not (behind and self.policy == "skip"):
-                self.taskEngine.insert(
-                    scheduler._emit(deadline=scheduler.deadline)
-                )
+                task = scheduler._emit(deadline=scheduler.deadline)
+                task.uid = beatUid(scheduler.uid, scheduler.deadline)
+
+                if task.work.functionName not in self.taskEngine.functions:
+                    # skipped, not disabled: disabling is the operator's word, and
+                    # would outlast the task coming back
+                    logger.warning(
+                        "%r emits %s, which this app has no task for; skipped this beat",
+                        scheduler, task.work.functionName
+                    )
+                else:
+                    try:
+                        self.taskEngine.insert(task)
+                    except DuplicateKeyError:
+                        pass    # emitted by a worker that died before moving the deadline on
         finally:
             self._releaseHold(scheduler.uid)
 
@@ -1305,9 +1326,6 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         return scheduler
 
-    def byUid(self, uid: str) -> Scheduler | None:
-        return self.get(uid)
-
     def byName(self, name: str) -> Scheduler | None:
         """The scheduler declared under this name by ensure()."""
 
@@ -1335,7 +1353,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         the merged scheduler, so context fields are checked against the work.
         """
 
-        existing = self.byUid(uid)
+        existing = self.get(uid)
 
         if existing is None:
             return None
@@ -1354,6 +1372,9 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         dumped = merged.model_dump()
         update: dict[str, Any] = {key: dumped[key] for key in changes if key in dumped}
 
+        if "deadline" in update:
+            update.update(self._deadline(update["deadline"]))
+
         if distribution is not None:
             update.update(self._deadline(utc_now() + self.taskEngine.distributionEngine.gen(distribution)))
 
@@ -1366,7 +1387,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
                 {"$set": update}
             )
 
-        return self.byUid(uid)
+        return self.get(uid)
 
     def ensure(
             self,
@@ -1420,6 +1441,9 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         dumped = merged.model_dump()
         update: dict[str, Any] = {key: dumped[key] for key in changes if key in dumped}
 
+        if "deadline" in update:
+            update.update(self._deadline(update["deadline"]))
+
         if existing.get("distribution") != distribution.model_dump():
             # the rhythm itself changed, so start the new one from now
             update.update(self._deadline(utc_now() + self.taskEngine.distributionEngine.gen(distribution)))
@@ -1438,8 +1462,6 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         """Delete the scheduler declared under this name."""
 
         return self.delete(schedulerUid(name))
-
-    remove = removeNamed
 
 
 class Item(Document, Generic[P]):
@@ -1480,13 +1502,21 @@ class PileEngine(CollectionEngine):
             name:               str,
             payload:            type[BaseModel] | None = None,
             itemsCollection:    Collection | str | None = None,
-            policy:             STALE_ITEMS_POLICY = "retry",
+            maxAttempts:        int | None = None,
+            retryDelay:         float | None = None,
             leaseSeconds:       float = LEASE_SECONDS
         ):
 
         self.leaseSeconds = leaseSeconds
         self.payload: type[BaseModel] | None = payload
-        self.policy: STALE_ITEMS_POLICY = policy
+        self.maxAttempts: int = maxAttempts if maxAttempts is not None else app.itemMaxAttempts
+        self.retryDelay: float = retryDelay if retryDelay is not None else app.itemRetryDelay
+
+        if self.maxAttempts < 1:
+            raise ValueError(f"maxAttempts must be at least 1, not {self.maxAttempts}")
+
+        if self.retryDelay < 0:
+            raise ValueError(f"retryDelay is seconds and cannot be negative, not {self.retryDelay}")
 
         self._held: set[str] = set()
         self._heldLock = threading.Lock()
@@ -1507,31 +1537,6 @@ class PileEngine(CollectionEngine):
     def itemsCollection(self) -> Collection:
         return self.collection
 
-    def init(self):
-        """Under "retry" there is nothing to do — an expired lease is claimable
-        again on its own. "fail" is the one that needs saying out loud, and claim()
-        says it too, so a stale item does not wait for a boot to be resolved."""
-
-        if self.policy == "fail":
-            self._failStale(utc_now())
-
-    def _failStale(self, now: datetime) -> int:
-        """Finish items whose holder stopped renewing.
-
-        A live worker renews, so a lapsed lease means nobody is holding it — which
-        is why this can run from any process without disturbing another's work.
-        """
-
-        return self.collection.update_many(
-            {"status": "claimed", "leaseUntil": {"$lte": now}},
-            {"$set": {
-                "status": "failed",
-                "error": "the worker holding this item stopped renewing its lease",
-                "claimId": None,    # that worker can no longer finish it
-                "finishedAt": now,
-            }},
-        ).modified_count
-
     def createIndexes(self):
         super().createIndexes()  # unique uid
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])  # claim()
@@ -1550,48 +1555,55 @@ class PileEngine(CollectionEngine):
     # --- taking work out of it ---
 
     def claim(self, where: Mapping[str, Any] | None = None) -> Item | None:
-        """Atomically take the oldest pending item, or None if the pile is empty.
+        """Atomically take the oldest claimable item, or None if there is none.
 
+        Claimable is pending and due, or claimed by a worker that stopped renewing.
         The claim is a single find_one_and_update, so two workers racing on the
         same pile can never receive the same item.
         """
 
-        now = utc_now()
-
-        # "retry" picks up items whose holder stopped renewing; "fail" retires them
-        # here instead, so the policy means the same thing between boots as at one.
-        if self.policy == "fail":
-            self._failStale(now)
-
-        claimable = ["pending", "claimed"] if self.policy == "retry" else ["pending"]
-
-        query: dict[str, Any] = {
-            "status": {"$in": claimable},
-            "leaseUntil": {"$lte": now},
-        }
+        query: dict[str, Any] = {"status": {"$in": ["pending", "claimed"]}}
         if where:
             query.update(where)
 
-        raw = self.collection.find_one_and_update(
-            query,
-            {
-                "$set": {
-                    "status": "claimed",
-                    "claimId": uuid4str(),
-                    "claimedAt": now,
-                    "leaseUntil": now + timedelta(seconds=self.leaseSeconds),
+        while True:
+            now = utc_now()
+            raw = self.collection.find_one_and_update(
+                {**query, "leaseUntil": {"$lte": now}},
+                {
+                    "$set": {
+                        "status": "claimed",
+                        "claimId": uuid4str(),
+                        "claimedAt": now,
+                        "leaseUntil": now + timedelta(seconds=self.leaseSeconds),
+                    },
+                    "$inc": {"attempts": 1},
                 },
-                "$inc": {"attempts": 1},
-            },
-            # a pending item's lease is its createdAt, so this is still oldest-first
-            sort=[("leaseUntil", 1)],
-            return_document=ReturnDocument.AFTER
+                # a pending item's lease is its createdAt, so this is still oldest-first
+                sort=[("leaseUntil", 1)],
+                return_document=ReturnDocument.AFTER
+            )
+
+            if not raw:
+                return None
+
+            item = self.load(raw)
+
+            # A failure with attempts left goes back as pending, so running out at
+            # the claim means the last one never reported back: its worker died.
+            if item.attempts <= self.maxAttempts:
+                return item
+
+            self._giveUp(item)      # and look for the next one
+
+    def _giveUp(self, item: Item):
+        error = (
+            f"gave up after {item.attempts - 1} attempt(s): the worker holding the last "
+            f"one died without reporting back — killed, or taken down by the item itself"
         )
 
-        if not raw:
-            return None
-
-        return self.load(raw)
+        self._finish(item, "failed", error=error)
+        logger.error("%s item %s %s", self.name, item.uid, error)
 
     @staticmethod
     def _uid(item: Item | str) -> str:
@@ -1619,7 +1631,7 @@ class PileEngine(CollectionEngine):
             error:      str | None = None
         ) -> bool:
 
-        update: dict[str, Any] = {"status": status, "finishedAt": utc_now()}
+        update: dict[str, Any] = {"status": status, "finishedAt": utc_now(), "claimId": None}
 
         if result is not None:
             update["result"] = result
@@ -1640,15 +1652,49 @@ class PileEngine(CollectionEngine):
         return self._finish(item, "done", result=result)
 
     def fail(self, item: Item | str, error: str | None = None) -> bool:
-        return self._finish(item, "failed", error=error)
+        """Record a failure. False if nothing matched, as for done().
+
+        A claimed Item with attempts left goes back on the pile, claimable after
+        retryDelay — the same rule as a task. A bare uid is an operator's verdict
+        and is final.
+        """
+
+        if isinstance(item, str) or item.attempts >= self.maxAttempts:
+            return self._finish(item, "failed", error=error)
+
+        retried = self.collection.update_one(
+            self._matching(item),
+            {"$set": {
+                "status": "pending",
+                "error": error,
+                "claimId": None,
+                "claimedAt": None,
+                "leaseUntil": utc_now() + timedelta(seconds=self.retryDelay),
+            }}
+        ).matched_count > 0
+
+        if retried:
+            logger.warning(
+                "%s item %s failed on attempt %d of %d, retrying in %ss",
+                self.name, item.uid, item.attempts, self.maxAttempts, self.retryDelay
+            )
+
+        return retried
 
     def release(self, item: Item | str) -> bool:
-        """Put a claimed item back on the pile without consuming an outcome."""
+        """Put a claimed item back on the pile without consuming an outcome, or
+        an attempt."""
 
         return self.collection.update_one(
-            self._matching(item),
+            {**self._matching(item), "status": "claimed"},
             # back to its own place in the pile, not the end of it
-            [{"$set": {"status": "pending", "claimId": None, "claimedAt": None, "leaseUntil": "$createdAt"}}]
+            [{"$set": {
+                "status": "pending",
+                "claimId": None,
+                "claimedAt": None,
+                "leaseUntil": "$createdAt",
+                "attempts": {"$subtract": ["$attempts", 1]},
+            }}]
         ).matched_count > 0
 
     def renewLease(self, item: Item | str) -> bool:
@@ -1679,13 +1725,12 @@ class PileEngine(CollectionEngine):
         while True:
             time.sleep(max(1.0, self.leaseSeconds / 3))
 
+            # one lock for the check and the exit, or a claim held in between would
+            # find a renewer still set, start none, and never be renewed
             with self._heldLock:
-                idle = not self._held
-
-            if idle:
-                with self._heldLock:
+                if not self._held:
                     self._renewer = None
-                return
+                    return
 
             try:
                 self.renewLeases()
@@ -1710,7 +1755,8 @@ class PileEngine(CollectionEngine):
 
     @contextmanager
     def work(self, where: Mapping[str, Any] | None = None):
-        """Claim one item, mark it done on success and failed on exception.
+        """Claim one item, mark it done on success, and fail() it on exception —
+        which retries it if it has attempts left.
 
         Yields None when the pile is empty. The exception is re-raised, so a task
         driving the pile fails alongside the item.
@@ -1780,27 +1826,30 @@ class pile:
             self,
             payload:            type[BaseModel] | None = None,
             itemsCollection:    Collection | str | None = None,
-            policy:             STALE_ITEMS_POLICY | None = None,
+            maxAttempts:        int | None = None,
+            retryDelay:         float | None = None,
             leaseSeconds:       float | None = None
         ):
 
         self.__is_pile__: bool = True
         self.payload = payload
         self.itemsCollection = itemsCollection
-        self.policy = policy
+        self.maxAttempts = maxAttempts      # None: the app's itemMaxAttempts
+        self.retryDelay = retryDelay        # None: the app's itemRetryDelay
         self.leaseSeconds = leaseSeconds
         self.name: str = ""
 
     def __set_name__(self, owner, name: str):
         self.name = name
 
-    def _engine(self, app: BaseApp, policy: STALE_ITEMS_POLICY, leaseSeconds: float) -> PileEngine:
+    def _engine(self, app: BaseApp, leaseSeconds: float) -> PileEngine:
         return PileEngine(
             app,
             name=self.name,
             payload=self.payload,
             itemsCollection=self.itemsCollection,
-            policy=self.policy or policy,
+            maxAttempts=self.maxAttempts,
+            retryDelay=self.retryDelay,
             leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds
         )
 
@@ -1881,7 +1930,6 @@ class schedulers:
             schedulersCollection:   Collection | str | None = None,
             policy:                 OVERDUE_SCHEDULES_POLICY | None = None,
             pollInterval:           float | None = None,
-            taskEngine:             TaskEngine | None = None,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float | None = None
         ):
@@ -1898,7 +1946,6 @@ class schedulers:
         self.schedulersCollection = schedulersCollection
         self.policy = policy
         self.pollInterval = pollInterval
-        self.taskEngine = taskEngine
         self.extraIndexes = extraIndexes
         self.name: str = ""
 
@@ -1920,12 +1967,12 @@ class schedulers:
         return SchedulerEngine(
             app,
             schedulersCollection=collection,
-            taskEngine=self.taskEngine,
             pollInterval=self.pollInterval if self.pollInterval is not None else pollInterval,
             policy=self.policy or policy,
             schedulerModel=self.schedulerModel,
             extraIndexes=self.extraIndexes,
-            leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds
+            leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds,
+            name=self.name
         )
 
     def __get__(self, obj, objtype=None) -> SchedulerEngine | schedulers:
@@ -1979,11 +2026,10 @@ class BaseApp:
     def _getSchedulerEngines(cls) -> dict[str, schedulers]:
         return cls._getDeclared("__is_schedulers__")
 
-    # Policies are declared on the class, never passed in: every process that
-    # imports this app must agree on them, and they are part of the fingerprint
-    # so two that disagree cannot both run workers.
+    # Policies and limits are declared on the class, never passed in: every
+    # process that imports this app must agree on them, and they are part of the
+    # fingerprint so two that disagree cannot both run workers.
     overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
-    staleItemsPolicy:           STALE_ITEMS_POLICY        = "retry"
 
     # Seconds a task may run before it is written off, and seconds past its
     # deadline before it stops being worth running at all. None means no limit;
@@ -1998,6 +2044,11 @@ class BaseApp:
     # that takes its worker down with it is given up on, not rerun forever.
     taskMaxAttempts:            int                       = MAX_ATTEMPTS
     taskRetryDelay:             float                     = RETRY_DELAY
+
+    # The same rule for pile items, overridable per pile(): a failure with
+    # attempts left goes back on the pile, and a crash counts.
+    itemMaxAttempts:            int                       = MAX_ATTEMPTS
+    itemRetryDelay:             float                     = RETRY_DELAY
 
     def __init__(
             self, 
@@ -2059,7 +2110,7 @@ class BaseApp:
         }
 
         self.piles: dict[str, PileEngine] = {
-            name: spec._engine(self, self.staleItemsPolicy, self.leaseSeconds)
+            name: spec._engine(self, self.leaseSeconds)
             for name, spec in type(self)._getPiles().items()
         }
 
@@ -2094,8 +2145,8 @@ class BaseApp:
         nothing can, reliably — so this is a guard, not a proof. Deploy one
         version at a time.
 
-        Policies are in here because they are shared behaviour: one process
-        retrying stale pile items while another fails them is a split brain over
+        Policies and limits are in here because they are shared behaviour: one
+        process retrying a failure another treats as final is a split brain over
         the same documents, not two harmless local settings.
         """
 
@@ -2105,9 +2156,10 @@ class BaseApp:
             for name, func in sorted(registry.items())
         ]
 
+        parts += [f"{engine.name}:{engine.policy}" for engine in self.schedulerEngines.values()]
         parts += [
-            f"{engine.name}:{engine.policy}"
-            for engine in (*self.schedulerEngines.values(), *self.piles.values())
+            f"{p.name}:maxAttempts={p.maxAttempts}:retryDelay={p.retryDelay}"
+            for p in self.piles.values()
         ]
 
         parts.append(f"taskTimeout:{self.task.timeout}")
@@ -2267,8 +2319,8 @@ class BaseApp:
         return [self.task, *self.schedulerEngines.values()]
 
     def init(self):
-        """Startup housekeeping: resolve documents whose task
-        no longer exists on this app.
+        """Startup housekeeping: flag pending tasks whose function no longer
+        exists on this app.
 
         Run by startWorkers(), not by the constructor — a process that only
         enqueues or reads must never disturb what the workers are doing. It is
@@ -2337,8 +2389,8 @@ class BaseApp:
         """Stop claiming, let the work already claimed finish, then return.
 
         Returns False if anything was still busy when `timeout` ran out — the
-        threads are daemons, so leaving the process at that point abandons them
-        and their tasks are recovered on the next startup.
+        threads are daemons, so leaving the process at that point abandons them,
+        as a kill would: their leases lapse and the next worker deals with them.
         """
 
         self.requestStop()
@@ -2370,20 +2422,15 @@ class BaseApp:
 
         return not self.running
 
-    def handleSignals(
-            self,
-            timeout:    float | None = 30,
-            signals:    Sequence[int] = (signal.SIGINT, signal.SIGTERM)
-        ):
-
+    def handleSignals(self, signals: Sequence[int] = (signal.SIGINT, signal.SIGTERM)):
         """Turn SIGINT/SIGTERM into a graceful shutdown.
 
         The first signal stops claiming and lets in-flight work finish; a second
         one exits immediately. Opt-in, because a host framework may want to own
         these — call it only from a process pymonque is running.
 
-        SIGKILL cannot be caught: the process dies with work in flight, which is
-        what the startup recovery policies are for.
+        SIGKILL cannot be caught: the process dies with work in flight, and its
+        leases lapse for the next worker to deal with.
         """
 
         def onSignal(signum, frame):
@@ -2400,8 +2447,6 @@ class BaseApp:
             self._previousHandlers[s] = signal.getsignal(s)
             signal.signal(s, onSignal)
 
-        self._shutdownTimeout = timeout
-
     def restoreSignals(self):
         for s, handler in self._previousHandlers.items():
             signal.signal(s, handler)
@@ -2416,7 +2461,7 @@ class BaseApp:
                 q.run(taskWorkers=4, schedulerWorkers=1)
         """
 
-        self.handleSignals(timeout=timeout)
+        self.handleSignals()
         self.startWorkers(taskWorkers, schedulerWorkers)
 
         try:

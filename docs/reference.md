@@ -5,11 +5,12 @@
 ```python
 class App(BaseApp):
     overdueSchedulersPolicy = "execute once"    # policies are declared, not passed
-    staleItemsPolicy        = "retry"
-    taskTimeout             = None              # and so are the task limits
+    taskTimeout             = None              # and so are the limits
     taskSkipAfter           = None
     taskMaxAttempts         = 1
     taskRetryDelay          = 60
+    itemMaxAttempts         = 1                 # the same, for pile items
+    itemRetryDelay          = 60
 
 app = App(
     db,                                         # pymongo Database
@@ -19,8 +20,8 @@ app = App(
 )
 ```
 
-Policies are class attributes, never constructor arguments: every process that imports this app
-has to agree on them, or one would retry a stale item while another failed it. They are part of
+Policies and limits are class attributes, never constructor arguments: every process that imports
+this app has to agree on them, or one would retry a failure another treats as final. They are part of
 the [fingerprint](#one-version-at-a-time), so two that disagree cannot both run workers.
 Pacing and lease lengths are per-process and stay arguments.
 
@@ -52,7 +53,7 @@ That is the whole of a worker process. For finer control:
 | `requestStop()` | Stop claiming new work. Returns at once. |
 | `stopWorkers(timeout=30)` | Stop claiming, wait for in-flight work, deregister. `False` if the timeout ran out. |
 | `joinWorkers(timeout=None)` | Block until the workers stop. |
-| `handleSignals(timeout=30, signals=(SIGINT, SIGTERM))` | Install graceful-shutdown handlers. |
+| `handleSignals(signals=(SIGINT, SIGTERM))` | Install graceful-shutdown handlers. |
 | `restoreSignals()` | Put the previous handlers back. |
 | `app.running` / `app.stopping` | Also on each engine. |
 
@@ -75,7 +76,8 @@ process pymonque is running, not from inside someone else's server.
 | SIGKILL | Cannot be caught. The process dies with work in flight. |
 
 After a SIGKILL, the leases of whatever was in flight simply lapse and the next worker to poll
-reclaims it. No boot is required, and no other worker is disturbed.
+picks it up — no boot is required, and no other worker is disturbed. What it then does depends on
+what it picked up; see [Leases](#leases).
 
 Collections and indexes are created on construction. Startup cleanup is not — it belongs to
 `startWorkers()`. See [Startup housekeeping](#startup-housekeeping).
@@ -391,8 +393,8 @@ schedulers(schedulerModel: type[Scheduler] = Scheduler,
            extraIndexes: Sequence[IndexModel] | None = None)
 ```
 
-They land in `app.schedulerEngines` and are reachable as `app.<name>`. `init()` runs on all of
-them at construction and `app.startWorkers()` starts all of them. Declaring one named
+They land in `app.schedulerEngines` and are reachable as `app.<name>`. `app.startWorkers()` starts
+all of them. Declaring one named
 `scheduler` replaces the default engine instead of adding to it.
 
 ### SchedulerEngine
@@ -404,7 +406,7 @@ them at construction and `app.startWorkers()` starts all of them. Declaring one 
 | `build(work, distribution, deadline=None, **fields)` | An unsaved scheduler of this engine's model. |
 | `upsert(scheduler)` | Store one under its own uid, creating or replacing. |
 | `update(uid, work=None, distribution=None, enabled=None, **fields)` | Change parts of one; `None` if no such uid. |
-| `get(uid)` / `byUid(uid)` | `Scheduler` or `None`. |
+| `get(uid)` | `Scheduler` or `None`. |
 | `byName(name)` | The one declared under that name by `ensure()`. |
 | `find(where=None)` / `count(where=None)` | Query the collection. |
 | `delete(uid)` / `removeNamed(name)` | `True` if one was deleted. |
@@ -420,7 +422,8 @@ Everything that writes validates the scheduler *as it will be emitted* — `emit
 
 On each fire the scheduler emits a task dated to its own deadline, then advances that
 deadline by a fresh interval — measured from the old deadline, so the rhythm does not drift.
-A `disabled` scheduler advances without emitting.
+A `disabled` scheduler advances without emitting. So does one whose task the app no longer has,
+logging a warning each beat — it stays `enabled`, so putting the task back resumes it.
 
 ### ensure
 
@@ -435,7 +438,7 @@ upsert, so processes booting together produce one scheduler, not one each.
 
 `enabled` is left as the database has it unless you pass it, so disabling a scheduler in
 production survives a deploy. Dropping the `ensure()` call does not delete the scheduler —
-use `remove()`.
+use `removeNamed()`.
 
 The name also lands on every emitted task as `factory.name`.
 
@@ -522,7 +525,7 @@ class App(BaseApp):
     outbox = pile(Email)                          # payload validated against Email
     scraps = pile()                               # payload is any dict
     other  = pile(Email, itemsCollection="x")     # explicit collection
-    strict = pile(Email, policy="fail")           # override staleItemsPolicy
+    retried = pile(Email, maxAttempts=5, retryDelay=10)   # override itemMaxAttempts / itemRetryDelay
 ```
 
 Each pile gets `pymonque_pile_<name>` unless told otherwise.
@@ -533,11 +536,11 @@ Each pile gets `pymonque_pile_<name>` unless told otherwise.
 |---|---|
 | `add(model \| dict \| **kwargs)` | Insert one item. |
 | `addMany(iterable)` | Insert many; validates all before inserting any. |
-| `claim(where=None)` | Atomically take the oldest pending item, or `None`. |
-| `work(where=None)` | Context manager: claim, then done, or failed if the block raises. |
+| `claim(where=None)` | Atomically take the oldest claimable item, or `None`. One whose worker died on its last attempt is given up on instead. |
+| `work(where=None)` | Context manager: claim, then `done`, or `fail` if the block raises. |
 | `done(item, result=None)` | `True`, or `False` if nothing matched: no such item, or — given the claimed `Item` — its claim has since passed to another worker. A bare uid acts whatever the claim. |
-| `fail(item, error=None)` | Same. |
-| `release(item)` | Put it back as pending. Same. |
+| `fail(item, error=None)` | Same. Given the claimed `Item` with attempts left, puts it back to retry; a bare uid is final. |
+| `release(item)` | Put a claimed item back as pending, without using up an attempt. Same. |
 | `count(where=None, status=None)` / `counts()` | |
 | `find(where=None)` | `list[Item]`. |
 | `purge(status="done")` | Delete, return how many. |
@@ -554,6 +557,13 @@ with app.outbox.work() as item:
 Piles run no workers of their own. Drive one from a task, and fire that task from a
 scheduler.
 
+### Retries
+
+The same rule as [tasks](#retries), one level shorter: the pile's `maxAttempts` / `retryDelay`,
+else the app's `itemMaxAttempts` / `itemRetryDelay`. Off by default. A failed item with attempts
+left goes back as `pending`, claimable after `retryDelay`. A crash counts: an item whose worker died
+on its last attempt is written `failed` at the next claim rather than handed out again.
+
 ### Item document
 
 | Field | Type |
@@ -562,14 +572,15 @@ scheduler.
 | `status` | `pending` `claimed` `done` `failed` |
 | `data` | the payload |
 | `createdAt` / `claimedAt` / `finishedAt` | `datetime` |
-| `attempts` | `int`, bumped on every claim |
+| `attempts` | `int`, bumped on every claim — a crashed run counts, a `release()` gives it back |
 | `claimId` | `str`, new on every claim. `done`/`fail`/`release`/`renewLease` given an `Item` only apply while it still matches, so a worker whose lease lapsed cannot overwrite the worker that took over; `work()` logs when that happens |
 | `result` / `error` | |
 
 ```
 pending ─→ claimed ─→ done
-              ├────→ failed
-              └────→ pending    release(), or a restart under "retry"
+              ├────→ failed     out of attempts, or failed by uid
+              ├────→ pending    fail() with attempts left, or release()
+              └────→ claimed    lease lapsed; another worker claimed it
 ```
 
 ## One version at a time
@@ -609,7 +620,7 @@ Workers check in every `heartbeatInterval` seconds and are considered gone after
 cleanup — and a crashed process frees its slot within a minute.
 
 **What the fingerprint can and cannot see.** It sees added, removed, or re-signatured tasks and
-distributions, the policy on every engine, and the task limits. It does **not** see a changed function body, and cannot: that would require hashing
+distributions, the scheduler policies, and the task and item limits. It does **not** see a changed function body, and cannot: that would require hashing
 every transitive dependency. It is a guard against the obvious mistake, not a proof of identity.
 The rule is the guarantee; the hash only enforces the part of it that is mechanically checkable.
 
@@ -631,11 +642,19 @@ So a claim is one comparison, and it covers both cases at once:
 While a worker holds something it renews the lease in the background, every `leaseSeconds / 3`.
 If that worker dies, nothing renews, the lease lapses, and the next worker claims it — with no
 restart, no sweep, and no coordination. `leaseSeconds` defaults to 300 and is settable on the
-app or per engine.
+app or per engine. What the next worker does with it:
 
-This is **at-least-once**: a worker that hangs long enough for its lease to lapse can have its
-work picked up while it is still running. Make tasks idempotent, or set a lease longer than the
-longest task.
+| it claimed | it |
+|---|---|
+| a task | counts the dead run as an attempt: reruns it if attempts are left, else writes it `failed` — so under the default of one, a killed task is failed, not rerun ([Retries](#retries)) |
+| a scheduler | emits the beat if the dead worker hadn't — each beat's task has a fixed uid, so it is never emitted twice |
+| a pile item | the same as a task ([pile retries](#retries-1)) |
+
+A renewal only stops when the process does, or loses the database. A worker cut off for longer
+than its lease can have its work picked up while its own run carries on, so the same call can run
+twice at once. **Only the current claim writes an outcome**: every claim bumps a task's `attempts`
+and gives an item a new `claimId`, and a write from an older claim matches nothing and is logged —
+which also keeps a late finish from overwriting a `cancel()`.
 
 | | |
 |---|---|
@@ -666,33 +685,27 @@ resolved where it is observed rather than at boot:
 | a worker died holding a pile item | continuously | at the claim |
 | a lease lapsed | continuously | at the claim |
 | a task went stale (`skipAfter`) | continuously | at the claim |
-| a task ran out of attempts | continuously | at the claim |
+| a task or item ran out of attempts | continuously | at the claim |
+| a scheduler's task is gone | only at boot | at the claim: the beat is skipped, the status left alone |
 | **the set of tasks that exist** | **only at boot** | **`init()`** |
 
-What `init()` still does: **flags pending tasks whose function is gone** as `incompatible`, and
-**disables schedulers** that emit one.
+What `init()` still does: **flags pending tasks whose function is gone** as `incompatible`.
 
 That belongs at boot rather than at a claim, and not as a compromise: the fingerprint forces
 a full restart to change an app's task list, so boot is the only moment that set can change.
 
 `init()` is **version-checked**, like `startWorkers()`. It decides what is runnable from *this*
 process's task list, so a process holding a different one must not run it — otherwise a script
-importing half the app could disable a live deployment's schedulers. Everything it does is
+importing half the app could write off a live deployment's tasks. Everything it does is
 otherwise scoped to documents nobody holds, so it cannot take work from a running worker.
 
 ## Policies
 
-Declared on the app class, and applied where their condition is observed rather than at boot —
-a scheduler falls behind, and a worker dies holding an item, while an app is running just as
-easily as while it is down.
+There is one, declared on the app class and applied every time a scheduler is claimed — a
+scheduler falls behind while an app is running just as easily as while it is down.
 
-| policy | applied |
-|---|---|
-| `overdueSchedulersPolicy` | every time a scheduler is claimed |
-| `staleItemsPolicy` | every time a pile is claimed from (and at `init()`, for a pile nothing claims from) |
-
-Tasks have no policy: a late one is governed by [`skipAfter`](#skipafter), a failing one by
-[`maxAttempts`](#retries).
+Tasks and piles have no policy: a late task is governed by [`skipAfter`](#skipafter), and a
+failing task or item by [`maxAttempts`](#retries).
 
 | `overdueSchedulersPolicy` | when a whole beat has gone by unworked |
 |---|---|
@@ -705,14 +718,6 @@ normally under all three. The policy only decides what is owed for beats that we
 `"execute reconstructed"` is the only one that can stay permanently behind: a scheduler set
 faster than its workers can serve it will keep a backlog forever. It logs `missed a beat` on
 every claim so you can see that happening.
-
-| `staleItemsPolicy` | what happens to an item whose holder stopped renewing |
-|---|---|
-| `"retry"` | it becomes claimable again on its own (default) — no sweep needed |
-| `"fail"` | it is never retried; the next claim on that pile marks it failed |
-
-A live worker renews its lease, so a lapsed one means nobody is holding the item. Failing it
-cannot take work away from a running worker, which is why any process may do it.
 
 A worker never claims a task it cannot run — the claim filters on the function names it has — so
 an unrecognised task waits rather than failing.
@@ -811,6 +816,4 @@ as they are. The update in step 3 is a pipeline, which needs MongoDB 4.2 or late
   or `mode="json"` when you want something else. `None` is stored as null, so a field
   can be cleared.
 - Workers are daemon threads. `stopWorkers()` lets work in flight finish; a process killed
-  outright leaves its leases to lapse, and the next worker reclaims them.
-- Tasks cap their attempts; pile items do not. An item that kills its worker is reclaimed each
-  time its lease lapses under `"retry"` — its `attempts` count shows it, and `"fail"` stops it.
+  outright leaves its leases to lapse, and the next worker picks them up ([Leases](#leases)).

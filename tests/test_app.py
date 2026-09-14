@@ -184,15 +184,16 @@ def test_poll_intervals_reach_the_engines(db):
     assert app.scheduler.pollInterval == 3
 
 
-def test_policies_reach_the_engines(db):
+def test_policies_and_limits_reach_the_engines(db):
     class App(ExampleApp):
-        overdueSchedulersPolicy = "execute once"
-        staleItemsPolicy        = "fail"
+        overdueSchedulersPolicy = "skip"
+        itemMaxAttempts         = 3
+        itemRetryDelay          = 5
 
     app = App(db)
 
-    assert app.scheduler.policy == "execute once"
-    assert app.outbox.policy == "fail"
+    assert app.scheduler.policy == "skip"
+    assert (app.outbox.maxAttempts, app.outbox.retryDelay) == (3, 5)
 
 
 def test_a_custom_distribution_registry_reaches_the_engines(db):

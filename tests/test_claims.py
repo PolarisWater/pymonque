@@ -5,11 +5,11 @@ from datetime import timedelta
 
 import pytest
 
-from pymonque import BaseApp, pile, utc_now
+from pymonque import BaseApp, pile, task, utc_now
 
 
 class App(BaseApp):
-    jobs = pile()
+    jobs = pile(maxAttempts=3)      # so a second worker may take over a lapsed claim
 
 
 @pytest.fixture
@@ -83,16 +83,16 @@ def test_a_released_item_is_claimed_afresh(app):
     assert app.jobs.claim().claimId != first.claimId
 
 
-def test_a_failed_stale_item_cannot_be_finished_by_its_old_holder(db):
-    class Failing(BaseApp):
-        staleItemsPolicy = "fail"
+def test_a_given_up_item_cannot_be_finished_by_its_old_holder(db):
+    class Once(BaseApp):
         jobs = pile()
 
-    app = Failing(db, enforceVersion=False, backlogWarnAfter=None)
+    app = Once(db, enforceVersion=False, backlogWarnAfter=None)
     app.jobs.add({"n": 1})
     item = app.jobs.claim()
     lapse(app, item)
-    app.jobs.claim()                    # retires it
+
+    assert app.jobs.claim() is None     # out of attempts, so given up on
 
     assert app.jobs.done(item) is False
     assert app.jobs.get(item.uid).status == "failed"
@@ -114,3 +114,48 @@ def test_work_says_when_its_outcome_was_not_recorded(app, caplog):
 
     assert "was not recorded" in caplog.text
     assert app.jobs.get(item.uid).status == "claimed"
+
+
+# --- tasks: the claim is the attempt number ---
+
+class Tasks(BaseApp):
+    @task
+    @staticmethod
+    def ping():
+        return "pong"
+
+
+def test_a_task_claim_that_was_lost_does_not_overwrite_a_cancel(db, caplog):
+    app = Tasks(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Tasks.ping())
+    original = app.task.execute
+
+    def cancelMidRun(claimed):
+        # the lease lapsed while it ran, and someone canceled it in that window
+        app.task.collection.update_one({"uid": claimed.uid}, {"$set": {"leaseUntil": utc_now()}})
+        assert app.task.cancel(claimed.uid)
+        return original(claimed)
+
+    app.task.execute = cancelMidRun
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        app.task._work()
+
+    assert app.task.get(stored.uid).status == "canceled"
+    assert "not recorded" in caplog.text
+
+
+def test_a_task_taken_over_keeps_the_new_claims_outcome(db):
+    app = Tasks(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Tasks.ping())
+    original = app.task.execute
+
+    def takenOverMidRun(claimed):
+        # a second claim bumps attempts; this worker's write must not land
+        app.task.collection.update_one({"uid": claimed.uid}, {"$inc": {"attempts": 1}})
+        return original(claimed)
+
+    app.task.execute = takenOverMidRun
+    app.task._work()
+
+    assert app.task.get(stored.uid).status == "processing"

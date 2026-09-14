@@ -313,8 +313,12 @@ def test_the_policy_still_applies_after_startup(db, tasks):
     assert tasks.count_documents({}) == 0
 
 
-def test_a_scheduler_whose_task_vanished_is_disabled(db, app):
+def test_a_scheduler_whose_task_vanished_skips_its_beats_but_stays_enabled(db, app, tasks, caplog):
+    """Disabling is the operator's word: it would outlast the task coming back."""
+
     scheduler = addScheduler(app)
+    due = utc_now() - timedelta(seconds=1)
+    setDeadline(app, scheduler, due)
 
     class Smaller(BaseApp):
         @task
@@ -322,9 +326,17 @@ def test_a_scheduler_whose_task_vanished_is_disabled(db, app):
         def other():
             return None
 
-    Smaller(db).init()
+    smaller = Smaller(db)
+    smaller.init()
 
-    assert reload(app, scheduler).status == "disabled"
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        smaller.scheduler._work()
+
+    after = reload(app, scheduler)
+    assert after.status == "enabled"
+    assert after.deadline > due             # still keeps its rhythm
+    assert tasks.count_documents({}) == 0
+    assert "no task for" in caplog.text
 
 
 # --- ensure(): declaring a scheduler that should always exist ---
@@ -457,14 +469,14 @@ def test_get_finds_a_declared_scheduler(app):
 def test_remove_deletes_it(app, schedulers):
     declare(app)
 
-    assert app.scheduler.remove("nightly") is True
-    assert app.scheduler.remove("nightly") is False
+    assert app.scheduler.removeNamed("nightly") is True
+    assert app.scheduler.removeNamed("nightly") is False
     assert schedulers.count_documents({}) == 0
 
 
 def test_a_removed_scheduler_can_be_declared_again(db, schedulers):
     declare(ExampleApp(db))
-    ExampleApp(db).scheduler.remove("nightly")
+    ExampleApp(db).scheduler.removeNamed("nightly")
     declare(ExampleApp(db))
 
     assert schedulers.count_documents({}) == 1
@@ -508,3 +520,28 @@ def test_a_scheduler_field_can_be_cleared(db):
     )
 
     assert app.scheduler.update(stored.uid, note=None).note is None
+
+
+# --- emitting a beat exactly once ---
+
+def test_a_beat_reclaimed_after_a_crash_is_not_emitted_twice(app):
+    scheduler = addScheduler(app)
+    due = utc_now() - timedelta(seconds=1)
+    setDeadline(app, scheduler, due)
+
+    app.scheduler._work()
+    # the worker died after emitting, before moving the deadline on
+    setDeadline(app, scheduler, due)
+    app.scheduler._work()
+
+    assert app.task.tasksCollection.count_documents({"work.functionName": "greet"}) == 1
+
+
+def test_a_new_deadline_moves_the_lease_with_it(app):
+    scheduler = addScheduler(app)
+    later = (utc_now() + timedelta(days=30)).replace(microsecond=0)
+
+    updated = app.scheduler.update(scheduler.uid, deadline=later)
+
+    assert updated.deadline == later
+    assert updated.leaseUntil == later
