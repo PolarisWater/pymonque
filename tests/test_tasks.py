@@ -298,3 +298,32 @@ def test_sys_exit_in_a_task_is_a_failure_not_a_dead_worker(db):
 
     assert app.task.get(stored.uid).status == "failed"
     assert "SystemExit" in app.task.get(stored.uid).error
+
+
+# --- save(): the lease follows a first run's deadline, not a retry's ---
+
+def test_saving_a_moved_deadline_moves_a_waiting_tasks_lease(app):
+    from datetime import timedelta
+    from pymonque import utc_now
+
+    stored = app.task.get(app.task.schedule(ExampleApp.greet(name="Ada")).uid)
+    stored.deadline = (utc_now() + timedelta(days=1)).replace(microsecond=0)
+    stored.save()
+
+    assert app.task.get(stored.uid).leaseUntil == stored.deadline
+    assert app.task._work() is None          # no longer due
+
+
+def test_saving_a_task_waiting_for_a_retry_keeps_its_retry_time(app):
+    from datetime import timedelta
+    from pymonque import utc_now
+
+    stored = app.task.schedule(ExampleApp.boom(), maxAttempts=2, retryDelay=600)
+    app.task._work()
+    waiting = app.task.get(stored.uid)
+    retryAt = waiting.leaseUntil
+
+    waiting.deadline = utc_now() - timedelta(days=1)
+    waiting.save()
+
+    assert app.task.get(stored.uid).leaseUntil == retryAt

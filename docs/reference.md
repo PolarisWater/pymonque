@@ -816,6 +816,36 @@ for name in schedulerCollections:
 It is idempotent, so running it twice does no harm. Tasks 0.x marked `outdated` or `canceled` stay
 as they are. The update in step 3 is a pipeline, which needs MongoDB 4.2 or later.
 
+## Known limitations
+
+Deliberate trade-offs and edges that are not handled, so none of them comes as a surprise:
+
+- **Two versions starting at the same instant can both pass the version check.** It reads the live
+  workers, then registers. Deploy one version at a time rather than relying on the check to settle a
+  race.
+- **The fingerprint sees signatures, not function bodies.** See
+  [One version at a time](#one-version-at-a-time).
+- **A timeout frees the worker, not the call.** Python can't interrupt a running call, so a timed-out
+  task keeps running on its own daemon thread until it returns or the process exits.
+- **A process cut off from the database for longer than its lease can have its work run twice at
+  once.** Only the current claim's outcome is recorded, and the other is logged, but the side effects
+  of both runs happen. Keep tasks idempotent where that matters.
+- **`stopWorkers()` that times out still deregisters the process,** while the abandoned threads may
+  still be running. Exit the process afterwards; a new version could otherwise start alongside them.
+- **`requestStop()` alone leaves the heartbeat running.** Call `stopWorkers()`, or use `run()`, to
+  finish shutting down.
+- **`skipAfter` counts from the original deadline,** so the time a task spends waiting for retries
+  counts against it.
+- **`save()` on a task waiting for a retry keeps the retry time,** even if you change its deadline.
+  Set `leaseUntil` yourself to move it. A task waiting for its first run, or a scheduler, moves its
+  lease with its deadline.
+- **Pile limits are per pile or per app, not per item.** `add(**kwargs)` treats its keyword
+  arguments as the item's data, so there is no room for per-item settings.
+- **A scheduler whose task is gone warns on every beat** until you remove it, disable it, or put
+  the task back.
+- **`work()` treats `SystemExit` as a failure, like a task does, but not `KeyboardInterrupt`.** A
+  Ctrl-C in the main thread leaves a claimed item for its lease to lapse.
+
 ## Notes
 
 - Times are naive UTC (`utc_now()`). Mongo keeps millisecond precision.

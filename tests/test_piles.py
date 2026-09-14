@@ -521,3 +521,15 @@ def test_renewing_a_lease_reports_whether_there_was_one(app):
 
     assert app.outbox.renewLease(item) is True
     assert app.outbox.renewLease("no-such-uid") is False
+
+
+def test_sys_exit_inside_work_fails_the_item(app):
+    import sys
+
+    item = app.outbox.add(to="a@b.c")
+
+    with pytest.raises(SystemExit):
+        with app.outbox.work():
+            sys.exit(2)
+
+    assert app.outbox.get(item.uid).status == "failed"

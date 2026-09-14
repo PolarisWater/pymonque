@@ -780,6 +780,16 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         super().createIndexes()  # unique uid
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])  # _work() claim
 
+    def save(self, document: Task) -> Task:
+        """Store a task as it is now. A task waiting for its first run is claimable
+        at its deadline, so the lease moves with a deadline changed by hand. One
+        waiting for a retry keeps its retry time, and a claimed one its lease."""
+
+        if document.status == "pending" and document.attempts == 0:
+            document.leaseUntil = document.deadline
+
+        return super().save(document)
+
     def _work(self):
         now = utc_now()
         raw = self.tasksCollection.find_one_and_update(
@@ -1795,7 +1805,7 @@ class PileEngine(CollectionEngine):
 
         try:
             yield item
-        except Exception:
+        except (Exception, SystemExit):     # as execute() does: sys.exit() is a failure too
             if not self.fail(item, traceback.format_exc()):
                 self._lostClaim(item)
             raise
