@@ -335,3 +335,56 @@ def test_a_saved_document_stores_its_nones(store):
     account.save()
 
     assert store.accounts.get(42).createdAt is None
+
+
+def test_update_accepts_nested_models(db):
+    from pydantic import BaseModel
+    from pymonque import BaseApp, Document, collection
+
+    class Member(BaseModel):
+        name: str
+
+    class Group(Document):
+        members: list[Member] = []
+
+    class App(BaseApp):
+        groups = collection(Group)
+
+    app = App(db)
+    group = app.groups.create()
+
+    updated = app.groups.update(group.uid, members=[Member(name="Ada")])
+
+    assert updated.members == [Member(name="Ada")]
+
+
+def test_update_rejects_an_unknown_or_invalid_field(db):
+    import pytest
+    from pydantic import ValidationError
+    from pymonque import BaseApp, Document, collection
+
+    class Counter(Document):
+        count: int = 0
+
+    class App(BaseApp):
+        counters = collection(Counter)
+
+    app = App(db)
+    counter = app.counters.create()
+
+    with pytest.raises(ValidationError):
+        app.counters.update(counter.uid, count="many")
+
+    assert app.counters.get(counter.uid).count == 0
+
+
+def test_update_of_a_missing_document_is_none(db):
+    from pymonque import BaseApp, Document, collection
+
+    class Counter(Document):
+        count: int = 0
+
+    class App(BaseApp):
+        counters = collection(Counter)
+
+    assert App(db).counters.update("nope", count=1) is None

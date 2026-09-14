@@ -533,3 +533,17 @@ def test_sys_exit_inside_work_fails_the_item(app):
             sys.exit(2)
 
     assert app.outbox.get(item.uid).status == "failed"
+
+
+def test_done_after_a_retry_clears_the_earlier_error(db):
+    class Q(BaseApp):
+        jobs = pile(maxAttempts=2, retryDelay=0)
+
+    app = Q(db)
+    item = app.jobs.add({"n": 1})
+    app.jobs.fail(app.jobs.claim(), error="first try failed")
+
+    with app.jobs.work():
+        pass
+
+    assert app.jobs.get(item.uid).error is None

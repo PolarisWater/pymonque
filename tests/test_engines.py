@@ -442,3 +442,15 @@ def test_a_pile_accepts_a_collection_object(db):
 
 def test_declaration_repr():
     assert repr(OpsApp.accountOps) == "schedulers accountOps (AccountScheduler)"
+
+
+def test_an_invalid_scheduler_update_writes_nothing(ops):
+    from pydantic import ValidationError
+
+    scheduler = ops.accountOps.add(OpsApp.sync(), hourly(ops), accountId=7)
+
+    with pytest.raises(ValidationError):
+        ops.accountOps.update(scheduler.uid, accountId="not a number")
+
+    assert ops.accountOps.collection.find_one({"uid": scheduler.uid})["accountId"] == 7
+    assert ops.accountOps.get(scheduler.uid).accountId == 7      # still loads

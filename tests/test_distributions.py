@@ -129,3 +129,9 @@ def test_a_custom_registry_extends_the_built_ins(db):
 def test_the_default_registry_does_not_see_custom_distributions(app):
     with pytest.raises(DistributionNotFound):
         app.distribution("fixed", dailyFrequency=1, seconds=7)
+
+
+def test_gen_coerces_what_validation_accepted(app):
+    distribution = app.distribution("constant", dailyFrequency="24")
+
+    assert app.distribution.gen(distribution).total_seconds() == 3600

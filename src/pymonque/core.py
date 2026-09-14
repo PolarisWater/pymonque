@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pydantic import (
     create_model, field_validator, field_serializer, model_validator,
-    ConfigDict, BaseModel, Field, PrivateAttr, PositiveFloat
+    ConfigDict, BaseModel, Field, PrivateAttr, PositiveFloat, ValidationError
 )
 
 from typing import (
@@ -77,11 +77,23 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def nearestAttributes(cls: type) -> dict[str, Any]:
+    """Every name defined on a class or its parents, resolved to the definition that
+    wins — so a subclass that overrides a declaration with something else replaces
+    it, rather than leaving the parent's registered beside it. Kept in the order
+    names were first defined."""
+
+    resolved: dict[str, Any] = {}
+
+    for base in reversed(cls.__mro__):  # furthest first, so nearer definitions overwrite
+        resolved.update(base.__dict__)
+
+    return resolved
+
 def getStaticmethods(cls: type) -> dict[str, Callable]:
     return {
         name: obj.__func__
-        for base in reversed(cls.__mro__)  # walk trough all parents
-        for name, obj in base.__dict__.items()
+        for name, obj in nearestAttributes(cls).items()
         if isinstance(obj, staticmethod) and not name.startswith("_")  # add only staticmethods
     }
 
@@ -123,6 +135,19 @@ def buildValidator(func: Callable) -> type[BaseModel]:
         **fields,
         __config__ = ConfigDict(extra=extra)
     )
+
+def callValidated(func: Callable, validator: type[BaseModel], kwargs: Mapping[str, Any]) -> Any:
+    """Call with the arguments as the signature declares them.
+
+    A CallSpec is stored as plain data, so a model argument comes back as a dict,
+    and a value that validated by coercion ("3" for an int) is still the original.
+    Validating again at the call hands the function what its annotations promise.
+    """
+
+    validated = validator.model_validate(dict(kwargs))
+    arguments = {name: getattr(validated, name) for name in type(validated).model_fields}
+
+    return func(**arguments, **(validated.model_extra or {}))
 
 def uuid4str() -> str:
     return str(uuid.uuid4())
@@ -308,6 +333,21 @@ class CollectionEngine(Generic[M]):
 
         return [d.bind(self) for d in documents]
 
+    def _prepare(self, document: M) -> M:
+        """Keep derived fields in step before a document is written. Nothing to do
+        for plain storage."""
+
+        return document
+
+    def _assign(self, document: M, fields: Mapping[str, Any]) -> M:
+        """Set fields the way constructing the model would: validated and coerced,
+        raising before anything is written."""
+
+        for name, value in fields.items():
+            document.__pydantic_validator__.validate_assignment(document, name, value)
+
+        return document
+
     def save(self, document: M) -> M:
         """Store the document as it is now, creating it if it is not there yet.
 
@@ -320,22 +360,31 @@ class CollectionEngine(Generic[M]):
 
         self.collection.replace_one(
             {self.key: match},
-            document.model_dump(),
+            self._prepare(document).model_dump(),
             upsert=True
         )
 
         return document.bind(self)
 
     def update(self, key: Any, **fields) -> M | None:
-        """Merge fields into a stored document, without reading it first."""
+        """Merge fields into a stored document, or None if there is no such one.
 
-        self.collection.update_one(
-            {self.key: key},
-            {"$set": {
-                name: value.model_dump() if isinstance(value, BaseModel) else value
-                for name, value in fields.items()
-            }}
-        )
+        The fields are validated against the model first, so nothing invalid is
+        written, and only what changed is — the fields given, and anything kept in
+        step with them.
+        """
+
+        document = self.get(key)
+
+        if document is None:
+            return None
+
+        before = document.model_dump()
+        after = self._prepare(self._assign(document, fields)).model_dump()
+        changed = {name: value for name, value in after.items() if before.get(name) != value}
+
+        if changed:
+            self.collection.update_one({self.key: key}, {"$set": changed})
 
         return self.get(key)
 
@@ -457,7 +506,15 @@ class DistributionEngine:
             raise DistributionNotFound(f"Distribution {distribution.functionName} does not exist in this app")
 
     def gen(self, distribution: CallSpec) -> timedelta:
-        delta = distribution(self.functions)
+        name = distribution.functionName
+
+        if name not in self.functions:
+            raise DistributionNotFound(f"Distribution {name} does not exist in this app")
+
+        try:
+            delta = callValidated(self.functions[name], self.validators[name], distribution.kwargs)
+        except ValidationError as e:
+            raise DistributionValidationError(f"Failed to validate distribution {distribution!r}") from e
 
         if not isinstance(delta, timedelta):
             raise DistributionValidationError(
@@ -569,6 +626,10 @@ class WorkerLoop:
     pollInterval: float
     leaseSeconds: float
 
+    # what a held document must still match to be renewed, so a renewal racing the
+    # write of an outcome cannot overwrite what that write set
+    renewOnly: Mapping[str, Any] = {}
+
     def _initWorkers(self):
         self.workerCount: int = 0
         self._stop = threading.Event()
@@ -607,7 +668,7 @@ class WorkerLoop:
             return 0
 
         return self.workCollection.update_many(
-            {"uid": {"$in": uids}},
+            {"uid": {"$in": uids}, **self.renewOnly},
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
         ).modified_count
 
@@ -706,6 +767,7 @@ class WorkerLoop:
 
 class TaskEngine(CollectionEngine, WorkerLoop):
     workerLabel = "task"
+    renewOnly = {"status": "processing"}    # not a retry, whose lease is its retry time
 
     def __init__(
             self, 
@@ -780,15 +842,24 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         super().createIndexes()  # unique uid
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])  # _work() claim
 
-    def save(self, document: Task) -> Task:
-        """Store a task as it is now. A task waiting for its first run is claimable
-        at its deadline, so the lease moves with a deadline changed by hand. One
-        waiting for a retry keeps its retry time, and a claimed one its lease."""
+    def _prepare(self, document: Task) -> Task:
+        """A task waiting for its first run is claimable at its deadline, so the
+        lease moves with a deadline changed by save() or update(). One waiting for
+        a retry keeps its retry time, and a claimed one its lease."""
 
         if document.status == "pending" and document.attempts == 0:
             document.leaseUntil = document.deadline
 
-        return super().save(document)
+        return document
+
+    def _call(self, work: CallSpec) -> Any:
+        """Run a call in this thread, its arguments validated into the types the
+        function declares."""
+
+        if work.functionName not in self.functions:
+            raise TaskNotFound(f"Task {work.functionName} does not exist in this app")
+
+        return callValidated(self.functions[work.functionName], self.validators[work.functionName], work.kwargs)
 
     def _work(self):
         now = utc_now()
@@ -931,7 +1002,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         def run():
             try:
-                outcome["result"] = task.work(self.functions)
+                outcome["result"] = self._call(task.work)
             except BaseException as e:      # carried back to the claiming thread
                 outcome["error"] = e
 
@@ -958,7 +1029,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         try:
             task.result = (
-                task.work(self.functions) if timeout is None
+                self._call(task.work) if timeout is None
                 else self._callWithTimeout(task, timeout)
             )
             task.status = "success"
@@ -1252,26 +1323,26 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         behind = scheduler.deadline + interval <= now
         replay = self.policy == "execute reconstructed"
 
-        self._hold(scheduler.uid)
-        try:
-            if scheduler.status == "enabled" and not (behind and self.policy == "skip"):
-                task = scheduler._emit(deadline=scheduler.deadline)
-                task.uid = beatUid(scheduler.uid, scheduler.deadline)
+        # Not held for renewal: emitting takes milliseconds against a lease of
+        # minutes, and a renewal landing after the deadline write below would push
+        # the next beat out by a whole lease. A stall that outlasts the lease is
+        # covered by the beat's fixed uid.
+        if scheduler.status == "enabled" and not (behind and self.policy == "skip"):
+            task = scheduler._emit(deadline=scheduler.deadline)
+            task.uid = beatUid(scheduler.uid, scheduler.deadline)
 
-                if task.work.functionName not in self.taskEngine.functions:
-                    # skipped, not disabled: disabling is the operator's word, and
-                    # would outlast the task coming back
-                    logger.warning(
-                        "%r emits %s, which this app has no task for; skipped this beat",
-                        scheduler, task.work.functionName
-                    )
-                else:
-                    try:
-                        self.taskEngine.insert(task)
-                    except DuplicateKeyError:
-                        pass    # emitted by a worker that died before moving the deadline on
-        finally:
-            self._releaseHold(scheduler.uid)
+            if task.work.functionName not in self.taskEngine.functions:
+                # skipped, not disabled: disabling is the operator's word, and
+                # would outlast the task coming back
+                logger.warning(
+                    "%r emits %s, which this app has no task for; skipped this beat",
+                    scheduler, task.work.functionName
+                )
+            else:
+                try:
+                    self.taskEngine.insert(task)
+                except DuplicateKeyError:
+                    pass    # emitted by a worker that died before moving the deadline on
 
         # Only "execute reconstructed" walks the backlog beat by beat. The others
         # resume from now, so time spent behind is not time owed.
@@ -1350,13 +1421,13 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         return self.get(schedulerUid(name))
 
-    def save(self, document: Scheduler) -> Scheduler:
-        """Store a scheduler as it is now. The lease moves with the deadline, or a
-        deadline changed by hand would still fire at the old time."""
+    def _prepare(self, document: Scheduler) -> Scheduler:
+        """The lease moves with the deadline, or a deadline changed by hand would
+        still fire at the old time."""
 
         document.leaseUntil = document.deadline
 
-        return super().save(document)
+        return document
 
     def upsert(self, scheduler: Scheduler) -> Scheduler:
         """Store a scheduler under its own uid, creating or replacing it."""
@@ -1393,7 +1464,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         if distribution is not None:
             changes["distribution"] = distribution
 
-        merged = existing.model_copy(update=changes)
+        merged = self._assign(existing.model_copy(), changes)   # raises before writing anything
         self.validateScheduler(merged)
 
         dumped = merged.model_dump()
@@ -1462,7 +1533,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         changes: dict[str, Any] = {**fields, "work": work, "distribution": distribution}
 
-        merged = self.schedulerModel.model_validate(existing).model_copy(update=changes)
+        merged = self._assign(self.schedulerModel.model_validate(existing), changes)
         self.validateScheduler(merged)
 
         dumped = merged.model_dump()
@@ -1665,6 +1736,9 @@ class PileEngine(CollectionEngine):
         ) -> bool:
 
         update: dict[str, Any] = {"status": status, "finishedAt": utc_now(), "claimId": None}
+
+        if status == "done":
+            update["error"] = None      # from an earlier attempt, as a task clears it
 
         if result is not None:
             update["result"] = result
@@ -2020,8 +2094,9 @@ class schedulers:
 
 class task:
     def __init__(self, func: Callable):
-        self.func: Callable = func.__func__ if isinstance(func, staticmethod) else func
         self.__is_staticmethod__: bool = isinstance(func, staticmethod)
+        self.__is_classmethod__: bool = isinstance(func, classmethod)
+        self.func: Callable = func.__func__ if isinstance(func, (staticmethod, classmethod)) else func
         self.__is_task__: bool = True
 
     def __get__(self, obj, objtype=None) -> Callable:
@@ -2031,6 +2106,9 @@ class task:
         if self.__is_staticmethod__:
             return self.func  # nothing to bind
 
+        if self.__is_classmethod__:
+            return MethodType(self.func, type(obj))
+
         return MethodType(self.func, obj)
     
 class BaseApp:
@@ -2038,10 +2116,9 @@ class BaseApp:
     def _getDeclared(cls, flag: str) -> dict[str, Any]:
         return {
             name: obj
-            for base in reversed(cls.__mro__)  # walk trough all parents
-            for name, obj in base.__dict__.items()
+            for name, obj in nearestAttributes(cls).items()
             if getattr(obj, flag, False)
-        }  # resolve child overrides
+        }
 
     @classmethod
     def _getTasks(cls) -> dict[str, task]:

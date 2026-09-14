@@ -120,7 +120,7 @@ They land in `app.collections` and are reachable as `app.<name>`. The key is uni
 | `build(**fields)` | Build it without storing. |
 | `insert(doc)` / `insertMany(docs)` | Store what you built. |
 | `save(doc)` | Replace the stored document, creating it if absent. |
-| `update(key, **fields)` | Merge fields in without reading first. |
+| `update(key, **fields)` | Merge fields in, validated against the model before anything is written. Only what changed is written. `None` if there is no such document. |
 | `get(key)` / `findOne(where)` | One document, or `None`. |
 | `find(where=None, sort=None, limit=None)` | `list[Model]`. |
 | `count(where=None)` / `exists(key)` | |
@@ -162,7 +162,7 @@ whatever you have since done to the field in memory.
 
 ## Tasks
 
-Declare with `@task`, above `@staticmethod` if you use one:
+Declare with `@task`, above `@staticmethod` or `@classmethod` if you use one:
 
 ```python
 class App(BaseApp):
@@ -172,7 +172,14 @@ class App(BaseApp):
 
     @task
     def with_self(self): ...       # instance methods get the app
+
+    @task
+    @classmethod
+    def with_class(cls): ...       # class methods get the app's class
 ```
+
+A subclass that redefines a task's name as something else — a plain method, a pile — replaces the
+task; it is not left registered underneath.
 
 | Access | Returns |
 |---|---|
@@ -196,6 +203,10 @@ def retain(days: Annotated[int, Field(gt=0)]): ...
 
 app.task.schedule(App.retain(days=0))    # TaskValidationError, before it is ever stored
 ```
+
+They are validated again when the call runs, so the function receives what its annotations
+promise: a model argument arrives as the model, not the dict it was stored as, and a value
+pydantic coerced (`"3"` for an `int`) arrives coerced. Distributions are called the same way.
 
 ### TaskEngine
 

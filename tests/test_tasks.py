@@ -222,6 +222,7 @@ def test_a_task_with_a_live_lease_is_left_alone(db, app, tasks):
 
 def test_a_held_lease_is_renewed_while_the_task_runs(db, app, tasks):
     app.task.schedule(ExampleApp.greet(name="Ada"))
+    tasks.update_many({}, {"$set": {"status": "processing"}})   # claimed, and running
     app.task._hold(stored(tasks, "greet").uid)
     before = stored(tasks, "greet").leaseUntil
 
@@ -327,3 +328,106 @@ def test_saving_a_task_waiting_for_a_retry_keeps_its_retry_time(app):
     waiting.save()
 
     assert app.task.get(stored.uid).leaseUntil == retryAt
+
+
+# --- a call receives its arguments as the signature declares them ---
+
+def test_a_task_gets_models_and_coerced_values_not_stored_data(db):
+    from pydantic import BaseModel
+    from pymonque import BaseApp, task
+
+    class Email(BaseModel):
+        to: str
+
+    seen = {}
+
+    class Typed(BaseApp):
+        @task
+        @staticmethod
+        def send(email: Email, count: int):
+            seen.update(email=email, count=count)
+
+    app = Typed(db)
+    stored = app.task.schedule(Typed.send(email=Email(to="a@b.c"), count="3"))
+    app.task._work()
+
+    assert app.task.get(stored.uid).status == "success"
+    assert seen == {"email": Email(to="a@b.c"), "count": 3}
+
+
+def test_a_classmethod_can_be_a_task(db):
+    from pymonque import BaseApp, task
+
+    class WithClass(BaseApp):
+        @task
+        @classmethod
+        def name(cls):
+            return cls.__name__
+
+    app = WithClass(db)
+    stored = app.task.schedule(WithClass.name())
+    app.task._work()
+
+    assert app.name() == "WithClass"
+    assert app.task.get(stored.uid).result == "WithClass"
+
+
+def test_a_subclass_overriding_a_task_with_a_plain_method_unregisters_it(db):
+    from pymonque import BaseApp, Document, collection, pile, task
+
+    class Doc(Document):
+        x: int = 0
+
+    class Parent(BaseApp):
+        @task
+        @staticmethod
+        def job():
+            return "task"
+
+        things = pile()
+
+    class Child(Parent):
+        def job(self):
+            return "plain"
+
+        things = collection(Doc)
+
+    app = Child(db)
+
+    assert "job" not in app.task.functions
+    assert "things" not in app.piles and "things" in app.collections
+
+
+def test_renewal_does_not_touch_a_task_waiting_for_a_retry(app):
+    stored = app.task.schedule(ExampleApp.boom(), maxAttempts=2, retryDelay=600)
+    app.task._work()
+    retryAt = app.task.get(stored.uid).leaseUntil
+    app.task._hold(stored.uid)           # a renewal that copied the uid before the write landed
+
+    app.task.renewLeases()
+
+    assert app.task.get(stored.uid).leaseUntil == retryAt
+
+
+def test_update_validates_before_writing(app):
+    import pytest
+    from pydantic import ValidationError
+
+    stored = app.task.schedule(ExampleApp.greet(name="Ada"))
+
+    with pytest.raises(ValidationError):
+        app.task.update(stored.uid, maxAttempts=0)
+
+    assert app.task.collection.find_one({"uid": stored.uid})["maxAttempts"] is None
+
+
+def test_update_moves_a_waiting_tasks_lease_with_its_deadline(app):
+    from datetime import timedelta
+    from pymonque import utc_now
+
+    stored = app.task.schedule(ExampleApp.greet(name="Ada"))
+    later = (utc_now() + timedelta(days=1)).replace(microsecond=0)
+
+    updated = app.task.update(stored.uid, deadline=later)
+
+    assert updated.leaseUntil == later

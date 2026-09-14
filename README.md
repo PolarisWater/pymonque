@@ -99,7 +99,8 @@ app.cleanup_logs(retention_days=30)     # -> runs it now
 ```
 
 A `CallSpec` is just `{functionName, kwargs}`. Kwargs are checked against the function
-signature when you schedule the task, not when a worker picks it up.
+signature when you schedule the task, so a bad call never gets stored, and validated again when it
+runs, so a model argument arrives as the model rather than the dict it was stored as.
 
 **Schedulers.** A scheduler stores a `CallSpec` and an interval. When its deadline passes it
 emits a task and advances its own deadline by a fresh interval. Intervals come from
