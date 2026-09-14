@@ -154,6 +154,9 @@ if a live worker reports a different hash. Stop the old workers before starting 
 
 [docs/reference.md](docs/reference.md) — every object, method, field, status, and policy.
 
+Coming from 0.x? 2.0 changes the code and the stored documents — read
+[Upgrading from 0.x](docs/reference.md#upgrading-from-0x) before starting a 2.0 worker.
+
 ## Tests
 
 ```bash

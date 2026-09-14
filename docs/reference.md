@@ -743,6 +743,66 @@ for raw in app.task.tasksCollection.find({"status": "failed"}):
 | `VersionMismatch` | `startWorkers()` or `init()` found a live worker on a different fingerprint |
 | `UnboundDocument` | `save()`/`delete()`/`reload()` on a document with no engine |
 
+## Upgrading from 0.x
+
+2.0 keeps no compatibility code, so an upgrade is two steps: change the code, then migrate the
+data **once, with every 0.x worker stopped**. Skipping the data step fails quietly — a 0.x
+document has no `leaseUntil`, and 2.0 never claims one without it.
+
+### Code
+
+| 0.x | 2.0 |
+|---|---|
+| `class Queue(BaseQueue)` | `class App(BaseApp)` |
+| `super().__init__(db, overdueSchedulersPolicy="skip")` | `overdueSchedulersPolicy = "skip"` on the class |
+| `overdueTaskPolicy` | gone — `taskSkipAfter` covers work that went stale, for any reason |
+| `SchedulerEngine(self, schedulersCollection=..., policy=...)` in `__init__`, then `engine.init()` | `accountOps = schedulers(AccountScheduler, "accountOperations")` on the class |
+| `taskPoolInterval`, `schedulerPoolInterval`, `engine.poolInterval` | `taskPollInterval`, `schedulerPollInterval`, `engine.pollInterval` |
+| constructing the queue ran `init()` | only `startWorkers()` runs it — constructing is safe from any process |
+| `engine.startWorkers(n)` on each engine | `app.startWorkers(taskWorkers=n, schedulerWorkers=n)`, or `app.run(...)` |
+| context merged into `work.kwargs` by hand | `emitWork()` on a `Scheduler` subclass — see [Schedulers](#schedulers) |
+| `pymonque.mongo.MongoModel` | gone. `model_dump()` is pydantic's, and `None` is stored as null |
+
+Two defaults to check: a `SchedulerEngine` built by hand in 0.x defaulted to `"execute reconstructed"`,
+while a declared one takes the app's `overdueSchedulersPolicy` (`"execute once"`). And tasks are still
+not retried unless you set `taskMaxAttempts`.
+
+### Data
+
+Run once against the database, before starting any 2.0 worker. List every scheduler collection,
+including those of engines you built yourself:
+
+```python
+from pymongo import MongoClient
+
+db = MongoClient("mongodb://...")["your_db"]
+schedulerCollections = ["pymonque_schedulers"]      # + your own, e.g. "accountOperations"
+collections = ["pymonque_tasks", *schedulerCollections]
+
+# 1. uids must be unique: 2.0 builds unique indexes, and construction fails on duplicates
+for name in collections:
+    dupes = list(db[name].aggregate([
+        {"$group": {"_id": "$uid", "n": {"$sum": 1}}},
+        {"$match": {"n": {"$gt": 1}}},
+    ]))
+    assert not dupes, f"{name} has duplicate uids, resolve these first: {dupes[:5]}"
+
+# 2. tasks 0.x left processing: it cancelled these at its next start, so do the same
+#    (otherwise 2.0 would claim and run them again)
+db["pymonque_tasks"].update_many({"status": "processing"}, {"$set": {"status": "canceled"}})
+
+# 3. give everything a lease, claimable at its deadline
+for name in collections:
+    db[name].update_many({"leaseUntil": None}, [{"$set": {"leaseUntil": "$deadline"}}])
+
+# 4. schedulers no longer have a processing status — being worked is a lease
+for name in schedulerCollections:
+    db[name].update_many({"status": "processing"}, {"$set": {"status": "enabled"}})
+```
+
+It is idempotent, so running it twice does no harm. Tasks 0.x marked `outdated` or `canceled` stay
+as they are. The update in step 3 is a pipeline, which needs MongoDB 4.2 or later.
+
 ## Notes
 
 - Times are naive UTC (`utc_now()`). Mongo keeps millisecond precision.
