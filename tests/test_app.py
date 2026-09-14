@@ -212,3 +212,33 @@ def test_an_app_exposes_its_database(db):
     app = ExampleApp(db)
 
     assert app.db is db
+
+
+# --- a declaration cannot replace part of the app ---
+
+@pytest.mark.parametrize("name", ["backlog", "init", "run", "fingerprint", "db", "piles"])
+def test_a_declaration_cannot_shadow_the_app(name):
+    with pytest.raises(TypeError, match=name):
+        type("Clashing", (BaseApp,), {name: pile()})
+
+
+def test_a_task_cannot_shadow_the_app():
+    with pytest.raises(TypeError, match="engines"):
+        class Clashing(BaseApp):
+            @task
+            @staticmethod
+            def engines():
+                pass
+
+
+def test_declaring_schedulers_named_scheduler_is_allowed():
+    from pymonque import schedulers
+
+    class Replaced(BaseApp):
+        scheduler = schedulers()
+
+
+def test_the_reserved_names_cover_every_attribute_init_sets(db):
+    app = BaseApp(db)
+
+    assert set(vars(app)) - {n for n in vars(app) if n.startswith("_")} <= BaseApp._INSTANCE_ATTRIBUTES

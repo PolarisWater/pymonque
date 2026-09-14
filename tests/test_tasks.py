@@ -280,3 +280,21 @@ def test_a_queue_can_be_drained_by_looping_on_work(app):
         ran.append(task.status)
 
     assert ran == ["success"] * 3
+
+
+def test_sys_exit_in_a_task_is_a_failure_not_a_dead_worker(db):
+    import sys
+    from pymonque import BaseApp, task
+
+    class Quits(BaseApp):
+        @task
+        @staticmethod
+        def quits():
+            sys.exit(3)
+
+    app = Quits(db)
+    stored = app.task.schedule(Quits.quits())
+    app.task._work()                     # would raise SystemExit and end the thread
+
+    assert app.task.get(stored.uid).status == "failed"
+    assert "SystemExit" in app.task.get(stored.uid).error

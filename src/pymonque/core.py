@@ -31,6 +31,7 @@ import hashlib
 import socket
 import os
 import signal
+import re
 
 from contextlib import contextmanager
 
@@ -610,9 +611,14 @@ class WorkerLoop:
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
         ).modified_count
 
-    def _renewLoop(self):
-        while not self._stop.is_set():
-            self._stop.wait(max(1.0, self.leaseSeconds / 3))
+    def _renewLoop(self, workers: list[threading.Thread]):
+        """Renew until these workers have stopped — not merely been asked to. A
+        shutdown lets work in flight finish, and that work must keep its lease."""
+
+        interval = max(1.0, self.leaseSeconds / 3)
+
+        while alive := [t for t in workers if t.is_alive()]:
+            alive[0].join(interval)     # returns early if it exits, so this ends promptly
 
             try:
                 self.renewLeases()
@@ -664,6 +670,7 @@ class WorkerLoop:
 
         threads.append(threading.Thread(
             target=self._renewLoop,
+            args=(list(threads),),
             name=f"pymonque-{self.workerLabel}-lease",
             daemon=True
         ))
@@ -950,7 +957,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             task.status = "timeout"
             task.error = str(e)
             logger.warning("%r timed out after %ss", task, timeout)
-        except Exception:
+        except (Exception, SystemExit):     # sys.exit() in a task would otherwise end the worker thread
             task.status = "failed"
             task.error = traceback.format_exc()
         finally:
@@ -1261,7 +1268,9 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         deadline = scheduler.deadline + interval if replay or not behind else now + interval
 
         self.schedulersCollection.update_one(
-            {"uid": scheduler.uid},
+            # only if nobody moved the deadline meanwhile: ensure() or update()
+            # restarting the rhythm mid-claim wrote its own, lease included
+            {"uid": scheduler.uid, "deadline": scheduler.deadline},
             {"$set": self._deadline(deadline)}
         )
 
@@ -1330,6 +1339,14 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         """The scheduler declared under this name by ensure()."""
 
         return self.get(schedulerUid(name))
+
+    def save(self, document: Scheduler) -> Scheduler:
+        """Store a scheduler as it is now. The lease moves with the deadline, or a
+        deadline changed by hand would still fire at the old time."""
+
+        document.leaseUntil = document.deadline
+
+        return super().save(document)
 
     def upsert(self, scheduler: Scheduler) -> Scheduler:
         """Store a scheduler under its own uid, creating or replacing it."""
@@ -1620,6 +1637,12 @@ class PileEngine(CollectionEngine):
 
         if isinstance(item, str):
             return {"uid": item}
+
+        if item.claimId is None:
+            raise ValueError(
+                f"item {item.uid} was not handed out by claim(), so it stands for no claim — "
+                f"claim it first, or pass its uid to act on it by hand"
+            )
 
         return {"uid": item.uid, "claimId": item.claimId}
 
@@ -2026,6 +2049,38 @@ class BaseApp:
     def _getSchedulerEngines(cls) -> dict[str, schedulers]:
         return cls._getDeclared("__is_schedulers__")
 
+    # set by __init__, so a declaration under one of these names would be shadowed
+    _INSTANCE_ATTRIBUTES = frozenset({
+        "db", "task", "scheduler", "distribution", "piles", "collections", "schedulerEngines",
+        "defaultFactory", "leaseSeconds", "enforceVersion", "heartbeatInterval",
+        "workerStaleAfter", "workerUid", "backlogWarnAfter", "backlogInterval",
+        "tasksCollection", "schedulersCollection", "workersCollection",
+    })
+
+    def __init_subclass__(cls, **kwargs):
+        """Refuse a declaration that would replace part of the app itself: a pile
+        named `backlog` would break the backlog check, a task named `init` the
+        startup. Declaring schedulers named `scheduler` is the one sanctioned
+        replacement."""
+
+        super().__init_subclass__(**kwargs)
+
+        reserved = set(dir(BaseApp)) | BaseApp._INSTANCE_ATTRIBUTES
+
+        for name, obj in cls.__dict__.items():
+            declared = any(getattr(obj, flag, False) for flag in
+                           ("__is_task__", "__is_pile__", "__is_collection__", "__is_schedulers__"))
+
+            if not declared or name not in reserved:
+                continue
+
+            if name == "scheduler" and getattr(obj, "__is_schedulers__", False):
+                continue
+
+            raise TypeError(
+                f"{cls.__name__}.{name} would replace BaseApp.{name}; declare it under another name"
+            )
+
     # Policies and limits are declared on the class, never passed in: every
     # process that imports this app must agree on them, and they are part of the
     # fingerprint so two that disagree cannot both run workers.
@@ -2151,7 +2206,8 @@ class BaseApp:
         """
 
         parts = [
-            f"{name}{inspect.signature(func)}"
+            # a default like object() prints its address, which differs per process
+            re.sub(r" at 0x[0-9a-fA-F]+", "", f"{name}{inspect.signature(func)}")
             for registry in (self.task.functions, self.distribution.functions)
             for name, func in sorted(registry.items())
         ]
@@ -2377,10 +2433,13 @@ class BaseApp:
         return self._stopping
 
     def requestStop(self):
-        """Stop claiming new work, without waiting for what is in flight."""
+        """Stop claiming new work, without waiting for what is in flight.
+
+        The heartbeat keeps going: work still finishing belongs to a live worker,
+        and the version check must go on seeing it. stopWorkers() ends it.
+        """
 
         self._stopping = True
-        self._quit.set()        # heartbeat and backlog wake immediately
 
         for engine in self.engines:
             engine._stop.set()
@@ -2403,6 +2462,13 @@ class BaseApp:
 
             if not engine.stopWorkers(remaining):
                 drained = False
+
+        self._quit.set()
+
+        # joined, so a startWorkers() straight after finds them gone and starts
+        # fresh ones, rather than trusting a heartbeat that is on its way out
+        for thread in self._monitors.values():
+            thread.join(1)
 
         self._deregisterWorker()
 
@@ -2444,7 +2510,8 @@ class BaseApp:
             self.requestStop()
 
         for s in signals:
-            self._previousHandlers[s] = signal.getsignal(s)
+            # a second call must not record our own handler as the one to restore
+            self._previousHandlers.setdefault(s, signal.getsignal(s))
             signal.signal(s, onSignal)
 
     def restoreSignals(self):

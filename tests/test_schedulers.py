@@ -545,3 +545,34 @@ def test_a_new_deadline_moves_the_lease_with_it(app):
 
     assert updated.deadline == later
     assert updated.leaseUntil == later
+
+
+def test_a_rhythm_restarted_mid_claim_is_not_overwritten(db):
+    class App(BaseApp):
+        @task
+        @staticmethod
+        def ping():
+            return None
+
+    app = App(db)
+    declared = app.scheduler.ensure("n", App.ping(), app.distribution("constant", dailyFrequency=24))
+    setDeadline(app, declared, utc_now() - timedelta(seconds=1))
+    insert = app.task.insert
+
+    def redeclareWhileClaimed(emitted):
+        stored = insert(emitted)
+        app.scheduler.ensure("n", App.ping(), app.distribution("constant", dailyFrequency=1))
+        return stored
+
+    app.task.insert = redeclareWhileClaimed
+    app.scheduler._work()
+
+    assert app.scheduler.get(declared.uid).deadline - utc_now() > timedelta(hours=23)
+
+
+def test_saving_a_moved_deadline_moves_the_lease(app):
+    scheduler = app.scheduler.get(addScheduler(app).uid)
+    scheduler.deadline = (utc_now() + timedelta(days=30)).replace(microsecond=0)
+    scheduler.save()
+
+    assert app.scheduler.get(scheduler.uid).leaseUntil == scheduler.deadline

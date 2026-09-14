@@ -25,6 +25,10 @@ this app has to agree on them, or one would retry a failure another treats as fi
 the [fingerprint](#one-version-at-a-time), so two that disagree cannot both run workers.
 Pacing and lease lengths are per-process and stay arguments.
 
+A declaration can't reuse a name `BaseApp` already has — a pile called `backlog`, a task called
+`init` or `run` — because it would replace that part of the app; the class raises `TypeError` when
+it is defined. The one exception is `scheduler = schedulers(...)`, which replaces the default engine.
+
 | Attribute | What |
 |---|---|
 | `app.task` | `TaskEngine` |
@@ -61,8 +65,10 @@ A stop is checked **between** iterations, never inside one, so work already clai
 to completion. Anything not yet claimed stays `pending` for the next process. Workers wait on the
 stop event rather than sleeping, so a shutdown doesn't sit through a poll interval.
 
-`stopWorkers` deregisters the process, which frees its version slot immediately — the replacement
-deployment can start without waiting out `workerStaleAfter`.
+While work drains, the process keeps renewing its leases and checking in, so nothing it is still
+running gets picked up elsewhere and the version check still sees it. `stopWorkers` then
+deregisters the process, which frees its version slot immediately — the replacement deployment can
+start without waiting out `workerStaleAfter`.
 
 ### Signals
 
@@ -404,7 +410,7 @@ all of them. Declaring one named
 | `add(work, distribution, **fields)` | Create a new scheduler. Every call creates another one. |
 | `ensure(name, work, distribution, enabled=None, **fields)` | Declare one by name. Idempotent. |
 | `build(work, distribution, deadline=None, **fields)` | An unsaved scheduler of this engine's model. |
-| `upsert(scheduler)` | Store one under its own uid, creating or replacing. |
+| `upsert(scheduler)` / `scheduler.save()` | Store one under its own uid, creating or replacing. The lease follows the deadline, so a deadline changed by hand takes effect. |
 | `update(uid, work=None, distribution=None, enabled=None, **fields)` | Change parts of one; `None` if no such uid. |
 | `get(uid)` | `Scheduler` or `None`. |
 | `byName(name)` | The one declared under that name by `ensure()`. |
@@ -545,7 +551,9 @@ Each pile gets `pymonque_pile_<name>` unless told otherwise.
 | `find(where=None)` | `list[Item]`. |
 | `purge(status="done")` | Delete, return how many. |
 
-`item` may be an `Item` or a uid.
+`item` may be an `Item` or a uid. An `Item` stands for the claim that handed it out, so passing one
+that never came from `claim()` or `work()` — the return value of `add()`, say — raises `ValueError`;
+pass its uid to act on it by hand.
 
 ```python
 with app.outbox.work() as item:

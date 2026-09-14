@@ -159,3 +159,13 @@ def test_a_task_taken_over_keeps_the_new_claims_outcome(db):
     app.task._work()
 
     assert app.task.get(stored.uid).status == "processing"
+
+
+def test_an_item_that_was_never_claimed_cannot_be_finished_as_a_claim(app):
+    added = app.jobs.add({"n": 1})
+
+    with pytest.raises(ValueError, match="claim"):
+        app.jobs.done(added)
+
+    assert app.jobs.get(added.uid).status == "pending"
+    assert app.jobs.done(added.uid) is True          # by hand, it can

@@ -158,3 +158,36 @@ def test_a_scheduler_lease_can_be_renewed(app, schedulers):
 
     assert app.scheduler.renewLeases() == 1
     assert app.scheduler.get(scheduler.uid).leaseUntil > utc_now()
+
+
+# --- a graceful shutdown keeps renewing until the work in flight is done ---
+
+def test_leases_are_renewed_while_a_shutdown_drains(db):
+    import threading
+    from pymonque import BaseApp, task
+
+    gate = threading.Event()
+
+    class Long(BaseApp):
+        @task
+        @staticmethod
+        def long():
+            gate.wait(10)
+
+    app = Long(db, leaseSeconds=1.5, taskPollInterval=0.02, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Long.long())
+    app.startWorkers(taskWorkers=1)
+    time.sleep(0.2)
+
+    stopper = threading.Thread(target=app.stopWorkers, kwargs={"timeout": 10})
+    stopper.start()
+    time.sleep(2.5)                      # past the lease, so only renewal keeps it
+
+    try:
+        assert app.task.collection.find_one({"uid": stored.uid})["leaseUntil"] > utc_now()
+        assert app.liveWorkers(), "the heartbeat stopped while work was still finishing"
+    finally:
+        gate.set()
+        stopper.join()
+
+    assert app.task.get(stored.uid).status == "success"

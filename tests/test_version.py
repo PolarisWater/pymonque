@@ -310,3 +310,19 @@ def test_enforcement_off_skips_the_check_for_init_too(db):
         V2Signature(db, enforceVersion=False).init()      # opted out, so unguarded
     finally:
         running.stopWorkers()
+
+
+def test_a_default_that_prints_an_address_does_not_split_the_fingerprint(db):
+    class One(BaseApp):
+        @task
+        @staticmethod
+        def f(x=object()):
+            return None
+
+    class Two(BaseApp):
+        @task
+        @staticmethod
+        def f(x=object()):
+            return None
+
+    assert One(db).fingerprint == Two(db).fingerprint
