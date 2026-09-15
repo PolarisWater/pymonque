@@ -42,8 +42,9 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
   and running out of tries gives it up. `release()` hands an item back unfinished and returns the
   try, since the holder says the work did not happen. `fail()` is final — the item is marked failed
   and never claimed again. Items have no retry delay.
-- Inside `with pile.work() as w:`, `w.release()` ends just that block and releases the item —
-  **Decided**, details in `docs/design-notes.md`.
+- Inside `with pile.work() as w:`, `w.done()`, `w.fail()` and `w.release()` each record their
+  outcome and end just that block; reaching the end is done, raising is failed — **Decided**,
+  details in `docs/design-notes.md`.
 - Tasks and items that have not started can be cancelled (`cancel`, `cancelMany`); running work
   cannot be interrupted, only waited out.
 - `sys.exit()` in work is a failure, not a dead worker thread.
@@ -228,6 +229,8 @@ agreed yet.
    than patching the old ones.
 5. **Write the reference and README from the new shape,** and an upgrade section covering renamed
    declarations, statuses and document fields. Examples the docs must include:
-   - releasing an item mid-block in `with pile.work() as w:` — the example in
-     `docs/design-notes.md`, with the bare `except:` caveat beside it.
+   - the `with pile.work() as w:` block as the main pile example, covering that `done`, `fail` and
+     `release` all end it, and what the block does for you (lease renewal, claim checks, done at
+     the end, fail on an exception, a lost claim), with the bare `except:` caveat beside it — see
+     `docs/design-notes.md`.
 6. **Replace the old package** once the checklist is covered.
