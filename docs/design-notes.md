@@ -38,9 +38,10 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
 - **`@task` names its call after the attribute it is declared as;** `self` may be positional-only,
   and an instance task without `self` is refused where written.
 - **`emitsInto` accepts an engine the class inherits** (`schedulers(emitsInto=Parent.heavy)`) and
-  refuses one the same class body replaces. Open for layer 4: a subclass that later replaces the
-  engine an inherited scheduler engine emits into. Proposed: follow the name, as a subclass's
-  redefinition replaces the parent's.
+  refuses one the same class body replaces. **Decided for layer 4: follow the name.** When a
+  subclass replaces the engine an inherited scheduler engine emits into, the scheduler engine emits
+  into the subclass's engine, as a subclass's redefinition replaces the parent's everywhere else.
+  The reference works as a name editors can check.
 - **For layer 4, following from arguments left out:** a queued call does not store the defaults, so
   the function's defaults apply when it runs. The fingerprint must therefore hash each parameter's
   default with the signature, so a changed default refuses a mismatched worker like a changed type.
