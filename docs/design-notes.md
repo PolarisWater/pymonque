@@ -77,7 +77,10 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
   `executionTime`, `result`, `error` — so a field changed while the task ran survives.
 - **The task engine takes what the app resolved:** the collection, model and name; the app's tasks as
   `taskFunctions(...)`, one `Functions` every task engine shares; `TaskEngineSettings`; each task's
-  `TaskLimits`, where a task without an entry has none; the `DistributionEngine`; and a default
+  resolved `TaskLimits` — one entry for every task, built by the app from `@task(...)` and the app's
+  defaults, so a bare `@task` has an entry too (usually "no timeout, no skipAfter"); users never
+  declare limits on every task, and a missing entry is a wiring bug the engine refuses; the
+  `DistributionEngine`; and a default
   factory, `TaskFactory(name="default")` unless given. `pollInterval` belongs to the worker loop.
 - **`work()` claims and runs one task,** returning it as it ended, or None. The worker threads that
   loop on it come with layer 4, and so do timeouts: layer 2 resolves `timeout` but does not enforce it.
@@ -106,6 +109,14 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
     limits, defaults filled in.
   - **`work()` writes the outcome inside `leases.holding(...)`,** so a claim is renewed until its
     outcome is written, not only until its call returns.
+- **To fix before layer 3** (found checking the review's build, `5a4732e`):
+  - **A task written off by a claim loses when its worker died.** The worker-died error no longer
+    carries the time, on the grounds that the stored `leaseUntil` keeps it; but the claim that finds
+    the task sets a fresh lease first, and the write-off writes only the outcome fields, so the stored
+    `leaseUntil` is the write-off claim's own lease (reproduced: lapsed 20:52:55, stored 21:07:55).
+    `writeOffStuck()` is unaffected, since it does not touch `leaseUntil`. Fix: `_writeOff` also
+    writes back the `leaseUntil` it found (`before["leaseUntil"]`), beside the `claimedAt` it already
+    restores; a test checks the stored `leaseUntil` equals the lapsed one.
 
 ## Decided, not built yet
 
