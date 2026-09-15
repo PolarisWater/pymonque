@@ -41,6 +41,9 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
   refuses one the same class body replaces. Open for layer 4: a subclass that later replaces the
   engine an inherited scheduler engine emits into. Proposed: follow the name, as a subclass's
   redefinition replaces the parent's.
+- **For layer 4, following from arguments left out:** a queued call does not store the defaults, so
+  the function's defaults apply when it runs. The fingerprint must therefore hash each parameter's
+  default with the signature, so a changed default refuses a mismatched worker like a changed type.
 - **Documents.** `build()` gives a document bound to its engine but not stored: `storedKey` is set
   only once it is written, and cleared by `delete()`. An `update()` that changes the key returns the
   renamed document. MongoDB's `_id` is dropped on load, so a model forbidding extras still loads. The

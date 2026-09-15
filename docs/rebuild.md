@@ -38,7 +38,8 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
   not handed to the next worker — it may have done half its work.
 - A timeout frees the worker and writes the task off, since the call may still be running. A pile
   item that call holds stops being renewed at the timeout, so its lease lapses (a spent try) and
-  another worker can take it. (Whether a timeout can also stop the call is open — §5.10.)
+  another worker can take it. A timeout also tries to stop the call, and can retire the process —
+  §5.10.
 - A task whose worker died ends as plain `failed`, with an error saying so.
 - Work that has to happen survives a dead process through a pile: the item holds it, a task drains
   it. A claim uses a try; if the lease lapses the item goes back to be claimed with that try spent,
