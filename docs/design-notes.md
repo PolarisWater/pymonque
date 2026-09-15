@@ -3,6 +3,9 @@
 Decisions that are made but not built, work that is on hold, and asymmetries that are deliberate.
 Finding ids (B1, P3, N2…) refer to the engine anatomy review of `c3e75e2`.
 
+The library is to be rebuilt rather than refactored further; `docs/rebuild.md` gathers everything
+here, plus the invariants the rebuild must keep and the decisions to make before building.
+
 ## Decided, not built yet
 
 ### Several task engines (B5, which also settles B1)
