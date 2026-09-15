@@ -184,15 +184,15 @@ def test_poll_intervals_reach_the_engines(db):
     assert app.scheduler.pollInterval == 3
 
 
-def test_policies_and_limits_reach_the_engines(db):
+def test_defaults_reach_the_engines(db):
     class App(ExampleApp):
-        overdueSchedulersPolicy = "skip"
+        schedulerMissed = "skip"
         itemMaxAttempts         = 3
         itemRetryDelay          = 5
 
     app = App(db)
 
-    assert app.scheduler.policy == "skip"
+    assert app.scheduler.missed == "skip"
     assert (app.outbox.maxAttempts, app.outbox.retryDelay) == (3, 5)
 
 

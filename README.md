@@ -134,8 +134,9 @@ items retry by the same rule as tasks (`itemMaxAttempts`, or per pile).
 
 **Workers.** `startWorkers()` starts daemon threads that poll, claim atomically, run, and write
 results back. A worker sleeps only when it finds nothing to do, so a backlog drains at full
-speed. A task runs once unless you opt in to retries (`taskMaxAttempts`, `retryDelay`); a crash
-counts as an attempt, so a task that kills its worker can't take every worker down in turn.
+speed. Limits are declared with the task — `@task(timeout=60, maxAttempts=3, retryDelay=30)` — with
+app-wide defaults for the rest. A task runs once unless it opts in to retries; a crash counts as an
+attempt, so a task that kills its worker can't take every worker down in turn.
 `app.task.wait(task)` blocks until one finishes, from any process.
 
 **Leases.** A claim is held for `leaseSeconds` and renewed while the work runs. If a worker dies,
@@ -151,12 +152,12 @@ claiming new work and lets what's in flight finish; a second exits immediately. 
 
 **One version at a time.** A task document names a function and nothing more, so two deployments
 that disagree about what that function does cannot safely share a database. `startWorkers()` hashes
-the app's task and distribution signatures, its policies and its task limits, and refuses to start
+the app's task and distribution signatures, its task and pile limits and its missed-beats rules, and refuses to start
 if a live worker reports a different hash. Stop the old workers before starting the new ones.
 
 ## Docs
 
-[docs/reference.md](docs/reference.md) — every object, method, field, status, and policy.
+[docs/reference.md](docs/reference.md) — every object, method, field, status, and limit.
 
 Coming from 0.x? 2.0 changes the code and the stored documents — read
 [Upgrading from 0.x](docs/reference.md#upgrading-from-0x) before starting a 2.0 worker.

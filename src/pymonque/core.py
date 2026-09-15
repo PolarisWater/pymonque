@@ -6,7 +6,7 @@ from pydantic import (
 
 from typing import (
     Any, Literal, Callable, TypeVar, Mapping, Iterable, Sequence, Generic, Self,
-    get_type_hints, overload
+    get_type_hints, get_args, overload
 )
 
 from types import MethodType
@@ -52,7 +52,8 @@ SCHEDULER_STATUS = Literal["enabled", "disabled"]   # being worked is the lease'
 ITEM_STATUS = Literal["pending", "claimed", "done", "failed"]
 FINAL_TASK_STATUSES = ("success", "failed", "timeout", "canceled", "outdated", "incompatible")
 
-OVERDUE_SCHEDULES_POLICY = Literal["skip", "execute once", "execute reconstructed"]
+# what a scheduler owes for beats that went by unworked: none of them, one, or every one
+MISSED_BEATS = Literal["skip", "once", "replay"]
 
 LEASE_SECONDS = 300         # how long a claim is held before it is considered abandoned
 BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobody is free
@@ -60,18 +61,18 @@ BACKLOG_INTERVAL = 30       # seconds between those checks. None as the threshol
 HEARTBEAT_INTERVAL = 15     # seconds between a worker process checking in
 WORKER_STALE_AFTER = 60     # after this long without checking in, a worker is gone
 MAX_ATTEMPTS = 1            # runs a task or item gets before a failure is final: retrying is opt-in
-RETRY_DELAY = 60            # seconds a failed task waits before it is claimable again
-NO_LIMIT = -1               # a timeout or skipAfter of this overrides any limit set further out
+RETRY_DELAY = 60            # seconds a failed task or item waits before it is claimable again
 
-
-def checkLimit(value: float | None) -> float | None:
-    """A limit is seconds, None to inherit the next one out, or NO_LIMIT."""
-
-    if value is not None and value < 0 and value != NO_LIMIT:
-        raise ValueError(f"a limit is seconds, None to inherit, or {NO_LIMIT} for none — not {value}")
-
-    return value
 HOSTNAME = socket.gethostname()
+
+
+def checkMissed(missed: str) -> str:
+    if missed not in get_args(MISSED_BEATS):
+        raise ValueError(
+            f"missed is one of {', '.join(map(repr, get_args(MISSED_BEATS)))}, not {missed!r}"
+        )
+
+    return missed
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -167,6 +168,30 @@ def beatUid(scheduler: str, deadline: datetime) -> str:
 
 
 MONGO_CONFIG = ConfigDict(serialize_by_alias=True)  # aliases are how a model matches an existing schema
+
+
+class TaskLimits(BaseModel):
+    """What a task may do, declared on @task and filled in from the app's defaults.
+
+    Limits describe the function — how long it may run, whether it is safe to run
+    again — not one call of it, so they live in code rather than on stored tasks.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeout:        float | None    = Field(default=None, gt=0)   # seconds a call may run; None: no limit
+    skipAfter:      float | None    = Field(default=None, ge=0)   # seconds past its deadline it is still worth running; None: always
+    maxAttempts:    int             = Field(default=MAX_ATTEMPTS, ge=1)  # runs before a failure is final
+    retryDelay:     float           = Field(default=RETRY_DELAY, ge=0)   # seconds before a retry is claimable
+
+
+class _Unset:
+    """A limit left off @task, as opposed to one given as None, which means no limit."""
+
+    def __repr__(self) -> str:
+        return "<the app's default>"
+
+UNSET = _Unset()
 
 
 class Document(BaseModel):
@@ -458,7 +483,7 @@ class BaseDistributions:
         return getStaticmethods(cls)
     
     # dailyFrequency is PositiveFloat throughout: zero divides, and a negative
-    # interval walks a scheduler backwards, which no overdue policy can stop.
+    # interval walks a scheduler backwards, which no missed-beats rule can stop.
 
     @staticmethod
     def constant(dailyFrequency: PositiveFloat) -> timedelta:
@@ -550,24 +575,12 @@ class Task(Document):
 
     attempts:       int                 = 0      # claims so far, including ones that crashed
 
-    # None means the engine's, and the engine's None means the app's. Nearest
-    # wins, and NO_LIMIT (-1) on a timeout or skipAfter means none at all.
-    timeout:        float | None        = None   # seconds this call may run for
-    skipAfter:      float | None        = None   # seconds past the deadline it stops being worth running
-    maxAttempts:    int | None          = Field(default=None, ge=1)  # runs before a failure is final
-    retryDelay:     float | None        = Field(default=None, ge=0)  # seconds before a retry is claimable
-
     @model_validator(mode="after")
     def defaultLease(self):
         if self.leaseUntil is None:
             self.leaseUntil = self.deadline
 
         return self
-
-    @field_validator("timeout", "skipAfter")
-    @staticmethod
-    def validate_limit(value: float | None) -> float | None:
-        return checkLimit(value)
 
     @field_serializer("executionTime")
     @staticmethod
@@ -592,25 +605,8 @@ class Task(Document):
 class TaskFactory(Document):
     name:   str
 
-    def _emit(
-            self, 
-            work:       CallSpec,
-            deadline:   datetime,
-            timeout:    float | None = None,
-            skipAfter:  float | None = None,
-            maxAttempts: int | None = None,
-            retryDelay: float | None = None
-        ) -> Task:
-
-        return Task(
-            work=work,
-            deadline=deadline, 
-            factory=self,
-            timeout=timeout,
-            skipAfter=skipAfter,
-            maxAttempts=maxAttempts,
-            retryDelay=retryDelay
-        )
+    def _emit(self, work: CallSpec, deadline: datetime) -> Task:
+        return Task(work=work, deadline=deadline, factory=self)
     
     def __repr__(self) -> str:
         return f"Factory {self.name}"
@@ -777,32 +773,32 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             defaultFactory:     TaskFactory | None = None,
             leaseSeconds:       float = LEASE_SECONDS,
             taskModel:          type[Task] = Task,
-            extraIndexes:       Sequence[IndexModel] | None = None,
-            timeout:            float | None = None,
-            skipAfter:          float | None = None,
-            maxAttempts:        int | None = None,
-            retryDelay:         float | None = None
+            extraIndexes:       Sequence[IndexModel] | None = None
         ):
 
         self.pollInterval = pollInterval
         self.leaseSeconds = leaseSeconds
-        self.timeout: float | None = checkLimit(timeout if timeout is not None else app.taskTimeout)
-        self.skipAfter: float | None = checkLimit(skipAfter if skipAfter is not None else app.taskSkipAfter)
-        self.maxAttempts: int = maxAttempts if maxAttempts is not None else app.taskMaxAttempts
-        self.retryDelay: float = retryDelay if retryDelay is not None else app.taskRetryDelay
         self.defaultFactory: TaskFactory = defaultFactory or app.defaultFactory
         self.distributionEngine: DistributionEngine = app.distribution
 
-        if self.maxAttempts < 1:
-            raise ValueError(f"maxAttempts must be at least 1, not {self.maxAttempts}")
-
-        if self.retryDelay < 0:
-            raise ValueError(f"retryDelay is seconds and cannot be negative, not {self.retryDelay}")
+        declared = type(app)._getTasks()
 
         # resolve tasks
         self.functions: dict[str, Callable] = {
             name: getattr(app, name)
-            for name in type(app)._getTasks()
+            for name in declared
+        }
+
+        # each task's limits: what its @task declares, and the app's defaults for the rest
+        defaults = {
+            "timeout": app.taskTimeout, "skipAfter": app.taskSkipAfter,
+            "maxAttempts": app.taskMaxAttempts, "retryDelay": app.taskRetryDelay,
+        }
+        TaskLimits(**defaults)      # checked even when no task uses them, so a bad default can't lie in wait
+
+        self.limits: dict[str, TaskLimits] = {
+            name: TaskLimits(**{**defaults, **declaration.limits})
+            for name, declaration in declared.items()
         }
 
         # build kwarg validators
@@ -889,7 +885,9 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         # A failure is retried by writing it back as pending, so running out of
         # attempts at the claim means the last one never reported back at all:
         # its worker died. Running it again is how a task kills every worker.
-        if task.attempts > self.maxAttemptsFor(task):
+        limits = self.limitsFor(task)
+
+        if task.attempts > limits.maxAttempts:
             return self._giveUp(task)
 
         self._hold(task.uid)
@@ -898,14 +896,13 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         finally:
             self._releaseHold(task.uid)
 
-        if task.status == "failed" and task.attempts < self.maxAttemptsFor(task):
-            delay = self.retryDelayFor(task)
+        if task.status == "failed" and task.attempts < limits.maxAttempts:
             logger.warning(
                 "%r failed on attempt %d of %d, retrying in %ss",
-                task, task.attempts, self.maxAttemptsFor(task), delay
+                task, task.attempts, limits.maxAttempts, limits.retryDelay
             )
             task.status = "pending"
-            task.leaseUntil = utc_now() + timedelta(seconds=delay)
+            task.leaseUntil = utc_now() + timedelta(seconds=limits.retryDelay)
 
         try:
             bson.encode(task.model_dump())
@@ -934,26 +931,13 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             {"$set": task.model_dump()}
         ).matched_count > 0
 
-    @staticmethod
-    def _nearest(own: float | None, engine: float | None) -> float | None:
-        """The task's own limit if it set one, else the engine's (which already
-        fell back to the app's). NO_LIMIT counts as set, and means none."""
+    def limitsFor(self, task: Task) -> TaskLimits:
+        """The limits a task runs under: those its function declares on @task."""
 
-        limit = own if own is not None else engine
-
-        return None if limit == NO_LIMIT else limit
-
-    def timeoutFor(self, task: Task) -> float | None:
-        return self._nearest(task.timeout, self.timeout)
-
-    def skipAfterFor(self, task: Task) -> float | None:
-        return self._nearest(task.skipAfter, self.skipAfter)
-
-    def maxAttemptsFor(self, task: Task) -> int:
-        return task.maxAttempts if task.maxAttempts is not None else self.maxAttempts
-
-    def retryDelayFor(self, task: Task) -> float:
-        return task.retryDelay if task.retryDelay is not None else self.retryDelay
+        try:
+            return self.limits[task.work.functionName]
+        except KeyError:
+            raise TaskNotFound(f"Task {task.work.functionName} does not exist in this app") from None
 
     def _giveUp(self, task: Task) -> Task:
         task.status = "failed"
@@ -971,7 +955,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         """Whether this task went stale waiting to be claimed — after downtime, or
         in a queue nobody is keeping up with; it is the same condition."""
 
-        limit = self.skipAfterFor(task)
+        limit = self.limitsFor(task).skipAfter
 
         return limit is not None and (now - task.deadline).total_seconds() > limit
 
@@ -981,7 +965,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         task.status = "outdated"
         task.error = (
             f"claimed {late:.0f}s after its deadline, past the "
-            f"{self.skipAfterFor(task)}s it was worth running for"
+            f"{self.limitsFor(task).skipAfter}s it was worth running for"
         )
 
         self._record(task)
@@ -1024,7 +1008,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         return outcome.get("result")
 
     def execute(self, task: Task) -> Task:
-        timeout = self.timeoutFor(task)
+        timeout = self.limitsFor(task).timeout
         start = time.perf_counter()
 
         try:
@@ -1055,27 +1039,8 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         except KeyError:
             raise TaskNotFound(f"Task {work.functionName} does not exist in this app")
 
-    def _add(
-            self, 
-            work:           CallSpec,
-            deadline:       datetime, 
-            factory:        TaskFactory,
-            timeout:        float | None = None,
-            skipAfter:      float | None = None,
-            maxAttempts:    int | None = None,
-            retryDelay:     float | None = None
-        ) -> Task:
-
-        return self.insert(
-            factory._emit(
-                deadline=deadline,
-                work=work,
-                timeout=timeout,
-                skipAfter=skipAfter,
-                maxAttempts=maxAttempts,
-                retryDelay=retryDelay
-            )
-        )
+    def _add(self, work: CallSpec, deadline: datetime, factory: TaskFactory) -> Task:
+        return self.insert(factory._emit(work=work, deadline=deadline))
 
     def _notStarted(self) -> dict[str, Any]:
         """Matches tasks nobody is running: waiting, or claimed by a worker that
@@ -1142,57 +1107,29 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             time.sleep(min(interval, remaining))
 
     def schedule(
-            self, 
-            work:           CallSpec, 
+            self,
+            work:           CallSpec,
             deadline:       datetime | None = None,
-            factory:        TaskFactory | None = None,
-            timeout:        float | None = None,
-            skipAfter:      float | None = None,
-            maxAttempts:    int | None = None,
-            retryDelay:     float | None = None
+            factory:        TaskFactory | None = None
         ) -> Task:
 
-        """Queue one call. `timeout`, `skipAfter`, `maxAttempts` and `retryDelay`
-        override the engine's and the app's."""
-
-        factory = factory or self.defaultFactory
-        deadline = deadline or utc_now()
+        """Queue one call. It runs under the limits its task declares."""
 
         self.validate(work)
 
-        return self._add(
-            work=work,
-            deadline=deadline, 
-            factory=factory,
-            timeout=timeout,
-            skipAfter=skipAfter,
-            maxAttempts=maxAttempts,
-            retryDelay=retryDelay
-        )
+        return self._add(work=work, deadline=deadline or utc_now(), factory=factory or self.defaultFactory)
 
     def scheduleFromDistribution(
             self,
             work:           CallSpec,
             distribution:   CallSpec,
-            factory:        TaskFactory | None = None,
-            timeout:        float | None = None,
-            skipAfter:      float | None = None,
-            maxAttempts:    int | None = None,
-            retryDelay:     float | None = None
+            factory:        TaskFactory | None = None
         ) -> Task:
 
         self._app.distribution.validate(distribution)
         deadline = utc_now() + self._app.distribution.gen(distribution)
 
-        return self.schedule(
-            work=work,
-            deadline=deadline,
-            factory=factory,
-            timeout=timeout,
-            skipAfter=skipAfter,
-            maxAttempts=maxAttempts,
-            retryDelay=retryDelay
-        )
+        return self.schedule(work=work, deadline=deadline, factory=factory)
 
     def __call__(self, functionName: str, **kwargs) -> CallSpec:
         obj = CallSpec.new(functionName, **kwargs)
@@ -1207,10 +1144,6 @@ class Scheduler(TaskFactory):
     distribution:   CallSpec
     deadline:       datetime
     leaseUntil:     datetime | None     = None
-    timeout:        float | None        = None   # all three stamped onto every task it emits
-    skipAfter:      float | None        = None
-    maxAttempts:    int | None          = Field(default=None, ge=1)
-    retryDelay:     float | None        = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def defaultLease(self):
@@ -1218,11 +1151,6 @@ class Scheduler(TaskFactory):
             self.leaseUntil = self.deadline
 
         return self
-
-    @field_validator("timeout", "skipAfter")
-    @staticmethod
-    def validate_limit(value: float | None) -> float | None:
-        return checkLimit(value)
 
     def emitWork(self) -> CallSpec:
         """The call this scheduler emits. Override to stamp context onto every task.
@@ -1237,11 +1165,7 @@ class Scheduler(TaskFactory):
         return self.work
 
     def _emit(self, deadline: datetime) -> Task:
-        return super()._emit(
-            self.emitWork(), deadline,
-            timeout=self.timeout, skipAfter=self.skipAfter,
-            maxAttempts=self.maxAttempts, retryDelay=self.retryDelay
-        )
+        return super()._emit(self.emitWork(), deadline)
     
     def __repr__(self) -> str:
         return f"Scheduler {self.name}: {self.work!r}"
@@ -1255,7 +1179,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
             schedulersCollection:   Collection | str | None = None,
             taskEngine:             TaskEngine | None = None,
             pollInterval:           float = 1,
-            policy:                 OVERDUE_SCHEDULES_POLICY = "execute once",
+            missed:                 MISSED_BEATS = "once",
             schedulerModel:         type[Scheduler] = Scheduler,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float = LEASE_SECONDS,
@@ -1265,7 +1189,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         self.pollInterval = pollInterval
         self.leaseSeconds = leaseSeconds
         self.taskEngine: TaskEngine = taskEngine or app.task
-        self.policy: OVERDUE_SCHEDULES_POLICY = policy
+        self.missed: MISSED_BEATS = checkMissed(missed)
 
         self._initWorkers()
 
@@ -1319,15 +1243,15 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
 
         # A whole beat came and went unworked, so this scheduler cannot keep its
         # cadence — either nothing was running, or it is set faster than it can be
-        # served. Which is the only moment the policy has anything to say.
+        # served. Which is the only moment `missed` has anything to say.
         behind = scheduler.deadline + interval <= now
-        replay = self.policy == "execute reconstructed"
+        replay = self.missed == "replay"
 
         # Not held for renewal: emitting takes milliseconds against a lease of
         # minutes, and a renewal landing after the deadline write below would push
         # the next beat out by a whole lease. A stall that outlasts the lease is
         # covered by the beat's fixed uid.
-        if scheduler.status == "enabled" and not (behind and self.policy == "skip"):
+        if scheduler.status == "enabled" and not (behind and self.missed == "skip"):
             task = scheduler._emit(deadline=scheduler.deadline)
             task.uid = beatUid(scheduler.uid, scheduler.deadline)
 
@@ -1344,7 +1268,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
                 except DuplicateKeyError:
                     pass    # emitted by a worker that died before moving the deadline on
 
-        # Only "execute reconstructed" walks the backlog beat by beat. The others
+        # Only "replay" walks the backlog beat by beat. The others
         # resume from now, so time spent behind is not time owed.
         deadline = scheduler.deadline + interval if replay or not behind else now + interval
 
@@ -1360,7 +1284,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         # has nothing to warn about
         if behind and scheduler.status == "enabled":
             logger.warning(
-                "%r missed a beat of %s (policy: %s)", scheduler, interval, self.policy
+                "%r missed a beat of %s (missed=%r)", scheduler, interval, self.missed
             )
 
         return scheduler
@@ -2035,7 +1959,7 @@ class schedulers:
             self,
             schedulerModel:         type[Scheduler] = Scheduler,
             schedulersCollection:   Collection | str | None = None,
-            policy:                 OVERDUE_SCHEDULES_POLICY | None = None,
+            missed:                 MISSED_BEATS | None = None,
             pollInterval:           float | None = None,
             extraIndexes:           Sequence[IndexModel] | None = None,
             leaseSeconds:           float | None = None
@@ -2051,7 +1975,7 @@ class schedulers:
         self.leaseSeconds = leaseSeconds
         self.schedulerModel = schedulerModel
         self.schedulersCollection = schedulersCollection
-        self.policy = policy
+        self.missed = checkMissed(missed) if missed is not None else None    # None: the app's schedulerMissed
         self.pollInterval = pollInterval
         self.extraIndexes = extraIndexes
         self.name: str = ""
@@ -2062,7 +1986,7 @@ class schedulers:
     def _engine(
             self,
             app:          BaseApp,
-            policy:         OVERDUE_SCHEDULES_POLICY,
+            missed:         MISSED_BEATS,
             pollInterval:   float,
             leaseSeconds:   float
         ) -> SchedulerEngine:
@@ -2075,7 +1999,7 @@ class schedulers:
             app,
             schedulersCollection=collection,
             pollInterval=self.pollInterval if self.pollInterval is not None else pollInterval,
-            policy=self.policy or policy,
+            missed=self.missed or missed,
             schedulerModel=self.schedulerModel,
             extraIndexes=self.extraIndexes,
             leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds,
@@ -2093,11 +2017,56 @@ class schedulers:
 
 
 class task:
-    def __init__(self, func: Callable):
+    """Declare a method as a task, bare or with its limits:
+
+        @task
+        @staticmethod
+        def ping(): ...
+
+        @task(timeout=60, maxAttempts=3, retryDelay=30)
+        def sync(self, accountId: int): ...
+
+    A limit left out takes the app's default (taskTimeout, taskSkipAfter,
+    taskMaxAttempts, taskRetryDelay); a timeout or skipAfter given as None means
+    no limit, whatever the default. Limits belong to the function rather than to
+    one call of it, so this is the only place they are set.
+    """
+
+    def __init__(
+            self,
+            func:           Callable | None = None,
+            *,
+            timeout:        float | None | _Unset = UNSET,
+            skipAfter:      float | None | _Unset = UNSET,
+            maxAttempts:    int | _Unset = UNSET,
+            retryDelay:     float | _Unset = UNSET
+        ):
+
+        given = {"timeout": timeout, "skipAfter": skipAfter, "maxAttempts": maxAttempts, "retryDelay": retryDelay}
+        self.limits: dict[str, Any] = {name: value for name, value in given.items() if value is not UNSET}
+
+        TaskLimits(**self.limits)       # a bad limit fails where it is written
+
+        self.func: Callable | None = None
+
+        if func is not None:
+            self._declare(func)
+
+    def _declare(self, func: Callable):
         self.__is_staticmethod__: bool = isinstance(func, staticmethod)
         self.__is_classmethod__: bool = isinstance(func, classmethod)
-        self.func: Callable = func.__func__ if isinstance(func, (staticmethod, classmethod)) else func
+        self.func = func.__func__ if isinstance(func, (staticmethod, classmethod)) else func
         self.__is_task__: bool = True
+
+    def __call__(self, func: Callable) -> task:
+        """The @task(...) form: the limits came first, and the function comes here."""
+
+        if self.func is not None:
+            raise TypeError(f"{self.func.__name__} is already declared as a task")
+
+        self._declare(func)
+
+        return self
 
     def __get__(self, obj, objtype=None) -> Callable:
         if obj is None:
@@ -2168,27 +2137,25 @@ class BaseApp:
                 f"{cls.__name__}.{name} would replace BaseApp.{name}; declare it under another name"
             )
 
-    # Policies and limits are declared on the class, never passed in: every
-    # process that imports this app must agree on them, and they are part of the
-    # fingerprint so two that disagree cannot both run workers.
-    overdueSchedulersPolicy:    OVERDUE_SCHEDULES_POLICY  = "execute once"
+    # Defaults, declared in code like everything they apply to: every process that
+    # imports this app must agree on them, and they are part of the fingerprint so
+    # two that disagree cannot both run workers.
 
-    # Seconds a task may run before it is written off, and seconds past its
-    # deadline before it stops being worth running at all. None means no limit;
-    # an engine or an individual task may set its own, and a task's NO_LIMIT
-    # lifts whatever is set out here.
+    # What a scheduler owes for beats that went by unworked. schedulers(missed=...)
+    # sets it for one engine.
+    schedulerMissed:            MISSED_BEATS              = "once"
+
+    # Limits for every task, each overridable on its own @task(...). A timeout or
+    # skipAfter of None means no limit. One attempt by default: rerunning a side
+    # effect nobody asked to rerun is worse than a failure you can see. A crash
+    # counts as an attempt, so a task that takes its worker down with it is given
+    # up on, not rerun forever.
     taskTimeout:                float | None              = None
     taskSkipAfter:              float | None              = None
-
-    # How many times a task runs before a failure is final, and how long a retry
-    # waits. One by default: rerunning a side effect nobody asked to rerun is
-    # worse than a failure you can see. A crash counts as an attempt, so a task
-    # that takes its worker down with it is given up on, not rerun forever.
     taskMaxAttempts:            int                       = MAX_ATTEMPTS
     taskRetryDelay:             float                     = RETRY_DELAY
 
-    # The same rule for pile items, overridable per pile(): a failure with
-    # attempts left goes back on the pile, and a crash counts.
+    # The same rule for pile items, overridable on each pile(...).
     itemMaxAttempts:            int                       = MAX_ATTEMPTS
     itemRetryDelay:             float                     = RETRY_DELAY
 
@@ -2263,14 +2230,14 @@ class BaseApp:
         )
 
         self.schedulerEngines: dict[str, SchedulerEngine] = {
-            name: spec._engine(self, self.overdueSchedulersPolicy, schedulerPollInterval, self.leaseSeconds)
+            name: spec._engine(self, self.schedulerMissed, schedulerPollInterval, self.leaseSeconds)
             for name, spec in type(self)._getSchedulerEngines().items()
         }
 
         # a declaration named `scheduler` replaces the default engine
         if "scheduler" not in self.schedulerEngines:
             self.scheduler: SchedulerEngine = SchedulerEngine(
-                self, pollInterval=schedulerPollInterval, policy=self.overdueSchedulersPolicy,
+                self, pollInterval=schedulerPollInterval, missed=self.schedulerMissed,
                 leaseSeconds=self.leaseSeconds
             )
             self.schedulerEngines["scheduler"] = self.scheduler
@@ -2280,16 +2247,17 @@ class BaseApp:
     @property
     def fingerprint(self) -> str:
         """Identifies the executable surface of this app: its task and distribution
-        names with their signatures, and the policies its engines apply.
+        names with their signatures, the limits every task and pile runs under, and
+        what each scheduler engine owes for missed beats.
 
         Two processes that disagree on this are running different code and must
         not work the same collections. It cannot see a changed function *body* —
         nothing can, reliably — so this is a guard, not a proof. Deploy one
         version at a time.
 
-        Policies and limits are in here because they are shared behaviour: one
-        process retrying a failure another treats as final is a split brain over
-        the same documents, not two harmless local settings.
+        Limits and missed-beats rules are in here because they are shared
+        behaviour: one process retrying a failure another treats as final is a
+        split brain over the same documents, not two harmless local settings.
         """
 
         parts = [
@@ -2299,16 +2267,12 @@ class BaseApp:
             for name, func in sorted(registry.items())
         ]
 
-        parts += [f"{engine.name}:{engine.policy}" for engine in self.schedulerEngines.values()]
+        parts += [f"{name} {limits.model_dump()}" for name, limits in sorted(self.task.limits.items())]
+        parts += [f"{engine.name}:missed={engine.missed}" for engine in self.schedulerEngines.values()]
         parts += [
             f"{p.name}:maxAttempts={p.maxAttempts}:retryDelay={p.retryDelay}"
             for p in self.piles.values()
         ]
-
-        parts.append(f"taskTimeout:{self.task.timeout}")
-        parts.append(f"taskSkipAfter:{self.task.skipAfter}")
-        parts.append(f"taskMaxAttempts:{self.task.maxAttempts}")
-        parts.append(f"taskRetryDelay:{self.task.retryDelay}")
 
         return hashlib.sha1("\n".join(parts).encode()).hexdigest()[:12]
 

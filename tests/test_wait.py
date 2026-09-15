@@ -19,6 +19,11 @@ class App(BaseApp):
     def broken() -> None:
         raise RuntimeError("nope")
 
+    @task(maxAttempts=2, retryDelay=60)
+    @staticmethod
+    def retried() -> None:
+        raise RuntimeError("nope")
+
     @task
     @staticmethod
     def slow() -> str:
@@ -71,7 +76,7 @@ def test_a_failure_is_finished(app):
 
 
 def test_a_task_waiting_for_a_retry_is_not_finished(app):
-    stored = app.task.schedule(App.broken(), maxAttempts=2, retryDelay=60)
+    stored = app.task.schedule(App.retried())
     app.task._work()
 
     with pytest.raises(TimeoutError):

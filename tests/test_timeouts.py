@@ -1,4 +1,4 @@
-"""Task timeouts: app, engine, and per-task, with the nearest one winning."""
+"""Task timeouts: declared on @task, with the app's taskTimeout for the tasks that don't."""
 
 import logging
 import time
@@ -8,8 +8,6 @@ import pytest
 
 from pymonque import BaseApp, task, utc_now
 
-from conftest import ExampleApp
-
 
 class Slow(BaseApp):
     @task
@@ -18,7 +16,13 @@ class Slow(BaseApp):
         time.sleep(seconds)
         return "finished"
 
-    @task
+    @task(timeout=0.05)
+    @staticmethod
+    def limited(seconds: float = 0.5) -> str:
+        time.sleep(seconds)
+        return "finished"
+
+    @task(timeout=5)
     @staticmethod
     def boom() -> None:
         raise ValueError("nope")
@@ -26,71 +30,72 @@ class Slow(BaseApp):
 
 @pytest.fixture
 def slow(db):
-    return Slow(db, enforceVersion=False)
+    return Slow(db, enforceVersion=False, backlogWarnAfter=None)
 
 
-def run(app, spec, **kwargs):
-    stored = app.task.schedule(spec, **kwargs)
+def run(app, spec):
+    stored = app.task.schedule(spec)
     app.task._work()
     return app.task.get(stored.uid)
 
 
-# --- no timeout is still the default ---
+# --- where a limit comes from ---
 
 def test_a_task_has_no_time_limit_by_default(slow):
-    assert slow.task.timeout is None
+    assert slow.task.limits["sleep"].timeout is None
     assert run(slow, Slow.sleep(seconds=0.2)).status == "success"
 
 
-# --- each level ---
+def test_a_task_declares_its_own(slow):
+    assert run(slow, Slow.limited()).status == "timeout"
 
-def test_the_app_sets_the_outermost_limit(db):
+
+def test_the_app_default_applies_to_a_bare_task(db):
     class Limited(Slow):
         taskTimeout = 0.05
 
-    app = Limited(db, enforceVersion=False)
-
-    assert app.task.timeout == 0.05
-    assert run(app, Slow.sleep(seconds=0.5)).status == "timeout"
-
-
-def test_the_engine_overrides_the_app(db):
-    class Limited(Slow):
-        taskTimeout = 5.0
-
-    app = Limited(db, enforceVersion=False)
-    app.task.timeout = 0.05
+    app = Limited(db, enforceVersion=False, backlogWarnAfter=None)
 
     assert run(app, Slow.sleep(seconds=0.5)).status == "timeout"
 
 
-def test_a_task_overrides_the_engine_in_both_directions(db):
-    class Limited(Slow):
+def test_a_task_declares_itself_looser_than_the_default(db):
+    class Limited(BaseApp):
         taskTimeout = 0.05
 
-    app = Limited(db, enforceVersion=False)
+        @task(timeout=5)
+        @staticmethod
+        def generous() -> str:
+            time.sleep(0.2)
+            return "finished"
 
-    assert run(app, Slow.sleep(seconds=0.3), timeout=5).status == "success"   # looser
-    assert run(app, Slow.sleep(seconds=0.3), timeout=0.01).status == "timeout"  # nearer
+        @task(timeout=None)
+        @staticmethod
+        def unlimited() -> str:
+            time.sleep(0.2)
+            return "finished"
+
+    app = Limited(db, enforceVersion=False, backlogWarnAfter=None)
+
+    assert run(app, Limited.generous()).status == "success"
+    assert run(app, Limited.unlimited()).status == "success"
 
 
-def test_a_scheduler_stamps_its_timeout_onto_what_it_emits(slow):
-    stored = slow.scheduler.add(
-        Slow.sleep(), slow.distribution("constant", dailyFrequency=1), timeout=0.05
-    )
-    slow.scheduler.collection.update_one(          # bring it due
-        {"uid": stored.uid},
-        {"$set": {"deadline": utc_now(), "leaseUntil": utc_now()}},
-    )
+def test_an_emitted_task_times_out_by_its_tasks_limit(slow):
+    scheduler = slow.scheduler.add(Slow.limited(), slow.distribution("constant", dailyFrequency=1))
+    now = utc_now()
+    slow.scheduler.collection.update_one({"uid": scheduler.uid}, {"$set": {"deadline": now, "leaseUntil": now}})
+
     slow.scheduler._work()
+    slow.task._work()
 
-    assert slow.task.find()[0].timeout == 0.05
+    assert slow.task.find()[0].status == "timeout"
 
 
 # --- what a timeout records ---
 
 def test_a_timed_out_task_records_why(slow):
-    finished = run(slow, Slow.sleep(seconds=0.5), timeout=0.05)
+    finished = run(slow, Slow.limited())
 
     assert finished.status == "timeout"
     assert "did not finish within" in finished.error
@@ -100,35 +105,23 @@ def test_a_timed_out_task_records_why(slow):
 
 def test_a_timeout_warns(slow, caplog):
     with caplog.at_level(logging.WARNING, logger="pymonque"):
-        run(slow, Slow.sleep(seconds=0.5), timeout=0.05)
+        run(slow, Slow.limited())
 
     assert "timed out" in caplog.text
 
 
 def test_a_raise_inside_a_timed_task_is_still_a_failure(slow):
-    finished = run(slow, Slow.boom(), timeout=5, maxAttempts=1)
+    finished = run(slow, Slow.boom())
 
     assert finished.status == "failed"
     assert "ValueError" in finished.error
 
 
 def test_a_timeout_frees_the_worker_for_the_next_task(slow):
-    slow.task.schedule(Slow.sleep(seconds=5), timeout=0.05)
+    slow.task.schedule(Slow.limited(seconds=5))
     quick = slow.task.schedule(Slow.sleep(seconds=0.01))
 
     slow.task._work()
     slow.task._work()
 
     assert slow.task.get(quick.uid).status == "success"
-
-
-# --- it is shared behaviour ---
-
-def test_a_timeout_change_is_a_different_fingerprint(db):
-    class Loose(Slow):
-        taskTimeout = None
-
-    class Tight(Slow):
-        taskTimeout = 1.0
-
-    assert Loose(db).fingerprint != Tight(db).fingerprint

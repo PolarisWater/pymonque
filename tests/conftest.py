@@ -28,10 +28,10 @@ def wait_for(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
     return bool(predicate())
 
 
-def appWith(base, db, **policies):
-    """Policies live on the class, so varying one for a test means a subclass."""
+def appWith(base, db, **attributes):
+    """Defaults live on the class, so varying one for a test means a subclass."""
 
-    return type("Configured", (base,), policies)(db, **policies.pop("_kwargs", {}))
+    return type("Configured", (base,), attributes)(db, **attributes.pop("_kwargs", {}))
 
 
 class Email(BaseModel):

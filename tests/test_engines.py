@@ -222,18 +222,18 @@ def test_a_subclass_can_override_an_engine(db):
     assert Child(db).groupOps.schedulersCollection.name == "other_groups"
 
 
-def test_per_engine_policy_and_interval(db):
+def test_per_engine_missed_and_interval(db):
     class Q(BaseApp):
-        fast = schedulers(policy="skip", pollInterval=0.5)
+        fast = schedulers(missed="skip", pollInterval=0.5)
 
     class App(Q):
-        overdueSchedulersPolicy = "execute once"
+        schedulerMissed = "once"
 
     app = App(db, schedulerPollInterval=9)
 
-    assert app.fast.policy == "skip"
+    assert app.fast.missed == "skip"
     assert app.fast.pollInterval == 0.5
-    assert app.scheduler.policy == "execute once"
+    assert app.scheduler.missed == "once"
     assert app.scheduler.pollInterval == 9
 
 

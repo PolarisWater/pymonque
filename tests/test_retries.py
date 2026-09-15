@@ -1,10 +1,9 @@
-"""A failing task is retried up to maxAttempts, and a task that kills its worker is given up on."""
+"""A failing task is retried up to its maxAttempts, and a task that kills its worker is given up on."""
 
 import time
 from datetime import timedelta
 
 import pytest
-from pydantic import ValidationError
 
 from pymonque import BaseApp, task, utc_now
 
@@ -13,16 +12,13 @@ calls: list[str] = []
 
 
 class App(BaseApp):
-    taskMaxAttempts = 3
-    taskRetryDelay = 0          # retries claimable at once, so a test can drain them
-
-    @task
+    @task(maxAttempts=3, retryDelay=0)      # retries claimable at once, so a test can drain them
     @staticmethod
     def broken() -> None:
         calls.append("broken")
         raise RuntimeError("nope")
 
-    @task
+    @task(maxAttempts=3, retryDelay=0)
     @staticmethod
     def flaky() -> str:
         calls.append("flaky")
@@ -32,9 +28,27 @@ class App(BaseApp):
 
     @task
     @staticmethod
+    def once() -> None:
+        calls.append("once")
+        raise RuntimeError("nope")
+
+    @task(maxAttempts=2, retryDelay=60)
+    @staticmethod
+    def delayed() -> None:
+        calls.append("delayed")
+        raise RuntimeError("nope")
+
+    @task(maxAttempts=3, retryDelay=0, timeout=0.05)
+    @staticmethod
     def slow() -> None:
         calls.append("slow")
         time.sleep(0.3)
+
+    @task(maxAttempts=3, retryDelay=0, skipAfter=60)
+    @staticmethod
+    def stale() -> None:
+        calls.append("stale")
+        raise RuntimeError("nope")
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +65,8 @@ def drain(app):
     while app.task._work():
         pass
 
+
+# --- retrying ---
 
 def test_a_failure_is_retried_until_the_last_attempt(app):
     stored = app.task.schedule(App.broken())
@@ -80,85 +96,82 @@ def test_a_retry_that_succeeds_clears_the_old_error(app):
     assert final.error is None
 
 
-def test_a_task_overrides_the_app(app):
-    stored = app.task.schedule(App.broken(), maxAttempts=1)
-    drain(app)
-
-    assert app.task.get(stored.uid).status == "failed"
-    assert calls == ["broken"]
-
-
-class Default(BaseApp):
-    @task
-    @staticmethod
-    def broken() -> None:
-        calls.append("broken")
-        raise RuntimeError("nope")
-
-
-def test_by_default_a_failure_is_final(db):
-    app = Default(db, enforceVersion=False, backlogWarnAfter=None)
-    stored = app.task.schedule(Default.broken())
-    app.task._work()
-
-    assert app.task.maxAttempts == 1
-    assert app.task.get(stored.uid).status == "failed"
-    assert app.task._work() is None
-
-
-def test_by_default_a_crashed_task_is_not_rerun(db):
-    """Under the default, a task whose worker died is failed: nobody knows how far it got."""
-
-    app = Default(db, enforceVersion=False, backlogWarnAfter=None)
-    stored = app.task.schedule(Default.broken())
-    app.task.collection.update_one({"uid": stored.uid}, {"$set": {
-        "status": "processing", "attempts": 1, "leaseUntil": utc_now() - timedelta(seconds=1),
-    }})
-    app.task._work()
-
-    assert calls == []
-    assert app.task.get(stored.uid).status == "failed"
-
-
-def test_a_retry_waits_retryDelay(db):
-    class Delayed(App):
-        taskRetryDelay = 60
-
-    app = Delayed(db, enforceVersion=False, backlogWarnAfter=None)
-    stored = app.task.schedule(App.broken())
+def test_a_retry_waits_its_delay(app):
+    stored = app.task.schedule(App.delayed())
     app.task._work()
     retrying = app.task.get(stored.uid)
 
     assert retrying.status == "pending"
     assert retrying.leaseUntil > utc_now() + timedelta(seconds=50)
     assert app.task._work() is None             # not yet
-    assert calls == ["broken"]
+    assert calls == ["delayed"]
 
 
-def test_a_task_overrides_the_retry_delay(db):
-    class Delayed(App):
-        taskRetryDelay = 60
+def test_the_app_default_applies_to_a_bare_task(db):
+    class Retrying(BaseApp):
+        taskMaxAttempts = 2
+        taskRetryDelay = 0
 
-    app = Delayed(db, enforceVersion=False, backlogWarnAfter=None)
-    stored = app.task.schedule(App.broken(), retryDelay=0)
+        @task
+        @staticmethod
+        def broken() -> None:
+            calls.append("broken")
+            raise RuntimeError("nope")
+
+    app = Retrying(db, enforceVersion=False, backlogWarnAfter=None)
+    stored = app.task.schedule(Retrying.broken())
     drain(app)
 
     assert app.task.get(stored.uid).status == "failed"
+    assert calls == ["broken"] * 2
+
+
+def test_an_emitted_task_retries_under_its_tasks_limits(app):
+    scheduler = app.scheduler.add(App.broken(), app.distribution("constant", dailyFrequency=1))
+    now = utc_now()
+    app.scheduler.collection.update_one({"uid": scheduler.uid}, {"$set": {"deadline": now, "leaseUntil": now}})
+
+    app.scheduler._work()
+    drain(app)
+
     assert calls == ["broken"] * 3
 
 
-def crashed(app, attempts):
+# --- the default is one attempt ---
+
+def test_by_default_a_failure_is_final(app):
+    stored = app.task.schedule(App.once())
+    app.task._work()
+
+    assert app.task.limits["once"].maxAttempts == 1
+    assert app.task.get(stored.uid).status == "failed"
+    assert app.task._work() is None
+
+
+def crashed(app, spec, attempts):
     """A task whose worker died mid-run: still processing, lease lapsed, no outcome written."""
 
-    stored = app.task.schedule(App.flaky())
+    stored = app.task.schedule(spec)
     app.task.collection.update_one({"uid": stored.uid}, {"$set": {
         "status": "processing", "attempts": attempts, "leaseUntil": utc_now() - timedelta(seconds=1),
     }})
     return stored
 
 
+def test_by_default_a_crashed_task_is_not_rerun(app):
+    """Under the default, a task whose worker died is failed: nobody knows how far it got."""
+
+    stored = crashed(app, App.once(), attempts=1)
+    app.task._work()
+
+    assert calls == []
+    assert app.task.get(stored.uid).status == "failed"
+
+
+# --- a crash counts ---
+
 def test_a_crash_below_the_limit_is_recovered(app):
-    stored = crashed(app, attempts=1)
+    stored = crashed(app, App.flaky(), attempts=1)
     calls.append("flaky")           # so this run is the one that succeeds
     app.task._work()
 
@@ -167,7 +180,7 @@ def test_a_crash_below_the_limit_is_recovered(app):
 
 
 def test_a_task_that_keeps_killing_its_worker_is_given_up_on(app):
-    stored = crashed(app, attempts=3)
+    stored = crashed(app, App.flaky(), attempts=3)
     app.task._work()
     final = app.task.get(stored.uid)
 
@@ -176,10 +189,12 @@ def test_a_task_that_keeps_killing_its_worker_is_given_up_on(app):
     assert "gave up after 3 attempt(s)" in final.error
 
 
+# --- what is never retried ---
+
 def test_a_timeout_is_not_retried(app):
     """The call may still be running, so another attempt would run it twice at once."""
 
-    stored = app.task.schedule(App.slow(), timeout=0.05)
+    stored = app.task.schedule(App.slow())
     drain(app)
 
     assert app.task.get(stored.uid).status == "timeout"
@@ -187,7 +202,7 @@ def test_a_timeout_is_not_retried(app):
 
 
 def test_an_outdated_retry_is_not_run(app):
-    stored = app.task.schedule(App.broken(), skipAfter=60)
+    stored = app.task.schedule(App.stale())
     app.task._work()
     app.task.collection.update_one(
         {"uid": stored.uid}, {"$set": {"deadline": utc_now() - timedelta(seconds=300)}}
@@ -195,64 +210,4 @@ def test_an_outdated_retry_is_not_run(app):
     app.task._work()
 
     assert app.task.get(stored.uid).status == "outdated"
-    assert calls == ["broken"]
-
-
-def test_a_scheduler_stamps_max_attempts_onto_what_it_emits(app):
-    stored = app.scheduler.add(
-        App.broken(), app.distribution("constant", dailyFrequency=1), maxAttempts=5
-    )
-    app.scheduler.collection.update_one(
-        {"uid": stored.uid}, {"$set": {"deadline": utc_now(), "leaseUntil": utc_now()}}
-    )
-    app.scheduler._work()
-
-    assert app.task.find()[0].maxAttempts == 5
-
-
-def test_fewer_than_one_attempt_is_a_mistake(app, db):
-    with pytest.raises(ValidationError):
-        app.task.schedule(App.broken(), maxAttempts=0)
-
-    class Never(App):
-        taskMaxAttempts = 0
-
-    with pytest.raises(ValueError):
-        Never(db)
-
-
-def test_max_attempts_is_part_of_the_fingerprint(db):
-    class More(App):
-        taskMaxAttempts = 5
-
-    assert More(db).fingerprint != App(db).fingerprint
-
-
-def test_retry_delay_is_part_of_the_fingerprint(db):
-    class Slower(App):
-        taskRetryDelay = 300
-
-    assert Slower(db).fingerprint != App(db).fingerprint
-
-
-def test_a_scheduler_stamps_retry_delay_onto_what_it_emits(app):
-    stored = app.scheduler.add(
-        App.broken(), app.distribution("constant", dailyFrequency=1), retryDelay=5
-    )
-    app.scheduler.collection.update_one(
-        {"uid": stored.uid}, {"$set": {"deadline": utc_now(), "leaseUntil": utc_now()}}
-    )
-    app.scheduler._work()
-
-    assert app.task.find()[0].retryDelay == 5
-
-
-def test_a_negative_retry_delay_is_a_mistake(app, db):
-    with pytest.raises(ValidationError):
-        app.task.schedule(App.broken(), retryDelay=-1)
-
-    class Backwards(App):
-        taskRetryDelay = -1
-
-    with pytest.raises(ValueError):
-        Backwards(db)
+    assert calls == ["stale"]

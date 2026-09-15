@@ -201,7 +201,7 @@ def test_indexes_back_the_claim_query(app, schedulers):
     assert (("uid", 1),) in keys
 
 
-# --- overdue policies, applied every time a scheduler is claimed ---
+# --- missed beats, applied every time a scheduler is claimed ---
 
 def test_an_abandoned_scheduler_is_reclaimed_when_its_lease_lapses(db, app, tasks):
     scheduler = addScheduler(app)
@@ -229,10 +229,10 @@ def test_a_scheduler_with_a_live_lease_is_left_alone(db, app):
     assert abs(reload(app, scheduler).leaseUntil - held) < timedelta(milliseconds=100)
 
 
-def behindByADay(db, policy):
+def behindByADay(db, missed):
     """An hourly scheduler that has not been served for a day: 24 beats missed."""
 
-    app = appWith(ExampleApp, db, overdueSchedulersPolicy=policy)
+    app = appWith(ExampleApp, db, schedulerMissed=missed)
     scheduler = addScheduler(app, dailyFrequency=24)
     setDeadline(app, scheduler, utc_now() - timedelta(days=1))
 
@@ -240,7 +240,7 @@ def behindByADay(db, policy):
 
 
 def test_execute_reconstructed_replays_the_backlog_beat_by_beat(db, tasks):
-    app, scheduler = behindByADay(db, "execute reconstructed")
+    app, scheduler = behindByADay(db, "replay")
     before = reload(app, scheduler).deadline
 
     app.scheduler._work()
@@ -252,7 +252,7 @@ def test_execute_reconstructed_replays_the_backlog_beat_by_beat(db, tasks):
 
 
 def test_execute_once_emits_one_run_and_resumes_from_now(db, tasks):
-    app, scheduler = behindByADay(db, "execute once")
+    app, scheduler = behindByADay(db, "once")
 
     app.scheduler._work()
     after = reload(app, scheduler)
@@ -271,9 +271,9 @@ def test_skip_emits_nothing_and_resumes_from_now(db, tasks):
     assert timedelta(minutes=59) < after.deadline - utc_now() < timedelta(minutes=61)
 
 
-@pytest.mark.parametrize("policy", ["execute reconstructed", "execute once", "skip"])
-def test_a_scheduler_that_is_merely_due_emits_under_every_policy(db, tasks, policy):
-    app = appWith(ExampleApp, db, overdueSchedulersPolicy=policy)
+@pytest.mark.parametrize("missed", ["replay", "once", "skip"])
+def test_a_scheduler_that_is_merely_due_emits_whatever_missed_says(db, tasks, missed):
+    app = appWith(ExampleApp, db, schedulerMissed=missed)
     scheduler = addScheduler(app, dailyFrequency=24)
     setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
 
@@ -284,10 +284,10 @@ def test_a_scheduler_that_is_merely_due_emits_under_every_policy(db, tasks, poli
 
 
 def test_a_scheduler_set_faster_than_it_can_be_served_stops_accumulating(db, tasks):
-    """The bug this policy exists for: a 1s scheduler down for an hour used to emit
+    """The bug missed beats exist for: a 1s scheduler down for an hour used to emit
     an unbounded burst trying to catch up."""
 
-    app = appWith(ExampleApp, db, overdueSchedulersPolicy="execute once")
+    app = appWith(ExampleApp, db, schedulerMissed="once")
     scheduler = addScheduler(app, dailyFrequency=86400)      # one second apart
     setDeadline(app, scheduler, utc_now() - timedelta(hours=1))
 
@@ -298,11 +298,11 @@ def test_a_scheduler_set_faster_than_it_can_be_served_stops_accumulating(db, tas
     assert reload(app, scheduler).deadline > utc_now()       # caught up on the first claim
 
 
-def test_the_policy_still_applies_after_startup(db, tasks):
-    """init() no longer owns the policy, so a scheduler that falls behind while
+def test_missed_still_applies_after_startup(db, tasks):
+    """init() has no say over missed beats, so a scheduler that falls behind while
     the app is up is treated the same as one that fell behind while it was down."""
 
-    app = appWith(ExampleApp, db, overdueSchedulersPolicy="skip")
+    app = appWith(ExampleApp, db, schedulerMissed="skip")
     app.init()
 
     scheduler = addScheduler(app, dailyFrequency=24)
@@ -576,3 +576,17 @@ def test_saving_a_moved_deadline_moves_the_lease(app):
     scheduler.save()
 
     assert app.scheduler.get(scheduler.uid).leaseUntil == scheduler.deadline
+
+
+# --- missed is checked where it is written ---
+
+def test_an_unknown_missed_rule_is_refused_on_a_declaration():
+    from pymonque import schedulers
+
+    with pytest.raises(ValueError, match="missed"):
+        schedulers(missed="execute once")
+
+
+def test_an_unknown_missed_rule_is_refused_on_the_app(db):
+    with pytest.raises(ValueError, match="missed"):
+        appWith(ExampleApp, db, schedulerMissed="sometimes")

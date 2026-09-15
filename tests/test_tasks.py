@@ -1,4 +1,4 @@
-"""TaskEngine: scheduling, validation, claiming, execution, and startup policies."""
+"""TaskEngine: scheduling, validation, claiming, execution, and startup housekeeping."""
 
 from datetime import timedelta
 
@@ -167,7 +167,7 @@ def test_an_instance_task_runs_with_its_app(app, tasks):
 # --- failure handling ---
 
 def test_a_raising_task_is_marked_failed(app, tasks):
-    app.task.schedule(ExampleApp.boom(), maxAttempts=1)     # retries: test_retries.py
+    app.task.schedule(ExampleApp.boom())    # one attempt by default; retries: test_retries.py
     app.task._work()
     entry = stored(tasks, "boom")
 
@@ -195,7 +195,7 @@ def test_indexes_back_the_claim_query(app, tasks):
     assert (("uid", 1),) in keys
 
 
-# --- startup policies ---
+# --- abandoned work and startup housekeeping ---
 
 def test_an_abandoned_task_is_reclaimed_when_its_lease_lapses(db, app, tasks):
     app.task.schedule(ExampleApp.greet(name="Ada"))
@@ -315,11 +315,24 @@ def test_saving_a_moved_deadline_moves_a_waiting_tasks_lease(app):
     assert app.task._work() is None          # no longer due
 
 
-def test_saving_a_task_waiting_for_a_retry_keeps_its_retry_time(app):
+def retrying(db):
+    """An app whose one task fails, and may try once more after ten minutes."""
+
+    class Retrying(BaseApp):
+        @task(maxAttempts=2, retryDelay=600)
+        @staticmethod
+        def boom():
+            raise ValueError("nope")
+
+    return Retrying(db)
+
+
+def test_saving_a_task_waiting_for_a_retry_keeps_its_retry_time(db):
     from datetime import timedelta
     from pymonque import utc_now
 
-    stored = app.task.schedule(ExampleApp.boom(), maxAttempts=2, retryDelay=600)
+    app = retrying(db)
+    stored = app.task.schedule(app.task("boom"))
     app.task._work()
     waiting = app.task.get(stored.uid)
     retryAt = waiting.leaseUntil
@@ -398,8 +411,9 @@ def test_a_subclass_overriding_a_task_with_a_plain_method_unregisters_it(db):
     assert "things" not in app.piles and "things" in app.collections
 
 
-def test_renewal_does_not_touch_a_task_waiting_for_a_retry(app):
-    stored = app.task.schedule(ExampleApp.boom(), maxAttempts=2, retryDelay=600)
+def test_renewal_does_not_touch_a_task_waiting_for_a_retry(db):
+    app = retrying(db)
+    stored = app.task.schedule(app.task("boom"))
     app.task._work()
     retryAt = app.task.get(stored.uid).leaseUntil
     app.task._hold(stored.uid)           # a renewal that copied the uid before the write landed
@@ -416,9 +430,9 @@ def test_update_validates_before_writing(app):
     stored = app.task.schedule(ExampleApp.greet(name="Ada"))
 
     with pytest.raises(ValidationError):
-        app.task.update(stored.uid, maxAttempts=0)
+        app.task.update(stored.uid, attempts="many")
 
-    assert app.task.collection.find_one({"uid": stored.uid})["maxAttempts"] is None
+    assert app.task.collection.find_one({"uid": stored.uid})["attempts"] == 0
 
 
 def test_update_moves_a_waiting_tasks_lease_with_its_deadline(app):

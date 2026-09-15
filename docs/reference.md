@@ -4,12 +4,12 @@
 
 ```python
 class App(BaseApp):
-    overdueSchedulersPolicy = "execute once"    # policies are declared, not passed
-    taskTimeout             = None              # and so are the limits
+    schedulerMissed         = "once"            # defaults are declared, not passed
+    taskTimeout             = None              # for every task; @task(...) sets a task's own
     taskSkipAfter           = None
     taskMaxAttempts         = 1
     taskRetryDelay          = 60
-    itemMaxAttempts         = 1                 # the same, for pile items
+    itemMaxAttempts         = 1                 # for every pile; pile(...) sets a pile's own
     itemRetryDelay          = 60
 
 app = App(
@@ -20,10 +20,11 @@ app = App(
 )
 ```
 
-Policies and limits are class attributes, never constructor arguments: every process that imports
-this app has to agree on them, or one would retry a failure another treats as final. They are part of
-the [fingerprint](#one-version-at-a-time), so two that disagree cannot both run workers.
-Pacing and lease lengths are per-process and stay arguments.
+Defaults are class attributes, never constructor arguments, and what overrides them is declared in
+code too — [limits](#limits) on `@task(...)` and `pile(...)`, [missed beats](#missed-beats) on
+`schedulers(...)`. Every process that imports the app has to agree on all of it, or one would retry
+a failure another treats as final, so it is part of the [fingerprint](#one-version-at-a-time) and two
+that disagree cannot both run workers. Pacing and lease lengths are per-process and stay arguments.
 
 A declaration can't reuse a name `BaseApp` already has — a pile called `backlog`, a task called
 `init` or `run` — because it would replace that part of the app; the class raises `TypeError` when
@@ -176,6 +177,9 @@ class App(BaseApp):
     @task
     @classmethod
     def with_class(cls): ...       # class methods get the app's class
+
+    @task(timeout=60, maxAttempts=3)
+    def with_limits(self): ...     # see Limits
 ```
 
 A subclass that redefines a task's name as something else — a plain method, a pile — replaces the
@@ -212,12 +216,13 @@ pydantic coerced (`"3"` for an `int`) arrives coerced. Distributions are called 
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None, timeout=None, skipAfter=None, maxAttempts=None, retryDelay=None)` | Store a task, and return it. Deadline defaults to now. |
+| `schedule(work, deadline=None, factory=None)` | Store a task, and return it. Deadline defaults to now. |
 | `scheduleFromDistribution(work, distribution, ...)` | Same, deadline is now + one interval. |
 | `__call__(functionName, **kwargs)` | Build and validate a `CallSpec`. |
 | `validate(work)` | Raises `TaskNotFound` / `TaskValidationError`. |
 | `execute(task)` | Run one task, return it filled in. |
-| `timeoutFor(task)` / `skipAfterFor(task)` / `maxAttemptsFor(task)` / `retryDelayFor(task)` | The limits that apply to it, resolved. |
+| `limits` | `dict[str, TaskLimits]`: what each task resolved to, from its `@task(...)` and the app's defaults. |
+| `limitsFor(task)` | The `TaskLimits` a stored task runs under — its function's. |
 | `wait(task, timeout=None, interval=0.1)` | Block until it finishes and return it. `TimeoutError` if it doesn't in time. From any process. |
 | `backlog()` | `(due, secondsTheOldestHasWaited)` — on `BaseApp`. |
 | `startWorkers(n)` | Poll, claim, execute. |
@@ -239,10 +244,8 @@ twice. See [Leases](#leases) for why one field covers both due and abandoned.
 | `result` | anything BSON can encode |
 | `error` | traceback of the last failure |
 | `attempts` | `int`, bumped on every claim — a crashed run counts |
-| `timeout` | `float` seconds, `None` for the engine's, `-1` for none |
-| `skipAfter` | `float` seconds past the deadline, `None` for the engine's, `-1` for never |
-| `maxAttempts` | `int` ≥ 1, or `None` for the engine's |
-| `retryDelay` | `float` seconds before a retry is claimable, or `None` for the engine's |
+
+A task stores no limits: it runs under the ones its function declares.
 
 ```
 pending ─→ processing ─→ success
@@ -259,84 +262,69 @@ pending ─→ incompatible   the function no longer exists on the app
 
 A result the driver cannot encode is stored as a `failed` task, not left claimed.
 
-## Timeouts
+## Limits
 
-A task runs without a limit unless one is set. Three places can set one, and the **nearest wins**:
+What a task may do is part of declaring it, because it describes the function — how long it may
+run, whether running it again is safe — not one call of it:
 
 ```python
 class App(BaseApp):
-    taskTimeout = 300               # app: the outermost limit
+    taskTimeout = 300                                   # the default for every task
 
-app.task.timeout = 60               # engine
-app.task.schedule(App.big(), timeout=900)   # task: wins over both, tighter or looser
+    @task(timeout=900, maxAttempts=3, retryDelay=30)    # this task's own
+    def sync(self, accountId: int): ...
+
+    @task(skipAfter=None)                               # None: no limit, whatever the default
+    @staticmethod
+    def charge(orderId: str): ...
 ```
 
-A scheduler stamps its own onto everything it emits:
+| Limit | App default | What |
+|---|---|---|
+| `timeout` | `taskTimeout = None` | seconds a call may run before it is written `timeout`; `None`: no limit |
+| `skipAfter` | `taskSkipAfter = None` | seconds past its deadline a task is still worth running; `None`: however late |
+| `maxAttempts` | `taskMaxAttempts = 1` | runs before a failure is final |
+| `retryDelay` | `taskRetryDelay = 60` | seconds a failed task waits before it is claimable again |
 
-```python
-app.scheduler.add(App.sync(), daily, timeout=120)
-```
+A limit left off `@task(...)` takes the app's default, and that is all: a scheduled call carries no
+limits of its own, and neither does a scheduler, so a task emitted by one runs under the same limits
+as any other call of that task. To run a function under different limits, declare a second task.
 
-When the limit passes, the task is written `timeout` with the reason in `error`, the worker is
+Limits are checked where they are written — a bad one on `@task(...)` fails as the class is defined,
+a bad default as the app is built. `app.task.limits` holds what every task resolved to, and all of it
+is in the [fingerprint](#one-version-at-a-time): whether a task ends up `timeout`, `outdated` or
+retried must not depend on which process picked it up.
+
+### Timeouts
+
+When `timeout` passes, the task is written `timeout` with the reason in `error`, the worker is
 freed, and a warning is logged. **The call itself is not interrupted** — Python cannot do that —
 so it runs on in a daemon thread until it returns. What a timeout guarantees is that the worker
 and the document stop waiting on it, which is what every other process can see. A task that must
 actually stop needs to check something itself.
 
-With no timeout set, the call runs on the worker thread exactly as before; the extra thread only
-appears when a limit applies. `timeout=-1` on a task (`NO_LIMIT`) lifts the engine's and the app's.
-
-A timed-out task is **not retried**: its call may still be running, and a second attempt would run
-it twice at once.
-
-Timeouts are part of the [fingerprint](#one-version-at-a-time), like the policies: whether a task
-ends up `timeout` must not depend on which process picked it up.
+Without a timeout, the call runs on the worker thread; the extra thread only appears when a limit
+applies. A timed-out task is **not retried**: its call may still be running, and a second attempt
+would run it twice at once.
 
 ### skipAfter
 
-The same three levels, for a task that went stale *waiting* rather than while running:
-
-```python
-class App(BaseApp):
-    taskSkipAfter = 3600            # app
-
-app.task.skipAfter = 600            # engine
-app.task.schedule(App.send(...), skipAfter=60)      # task
-app.scheduler.add(App.sync(), daily, skipAfter=120) # stamped on what it emits
-```
-
 If a worker claims a task more than `skipAfter` seconds past its deadline, it is written
-`outdated` with how late it was, and never run. `None` — the default — means run however late.
-
-It is the one rule for stale work, whatever made it stale: the app was down, or nobody kept up.
-A task that must run no matter how late opts out with `skipAfter=-1`:
-
-```python
-app.task.schedule(App.charge(...), skipAfter=-1)    # never skipped, whatever the app says
-```
+`outdated` with how late it was, and never run. It is the one rule for stale work, whatever made
+it stale: the app was down, or nobody kept up.
 
 A retry keeps its original deadline, so a task that keeps failing can age past `skipAfter` and be
-outdated between attempts. It is in the fingerprint for the same reason timeouts are.
+outdated between attempts.
 
-## Retries
+### Retries
 
 **Off by default.** A task runs once, and a failure is final: rerunning a side effect nobody asked
-to rerun — an upload, a payment — is worse than a failure you can see. Opt in where a task is safe
-to run again. Same three levels, nearest wins:
-
-```python
-class App(BaseApp):
-    taskMaxAttempts = 3             # app
-    taskRetryDelay = 30             # seconds before a retry (default 60)
-
-app.task.maxAttempts = 5            # engine
-app.task.schedule(App.sync(...), maxAttempts=4, retryDelay=5)   # task
-app.task.schedule(App.charge(...), maxAttempts=1)               # task: never retried
-```
+to rerun — an upload, a payment — is worse than a failure you can see. Opt in with `maxAttempts`
+where a task is safe to run again.
 
 A task that raises with attempts left is put back as `pending`, claimable after `retryDelay`
-seconds. `error` holds the last failure, and is cleared if a later attempt succeeds. Schedulers
-stamp both onto what they emit. `wait()` treats a task waiting for a retry as unfinished.
+seconds. `error` holds the last failure, and is cleared if a later attempt succeeds. `wait()`
+treats a task waiting for a retry as unfinished.
 
 **A crash counts as an attempt.** A worker that dies mid-task leaves it `processing` with a lapsing
 lease, and the next worker reclaims it — but if that claim would exceed `maxAttempts`, the task is
@@ -398,16 +386,16 @@ emitting into the one task engine.
 class App(BaseApp):
     globalOps  = schedulers()                                    # pymonque_schedulers_globalOps
     accountOps = schedulers(AccountScheduler, "account_ops")
-    groupOps   = schedulers(GroupScheduler, Groups_Collection, policy="skip")
+    groupOps   = schedulers(GroupScheduler, Groups_Collection, missed="skip")
 ```
 
 ```python
 schedulers(schedulerModel: type[Scheduler] = Scheduler,
            schedulersCollection: Collection | str | None = None,
-           policy: OVERDUE_SCHEDULES_POLICY | None = None,   # default: the app's
-           pollInterval: float | None = None,                # default: the app's
-           taskEngine: TaskEngine | None = None,             # default: app.task
-           extraIndexes: Sequence[IndexModel] | None = None)
+           missed: "skip" | "once" | "replay" | None = None,  # default: the app's schedulerMissed
+           pollInterval: float | None = None,                 # default: the app's
+           extraIndexes: Sequence[IndexModel] | None = None,
+           leaseSeconds: float | None = None)                 # default: the app's
 ```
 
 They land in `app.schedulerEngines` and are reachable as `app.<name>`. `app.startWorkers()` starts
@@ -497,7 +485,8 @@ happens against the real emitted call rather than a placeholder.
 | `work` | `CallSpec` emitted on each fire |
 | `distribution` | `CallSpec` producing the interval |
 | `deadline` | `datetime` |
-| `timeout` / `skipAfter` / `maxAttempts` / `retryDelay` | stamped onto every task it emits |
+
+A scheduler carries no limits: what it emits runs under its task's.
 
 Being worked is a live lease, not a status. A disabled scheduler is still claimed and still walks
 its deadline, so its distribution keeps its shape for when it is enabled again — it just emits
@@ -506,8 +495,8 @@ nothing, and has nothing to warn about.
 ## Distributions
 
 All take `dailyFrequency` — average runs per day — and return a `timedelta`. It must be
-positive: zero divides, and a negative interval walks a scheduler backwards, which no overdue
-policy can stop. `DistributionValidationError` either way, and `gen()` rejects a non-positive
+positive: zero divides, and a negative interval walks a scheduler backwards, which no missed-beats
+rule can stop. `DistributionValidationError` either way, and `gen()` rejects a non-positive
 interval from a custom distribution too.
 
 | Name | Extra argument |
@@ -639,7 +628,7 @@ Workers check in every `heartbeatInterval` seconds and are considered gone after
 cleanup — and a crashed process frees its slot within a minute.
 
 **What the fingerprint can and cannot see.** It sees added, removed, or re-signatured tasks and
-distributions, the scheduler policies, and the task and item limits. It does **not** see a changed function body, and cannot: that would require hashing
+distributions, every task's and pile's limits, and each scheduler engine's `missed`. It does **not** see a changed function body, and cannot: that would require hashing
 every transitive dependency. It is a guard against the obvious mistake, not a proof of identity.
 The rule is the guarantee; the hash only enforces the part of it that is mechanically checkable.
 
@@ -718,25 +707,27 @@ process's task list, so a process holding a different one must not run it — ot
 importing half the app could write off a live deployment's tasks. Everything it does is
 otherwise scoped to documents nobody holds, so it cannot take work from a running worker.
 
-## Policies
+## Missed beats
 
-There is one, declared on the app class and applied every time a scheduler is claimed — a
-scheduler falls behind while an app is running just as easily as while it is down.
+What a scheduler owes for beats that went by unworked. Declared per scheduler engine,
+`schedulers(..., missed="skip")`, with the app's `schedulerMissed` for the engines that don't, and
+applied every time a scheduler is claimed — a scheduler falls behind while an app is running just as
+easily as while it is down.
 
-Tasks and piles have no policy: a late task is governed by [`skipAfter`](#skipafter), and a
-failing task or item by [`maxAttempts`](#retries).
-
-| `overdueSchedulersPolicy` | when a whole beat has gone by unworked |
+| `missed` | when a whole beat has gone by unworked |
 |---|---|
-| `"execute once"` | emit one task, then resume from now (default) |
-| `"execute reconstructed"` | replay the backlog beat by beat, one per poll |
+| `"once"` | emit one task, then resume from now (default) |
+| `"replay"` | emit every missed beat, one per poll, keeping the original rhythm |
 | `"skip"` | emit nothing, resume from now |
 
 A scheduler that is merely due — its deadline has passed but the next one has not — emits
-normally under all three. The policy only decides what is owed for beats that were missed.
-`"execute reconstructed"` is the only one that can stay permanently behind: a scheduler set
-faster than its workers can serve it will keep a backlog forever. It logs `missed a beat` on
-every claim so you can see that happening.
+normally under all three; `missed` only decides what is owed for beats that were missed.
+`"replay"` is the only one that can stay permanently behind: a scheduler set faster than its
+workers can serve it will keep a backlog forever. It logs `missed a beat` on every claim so you
+can see that happening. An unknown value is refused where it is written.
+
+Nothing else is a policy: a late task is governed by its [`skipAfter`](#skipafter), and a failing
+task or item by its [`maxAttempts`](#retries).
 
 A worker never claims a task it cannot run — the claim filters on the function names it has — so
 an unrecognised task waits rather than failing.
@@ -778,8 +769,8 @@ document has no `leaseUntil`, and 2.0 never claims one without it.
 | 0.x | 2.0 |
 |---|---|
 | `class Queue(BaseQueue)` | `class App(BaseApp)` |
-| `super().__init__(db, overdueSchedulersPolicy="skip")` | `overdueSchedulersPolicy = "skip"` on the class |
-| `overdueTaskPolicy` | gone — `taskSkipAfter` covers work that went stale, for any reason |
+| `super().__init__(db, overdueSchedulersPolicy="skip")` | `schedulerMissed = "skip"` on the class, or `missed=` on one `schedulers(...)`; `"execute once"` is now `"once"`, `"execute reconstructed"` is `"replay"` |
+| `overdueTaskPolicy` | gone — `skipAfter` on `@task(...)`, or `taskSkipAfter` for every task, covers work that went stale for any reason |
 | `SchedulerEngine(self, schedulersCollection=..., policy=...)` in `__init__`, then `engine.init()` | `accountOps = schedulers(AccountScheduler, "accountOperations")` on the class |
 | `taskPoolInterval`, `schedulerPoolInterval`, `engine.poolInterval` | `taskPollInterval`, `schedulerPollInterval`, `engine.pollInterval` |
 | constructing the queue ran `init()` | only `startWorkers()` runs it — constructing is safe from any process |
@@ -787,9 +778,9 @@ document has no `leaseUntil`, and 2.0 never claims one without it.
 | context merged into `work.kwargs` by hand | `emitWork()` on a `Scheduler` subclass — see [Schedulers](#schedulers) |
 | `pymonque.mongo.MongoModel` | gone. `model_dump()` is pydantic's, and `None` is stored as null |
 
-Two defaults to check: a `SchedulerEngine` built by hand in 0.x defaulted to `"execute reconstructed"`,
-while a declared one takes the app's `overdueSchedulersPolicy` (`"execute once"`). And tasks are still
-not retried unless you set `taskMaxAttempts`.
+Two defaults to check: a `SchedulerEngine` built by hand in 0.x defaulted to `"execute reconstructed"`
+— `"replay"` — while a declared one takes the app's `schedulerMissed` (`"once"`). And tasks are still
+not retried unless a task declares `maxAttempts`, or the app sets `taskMaxAttempts`.
 
 ### Data
 
@@ -850,8 +841,8 @@ Deliberate trade-offs and edges that are not handled, so none of them comes as a
 - **`save()` on a task waiting for a retry keeps the retry time,** even if you change its deadline.
   Set `leaseUntil` yourself to move it. A task waiting for its first run, or a scheduler, moves its
   lease with its deadline.
-- **Pile limits are per pile or per app, not per item.** `add(**kwargs)` treats its keyword
-  arguments as the item's data, so there is no room for per-item settings.
+- **Limits are per task, not per call, and per pile, not per item.** They describe the work, so
+  they are declared with it. To run one function under two sets of limits, declare two tasks.
 - **A scheduler whose task is gone warns on every beat** until you remove it, disable it, or put
   the task back.
 - **`work()` treats `SystemExit` as a failure, like a task does, but not `KeyboardInterrupt`.** A

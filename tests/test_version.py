@@ -197,7 +197,7 @@ def test_the_heartbeat_keeps_a_worker_live(db):
     assert len(app.liveWorkers()) == 1
 
 
-# --- policies are shared behaviour, so they are part of the fingerprint ---
+# --- defaults are shared behaviour, so they are part of the fingerprint ---
 
 def test_two_apps_of_one_class_always_agree_on_limits(db):
     class App(ExampleApp):
@@ -223,8 +223,8 @@ def test_an_item_limit_change_is_a_different_fingerprint(db):
     assert Once(db).fingerprint != OwnDelay(db).fingerprint
 
 
-def test_the_scheduler_policy_reaches_the_fingerprint(db):
-    changed = appWith(ExampleApp, db, overdueSchedulersPolicy="skip")
+def test_the_missed_rule_reaches_the_fingerprint(db):
+    changed = appWith(ExampleApp, db, schedulerMissed="skip")
 
     assert ExampleApp(db).fingerprint != changed.fingerprint
 
@@ -246,8 +246,8 @@ def test_a_limit_mismatch_cannot_run_workers_alongside(db):
         running.stopWorkers()
 
 
-@pytest.mark.parametrize("setting", [{"overdueSchedulersPolicy": "skip"}, {"itemMaxAttempts": 3}])
-def test_a_policy_or_limit_is_not_a_constructor_argument(db, setting):
+@pytest.mark.parametrize("setting", [{"schedulerMissed": "skip"}, {"itemMaxAttempts": 3}])
+def test_a_default_is_not_a_constructor_argument(db, setting):
     with pytest.raises(TypeError):
         ExampleApp(db, **setting)
 

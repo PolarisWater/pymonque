@@ -301,7 +301,7 @@ def test_indexes_back_the_claim_query(app):
     assert (("uid", 1),) in keys
 
 
-# --- restart policies ---
+# --- abandoned items ---
 
 def test_a_live_lease_survives_a_new_instance(db, app):
     app.outbox.add(to="a@b.c")
