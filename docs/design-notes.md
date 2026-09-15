@@ -6,6 +6,52 @@ Finding ids (B1, P3, N2…) refer to the engine anatomy review of `c3e75e2`.
 The library is to be rebuilt rather than refactored further; `docs/rebuild.md` gathers everything
 here, plus the invariants the rebuild must keep and the decisions to make before building.
 
+## Decided while building
+
+### Layer 1: settings, declarations, documents, calls
+
+Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made along the way:
+
+- **Two kinds of declaration error.** A bad value raises pydantic's `ValidationError` naming the
+  setting; a setting that does not exist raises `TypeError` naming it. Settings removed since 2.0
+  (`maxAttempts` / `retryDelay` on `@task`; `retryDelay`, `itemsCollection`, `payload` on `pile`;
+  `schedulersCollection`, `schedulerModel`, `policy` on `schedulers`; `tasksCollection` on `tasks`)
+  say what became of them. Removed app defaults (`taskMaxAttempts`, `taskRetryDelay`,
+  `itemMaxAttempts`, `itemRetryDelay`) are refused the same way by `AppDefaults.of()`, which layer 4
+  calls when an app class is defined.
+- **The model and the collection by position, the rest by keyword:** `pile(Email, "outbox_items",
+  maxAttempts=3)`. The model argument is called `model` on every kind.
+- **`collection(key=)` must name a field of the model,** checked where written. An aliased key is
+  stored, indexed and queried under its alias.
+- **A declaration resolves itself; an engine takes what was resolved.** `collectionIn(db)` gives the
+  collection — given, named, or the default name. `settingsWith(defaults)` gives a frozen
+  `TaskEngineSettings`, `SchedulerEngineSettings` or `PileSettings`, and `@task`'s
+  `limitsWith(defaults)` a `TaskLimits`: the shared settings the fingerprint will hash.
+  `CollectionEngine(collection, model, name=, key=, extraIndexes=)` takes no app. `pollInterval`
+  stays on `tasks()` / `schedulers()` as pacing, outside those settings.
+- **Declarations have no `__get__`.** Class access gives the declaration; the intent for layer 4 is
+  that the app sets each part it builds on the instance, under the same name.
+- **Call arguments are checked with a TypedDict built from the signature,** not a pydantic model, so
+  a parameter may have any name (`_private`, `model_config`), and arguments left out stay left out:
+  the function applies its own defaults. The app's tasks and a distribution registry are both a
+  `Functions` — `build`, `validate`, `call`.
+- **`@task` names its call after the attribute it is declared as;** `self` may be positional-only,
+  and an instance task without `self` is refused where written.
+- **`emitsInto` accepts an engine the class inherits** (`schedulers(emitsInto=Parent.heavy)`) and
+  refuses one the same class body replaces. Open for layer 4: a subclass that later replaces the
+  engine an inherited scheduler engine emits into. Proposed: follow the name, as a subclass's
+  redefinition replaces the parent's.
+- **Documents.** `build()` gives a document bound to its engine but not stored: `storedKey` is set
+  only once it is written, and cleared by `delete()`. An `update()` that changes the key returns the
+  renamed document. MongoDB's `_id` is dropped on load, so a model forbidding extras still loads. The
+  time fields of `Task`, `Scheduler` and `Item` turn an aware datetime into naive UTC.
+- **Distributions:** `stdFraction` and `sigma` must be ≥ 0; a registry must subclass
+  `BaseDistributions`.
+- **Left for later layers,** because they need an engine or `BaseApp`: a declaration named `task` or
+  `scheduler` replacing the default; reserved names; app defaults checked at class definition;
+  `Task.runWork()` and `Scheduler.taskFields()`; emitting and scheduling. Checklist items that
+  straddle layers stay unticked until their last part has a test.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen
@@ -38,9 +84,10 @@ here, plus the invariants the rebuild must keep and the decisions to make before
   - ~~how a scheduler engine names its task engine~~ — decided: a reference,
     `schedulers(emitsInto=heavy)`, declared above; left out means the default engine;
   - an int worker count covers the default task engine too (decided);
-  - the collection name of a declared task engine (`pymonque_tasks_<name>`, matching schedulers);
+  - ~~the collection name of a declared task engine~~ — decided: `pymonque_task_<name>` (rebuild §5.6);
   - how `init()`, the backlog warning and the fingerprint span several task engines;
-  - whether the declaration can shape the engine's model, collection and indexes (the rest of B5).
+  - ~~whether the declaration can shape the engine's model, collection and indexes~~ — decided: yes,
+    see custom tasks (rebuild §5.9).
 
 ### `with pile.work() as w:` — done, fail or release end the block early
 
@@ -123,8 +170,7 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
   task by hand. Revisit after several task engines. (Cancelling an item is decided, above.)
 - **A hold duration for pile items,** like a task's `executionTime`. To be designed as something
   modular after several task engines, rather than forced onto items now.
-- **Not yet discussed:** B6 (three claim-identity mechanisms), P1–P4 (setting placement and
-  fingerprint coverage), N1–N7 (naming).
+- ~~Not yet discussed: B6, P1–P4, N1–N7~~ — all decided, in rebuild §5.
 
 ## Deliberate, not asymmetries
 

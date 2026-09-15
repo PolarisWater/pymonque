@@ -1,6 +1,5 @@
 .pytest_cache
 .venv
-src/pymonque/__pycache__
-tests/__pycache__
+__pycache__/
 .env
 .coverage

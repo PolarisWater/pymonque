@@ -15,17 +15,23 @@ threads), **scheduler engines** (recurring schedules that emit tasks), **piles**
 tasks), **distributions** (interval functions for schedulers).
 
 - Python ≥ 3.13, pydantic 2, pymongo 4. Tests use mongomock.
-- Package version 2.0.0; all code today lives in `src/pymonque/core.py` (~2,750 lines).
-- Run tests with `uv run pytest` — there is no `python` on PATH; use `uv run python`.
+- Package version 2.0.0; the current library lives in `src/pymonque/core.py` (~2,750 lines). The
+  rebuild grows beside it in `src/pymonque_next/`, tested in `tests_next/`.
+- Run tests with `uv run pytest` (both suites; `uv run pytest tests_next` for the rebuild alone) —
+  there is no `python` on PATH; use `uv run python`.
 
 ## Where things stand
 
 - **The library is being rebuilt, not refactored.** Too many fixes were fitted onto a shape that grew
-  one kind at a time. The rebuild is designed in full; no rebuild code exists yet.
+  one kind at a time. The rebuild is designed in full.
+- **Layer 1 is built:** settings, declarations, documents, calls, distributions, and the `Task`,
+  `Scheduler` and `Item` models — 240 tests in `tests_next/`. The small decisions made along the way,
+  and what it leaves for later layers, are in `design-notes.md` under "Decided while building".
+  **Next: layer 2**, claims and task engines.
 - **Branches:** `main` holds the current library and all docs. `rebuild` was branched from it and
-  holds the checklist and this file. Neither is pushed — `main` is ahead of `github/main` by the doc
-  commits since `fe85e6b`.
-- The old package passes all 482 tests and stays untouched until the new one replaces it.
+  holds the checklist, this file and the rebuild code. Neither is pushed — `main` is ahead of
+  `github/main` by the doc commits since `fe85e6b`.
+- The old package passes all 540 of its tests and stays untouched until the new one replaces it.
 
 ## Working rules
 

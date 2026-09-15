@@ -71,7 +71,7 @@ nothing; **New** — no old test, decided since.
 - [ ] A live holder is not taken over [piles]
 - [ ] An abandoned item with tries left is claimed again; out of tries it is given up at the next claim, without blocking the next item [piles]
 - [ ] A given-up item cannot be finished by its old holder [claims]
-- [ ] A pile can override the app's max tries; a bad value fails where it is written [piles, declarations]
+- [x] A pile can override the app's max tries; a bad value fails where it is written [piles, declarations]
 - [ ] A pile can declare extra indexes [piles]
 - [ ] `release` puts the item back in its own place, is claimed afresh, gives the try back, and needs a claim [piles, claims]
 - [ ] **Changed:** `fail()` is final, always — not only by uid or by default [piles]
@@ -126,7 +126,7 @@ nothing; **New** — no old test, decided since.
 - [ ] **Changed:** `ensure` takes context fields, stays idempotent, can change context, validates through `taskFields()` and the target task's `runWork()` [engines]
 - [ ] `delete` and `deleteMany` [engines]
 - [ ] **Changed:** schedulers share the default task engine unless `emitsInto=<declaration>` names another [engines]
-- [ ] **New:** `emitsInto` must reference a declaration above it on the same app class
+- [x] **New:** `emitsInto` must reference a declaration above it on the same app class
 
 ## Task engines
 
@@ -186,53 +186,53 @@ nothing; **New** — no old test, decided since.
 ## Declarations
 
 - [ ] A bad setting fails where it is written and names itself; a bad app default fails at class definition [declarations, limits]
-- [ ] Settings coerce like pydantic fields [declarations]
-- [ ] Left-out settings take the app's defaults; given ones win; `None` only means no limit [declarations, limits]
-- [ ] An existing collection object is accepted [declarations]
-- [ ] A bare task takes the defaults; a declared limit wins, the rest default; both decorator forms work [limits]
+- [x] Settings coerce like pydantic fields [declarations]
+- [x] Left-out settings take the app's defaults; given ones win; `None` only means no limit [declarations, limits]
+- [x] An existing collection object is accepted [declarations]
+- [x] A bare task takes the defaults; a declared limit wins, the rest default; both decorator forms work [limits]
 - [ ] A task runs under its function's limits; declared once; calls, stored tasks and schedulers carry no limits [limits]
 - [ ] A declaration or task cannot shadow the app; the reserved names cover every attribute `__init__` sets [app]
-- [ ] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)` (N1)
-- [ ] **Changed:** declarations `tasks` / `schedulers` / `pile` / `collection` / `@task`; defaults `task*`, `pile*`, `scheduler*` (N3)
-- [ ] **Changed:** collections `pymonque_task_<name>`, `pymonque_scheduler_<name>`, `pymonque_pile_<name>`; defaults `pymonque_task` and `pymonque_scheduler`, taken over by a declaration of that name (N2)
-- [ ] **New:** lease defaults `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds` (300), overridden by `leaseSeconds=` on a declaration
-- [ ] **Changed:** status vocabulary `pending` / `running` / `done` / `failed` / `canceled` (+ task-only `timeout`, `outdated`, `incompatible`) (N4)
+- [x] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)` (N1)
+- [x] **Changed:** declarations `tasks` / `schedulers` / `pile` / `collection` / `@task`; defaults `task*`, `pile*`, `scheduler*` (N3)
+- [x] **Changed:** collections `pymonque_task_<name>`, `pymonque_scheduler_<name>`, `pymonque_pile_<name>`; defaults `pymonque_task` and `pymonque_scheduler`, taken over by a declaration of that name (N2)
+- [x] **New:** lease defaults `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds` (300), overridden by `leaseSeconds=` on a declaration
+- [x] **Changed:** status vocabulary `pending` / `running` / `done` / `failed` / `canceled` (+ task-only `timeout`, `outdated`, `incompatible`) (N4)
 
 ## Calls
 
-- [ ] The string form and the class form build the same call spec [tasks]
-- [ ] Unknown task, missing, unknown or wrongly typed argument refused; an optional one may be omitted; an instance task does not expect `self` [tasks, specs]
-- [ ] `*args` and positional-only refused where written; `**kwargs` accepts extras but checks the named ones [guards]
-- [ ] Unannotated accepts anything; an `Annotated` constraint is enforced [guards, specs]
-- [ ] CallSpec: packs kwargs, dispatches against a mapping or an object, `KeyError` on unknown, roundtrips through Mongo [specs]
-- [ ] `bind` merges kwargs, overrides without touching the original [engines]
-- [ ] FuncSpec: class access gives one, calling it builds a CallSpec; instance access runs a staticmethod or binds an instance task [specs]
-- [ ] Tasks are discovered across the MRO; a subclass overrides; a plain method is not a task [specs]
-- [ ] Staticmethods collected through the MRO, the child's wins; `uuid4str` unique [specs]
+- [x] The string form and the class form build the same call spec [tasks]
+- [x] Unknown task, missing, unknown or wrongly typed argument refused; an optional one may be omitted; an instance task does not expect `self` [tasks, specs]
+- [x] `*args` and positional-only refused where written; `**kwargs` accepts extras but checks the named ones [guards]
+- [x] Unannotated accepts anything; an `Annotated` constraint is enforced [guards, specs]
+- [x] CallSpec: packs kwargs, dispatches against a mapping or an object, `KeyError` on unknown, roundtrips through Mongo [specs]
+- [x] `bind` merges kwargs, overrides without touching the original [engines]
+- [x] FuncSpec: class access gives one, calling it builds a CallSpec; instance access runs a staticmethod or binds an instance task [specs]
+- [x] Tasks are discovered across the MRO; a subclass overrides; a plain method is not a task [specs]
+- [x] Staticmethods collected through the MRO, the child's wins; `uuid4str` unique [specs]
 
 ## Distributions
 
-- [ ] `constant` is exact; every distribution gives a positive interval; mean matches the daily frequency; `normal` never negative [distributions, guards]
-- [ ] The registry walks the MRO; a custom registry extends the built-ins; the default does not see custom ones [distributions]
-- [ ] Calling builds and validates a CallSpec; unknown, missing, unknown or wrongly typed argument refused [distributions]
-- [ ] `gen` produces an interval, coerces what validation accepted, refuses a wrong return type [distributions]
+- [x] `constant` is exact; every distribution gives a positive interval; mean matches the daily frequency; `normal` never negative [distributions, guards]
+- [x] The registry walks the MRO; a custom registry extends the built-ins; the default does not see custom ones [distributions]
+- [x] Calling builds and validates a CallSpec; unknown, missing, unknown or wrongly typed argument refused [distributions]
+- [x] `gen` produces an interval, coerces what validation accepted, refuses a wrong return type [distributions]
 - [ ] A frequency that cannot give a positive interval is refused; a custom dead interval is refused; a scheduler cannot be built on one [guards]
 
 ## Documents
 
-- [ ] Collections are collected, default to their attribute name, can name an existing collection; class access gives the declaration; a subclass overrides [collections]
-- [ ] The key is indexed uniquely; a custom key is used throughout; a duplicate is refused [collections]
+- [x] Collections are collected, default to their attribute name, can name an existing collection; class access gives the declaration; a subclass overrides [collections]
+- [x] The key is indexed uniquely; a custom key is used throughout; a duplicate is refused [collections]
 - [ ] A task can reach a collection [collections]
-- [ ] `create`, `insert`, `insertMany` (nothing is a no-op), `save` replaces or creates, `update` merges without reading [collections]
-- [ ] `delete`, `deleteMany`, `get` misses cleanly, `findOne`, `find` filters/sorts/limits, `count` and `exists` [collections]
-- [ ] Documents come back typed; a field can be set back to `None`; a saved document stores its `None`s [collections]
-- [ ] `update` accepts nested models, rejects unknown or invalid fields, `None` for a missing document [collections]
-- [ ] Created, fetched and inserted documents are bound; a handmade one is not until stored; binding is not stored [collections, lifecycle]
-- [ ] A bound document saves, deletes and reloads itself, using the key it was stored under [collections, lifecycle]
-- [ ] Changing the key renames rather than copies; saving again after a rename keeps one row [lifecycle]
+- [x] `create`, `insert`, `insertMany` (nothing is a no-op), `save` replaces or creates, `update` merges without reading [collections]
+- [x] `delete`, `deleteMany`, `get` misses cleanly, `findOne`, `find` filters/sorts/limits, `count` and `exists` [collections]
+- [x] Documents come back typed; a field can be set back to `None`; a saved document stores its `None`s [collections]
+- [x] `update` accepts nested models, rejects unknown or invalid fields, `None` for a missing document [collections]
+- [x] Created, fetched and inserted documents are bound; a handmade one is not until stored; binding is not stored [collections, lifecycle]
+- [x] A bound document saves, deletes and reloads itself, using the key it was stored under [collections, lifecycle]
+- [x] Changing the key renames rather than copies; saving again after a rename keeps one row [lifecycle]
 - [ ] The task, scheduler and pile engines are collection engines [collections]
-- [ ] `utc_now` is naive UTC; `model_dump` keeps `None` and falsy values and is still pydantic's own [models]
-- [ ] Task defaults, unique uids, unknown status refused; `executionTime` accepts, rejects nonsense, serialises to seconds [models]
+- [x] `utc_now` is naive UTC; `model_dump` keeps `None` and falsy values and is still pydantic's own [models]
+- [x] Task defaults, unique uids, unknown status refused; `executionTime` accepts, rejects nonsense, serialises to seconds [models]
 - [ ] A task roundtrips through Mongo; emit stamps the factory; scheduler defaults [models]
 
 ### Timestamps

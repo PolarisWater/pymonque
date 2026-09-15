@@ -186,7 +186,7 @@ home:
 pymonque/
   app.py            BaseApp: construction, registries, reserved names, run/stop, signals
   declarations.py   collection / tasks / schedulers / pile / @task, and their checks
-  settings.py       the shared constraints, TaskLimits, ItemLimits, AppDefaults, the "left out" marker
+  settings.py       the shared constraints, TaskLimits, engine and pile settings, AppDefaults, the "left out" marker
   documents.py      Document, CollectionEngine, bound documents, validated update
   claims.py         leases, claim ids, renewal, the worker loop
   tasks.py          Task, TaskEngine: execute, timeouts, skipAfter, cancel, wait
