@@ -271,7 +271,9 @@ before layer 4.
       exit with a code of its own.
 11. **Housekeeping and versions across several task engines — Open, before layer 4.** How `init()`
     (flagging incompatible tasks), the backlog warning and the fingerprint span more than one task
-    engine: per engine or for the app as a whole, and what the warning names.
+    engine: per engine or for the app as a whole, and what the warning names. Already decided to
+    belong here: housekeeping also writes off a task left `running` by a dead worker whose function
+    has since gone (no engine claims it), as `failed` with the worker-died error.
 
 Also settled with these:
 - **Worker counts:** an int means that many threads on every engine of the kind, the default task

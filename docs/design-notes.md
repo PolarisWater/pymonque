@@ -89,15 +89,23 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
   app calls it, and across which engines, is §5.11.
 - **In tests,** mongomock's `find_one_and_update` finds, then updates by `_id`, so two threads can
   take one document. `tests_next/conftest.py` locks it, standing in for MongoDB's atomic claim.
-- **Open:**
-  - Calling a task engine (`app.accountTasks("sync")`) checks the whole call against the signature,
-    as calling the distribution engine does. On an engine whose `Task` supplies an argument through
-    `runWork()`, that refuses the call for the very argument the task would supply; the class form
-    `App.sync()` builds it unchecked, and `schedule()` checks it. The alternative: calling the engine
-    checks only the arguments given, and `schedule()` checks the rest.
-  - A task left `running` by a dead worker, whose function has since gone, is claimed by no engine —
-    a claim only takes tasks it can run — so it stays `running`. For §5.11: `flagIncompatible()`
-    could write those off as well.
+- **Decided after review:**
+  - **Calling a task engine checks only the arguments given** (`app.accountTasks("sync")`): unknown
+    names and the types of what is given. `runWork()` may supply any argument, so completeness is
+    left to `schedule()`, which checks the call as `runWork()` returns it. Calling a distribution
+    engine keeps the full check, since nothing adds arguments to a distribution; the docs say why
+    the two differ, in one sentence.
+  - **A task left `running` by a dead worker whose function has since gone is written off by
+    housekeeping,** alongside `flagIncompatible()`: marked `failed` with the worker-died error, not
+    `incompatible`, since its worker died before its function went. Same version check; part of
+    §5.11.
+- **Fixes to make before layer 3** (from the layer 2 review):
+  - **An engine refuses a function with no `limits` entry,** as it refuses an entry with no function.
+    `limitsFor` no longer falls back to no limits, so a task left out of the map by the app cannot
+    silently lose `taskTimeout` / `taskSkipAfter`. The app (layer 4) passes every task's resolved
+    limits, defaults filled in.
+  - **`work()` writes the outcome inside `leases.holding(...)`,** so a claim is renewed until its
+    outcome is written, not only until its call returns.
 
 ## Decided, not built yet
 
