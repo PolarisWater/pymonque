@@ -64,16 +64,22 @@ with app.outbox.work() as w:
   - `w.done(result)`, `w.fail(error)` or `w.release()` → that outcome, and the block ends there;
   - the claim was lost meanwhile (lease lapsed, taken over, cancelled) → nothing is written, and it is
     logged.
-- **Only the block ends.** Python can only leave a block by raising, so the three bound methods
-  raise a private `_Ended(claimId, outcome, value)`, derived from `BaseException` so
-  `except Exception:` in the block does not catch it. `work()` catches it, records the outcome and
-  suppresses it: the code after the `with` carries on, and nothing outside sees an exception.
+- **Write first, then end the block.** `w.done()`, `w.fail()` and `w.release()` record the outcome
+  immediately — which clears the claim and stops lease renewal — and only then raise a private
+  `_Ended(claimId)` to leave the block. Python can only leave a block by raising; `_Ended` derives
+  from `BaseException` so `except Exception:` in the block does not catch it. `work()` catches it
+  and suppresses it: the code after the `with` carries on, and nothing outside sees an exception.
   Helpers and loops inside the block are unwound on the way; `finally` and inner `with` cleanups run.
 - `work()` handles only its own claim's `_Ended` and re-raises anyone else's, so nested blocks end
   the right item.
 - `pile.done/fail/release(item)` called outside a block write directly and do not raise.
-- Caveat to document: a bare `except:` or `except BaseException:` inside the block swallows the
-  early end, and the block carries on to whatever outcome it reaches next.
+- **If something swallows the early end** — a bare `except:`, `except BaseException:`,
+  `contextlib.suppress(BaseException)`, or `return`/`break`/`continue` in a `finally` — the outcome
+  is already stored and stays: when the block later reaches its end or raises, the claim check finds
+  the claim gone and writes nothing, and `work()` logs a warning that the block kept running after
+  `w.release()` (or done/fail). What it cannot undo is the code that ran after the call: after a
+  release or fail, another worker may already hold the item while this block carries on. Caveat to
+  document.
 - **In the final docs:** the main pile example is the `with` block. The docs cover that `done`,
   `fail` and `release` all end it, and everything the block does for you — lease renewal, the claim
   check on every outcome, done at the end, fail on an exception, the lost-claim case — with the
