@@ -227,5 +227,7 @@ agreed yet.
 4. **Port the tests by behaviour, not by file,** writing them against the new declarations rather
    than patching the old ones.
 5. **Write the reference and README from the new shape,** and an upgrade section covering renamed
-   declarations, statuses and document fields.
+   declarations, statuses and document fields. Examples the docs must include:
+   - releasing an item mid-block in `with pile.work() as w:` — the example in
+     `docs/design-notes.md`, with the bare `except:` caveat beside it.
 6. **Replace the old package** once the checklist is covered.

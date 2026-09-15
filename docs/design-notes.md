@@ -65,6 +65,7 @@ with app.outbox.work() as w:
 - `pile.release(item)` outside a block writes directly and does not raise.
 - Caveat to document: a bare `except:` or `except BaseException:` inside the block swallows the
   release, and the item is marked done at the end.
+- The example above goes into the final docs (README or reference), with the caveat beside it.
 - Open: whether `w.done(result)` and `w.fail(error)` end the block early the same way.
 
 ## Proposed, not decided
