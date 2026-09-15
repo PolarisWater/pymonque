@@ -8,6 +8,17 @@ here, plus the invariants the rebuild must keep and the decisions to make before
 
 ## Decided, not built yet
 
+### No task retries; piles hold work that has to happen
+
+- The model was clean from the start: schedulers "never" fail, and tasks either work or fail. A task
+  that must succeed retries inside its own code; one that may fail needs no retry.
+- Task `maxAttempts` and `retryDelay`, and the app's `taskMaxAttempts` / `taskRetryDelay`, go.
+  A task whose worker dies is written off as failed, never rerun.
+- Pile items keep tries, because the task holding one can die before freeing it. An item's lease
+  lapsing (no response) or its holder releasing it (free) counts as a try. `fail()` is final: the
+  item is marked failed and never claimed again. No retry delay.
+- Max tries is set at two levels: an app default and each pile's declaration.
+
 ### Several task engines (B5, which also settles B1)
 
 - An app may declare more than one task engine, each with its own collection.
@@ -65,7 +76,7 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
 
 - **Schedulers have no retries, timeouts or staleness rule beyond `missed`.** Emitting is a database
   read and write, assumed not to fail; tasks can fail all day.
-- **Pile items have leases and retries** because the task holding an item can die before it
-  releases it.
+- **Pile items have leases and tries, tasks have neither retries nor tries** because the task
+  holding an item can die before it releases it, while a task either works or fails.
 - **Tasks record `executionTime`** because the library was built in part to fit a system that
   needed it.

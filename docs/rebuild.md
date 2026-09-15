@@ -28,15 +28,19 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
 - A lapsed lease makes the work claimable by anyone. No restart, sweep or coordinator.
 - **Only the current claim writes an outcome.** A worker whose lease lapsed cannot overwrite a
   cancel, or the worker that took over. (Today this is three mechanisms — B6; see §5.)
-- A renewal never overwrites a value an outcome write set, such as a retry time.
+- A renewal never overwrites an outcome.
 
-**Failure**
-- A crash counts as an attempt: running out of attempts at claim means the last run never reported
-  back, and the work is given up on rather than handed to the next worker.
-- One attempt by default. Retrying is opt-in, because rerunning a side effect nobody asked to rerun
-  is worse than a failure you can see.
-- A timeout frees the worker and writes the task off; it is never retried, since the call may still
-  be running.
+**Failure — Decided: no task retries**
+- Schedulers are assumed never to fail; tasks may fail, and nothing retries them. A task that must
+  succeed retries inside its own code; one that may fail just fails. Rerunning a side effect nobody
+  asked to rerun is worse than a failure you can see.
+- A task runs at most once. If its worker dies (the lease lapses), the task is written off as failed,
+  not handed to the next worker — it may have done half its work.
+- A timeout frees the worker and writes the task off, since the call may still be running.
+- Work that has to happen survives a dead process through a pile: the item holds it, a task drains
+  it. An item's lease lapsing, or its holder releasing it, counts as a try and puts it back to be
+  claimed; running out of tries gives it up. `fail()` is final — the item is marked failed and never
+  claimed again. Items have no retry delay.
 - `sys.exit()` in work is a failure, not a dead worker thread.
 - A result the driver cannot encode is checked before writing, and recorded as a failure.
 
@@ -134,13 +138,14 @@ a scheduler's context to the tasks it emits. Details in `docs/design-notes.md`.
 
 | | Declared on | App default | Stored on documents |
 |---|---|---|---|
-| Task limits: `timeout`, `skipAfter`, `maxAttempts`, `retryDelay` | `@task(...)` | `task*` | no |
-| Item limits: `maxAttempts`, `retryDelay` | `pile(...)` | `item*` (N3) | no |
+| Task limits: `timeout`, `skipAfter` | `@task(...)` | `task*` | no |
+| Item tries: `maxAttempts` — lapsed leases and releases | `pile(...)` | `item*` (N3) | no |
 | Missed beats: `skip`, `once`, `replay` | `schedulers(...)` | `schedulerMissed` | no |
 
 Deliberate differences, not asymmetries: schedulers have no retries, timeouts or staleness rule,
-because emitting is a database write assumed not to fail; items have leases and retries because the
-task holding one can die before releasing it; only tasks record `executionTime`.
+because emitting is a database write assumed not to fail; tasks have no retries, because a task
+either works or fails; items have tries because the task holding one can die before releasing it;
+only tasks record `executionTime`.
 
 ### Documents — Keep, with one Open question
 
@@ -148,7 +153,7 @@ task holding one can die before releasing it; only tasks record `executionTime`.
 |---|---|---|---|
 | When | `deadline` | `deadline` | `createdAt` |
 | Moments | `createdAt`, `claimedAt`, `finishedAt` | — | `createdAt`, `claimedAt`, `finishedAt` |
-| Outcome | `result`, `error`, `attempts` | — | `result`, `error`, `attempts` |
+| Outcome | `result`, `error` | — | `result`, `error`, `attempts` |
 | Duration | `executionTime` | — | on hold — a modular hook, not forced |
 
 ## 4. Code layout — Proposed
@@ -174,32 +179,36 @@ pymonque/
 
 ## 5. Decide before building — Open
 
-Ordered by how much of the shape depends on them.
+Ordered by how much of the shape depends on them. Each carries the recommended answer; none is
+agreed yet.
 
 1. **Claim identity (B6).** One `claimId` on every claimed document — task, item, and a scheduler
    while it is held — replacing `attempts` matching for tasks and `deadline` matching for
-   schedulers. Recommended: yes; it makes §2's "only the current claim writes" one mechanism.
+   schedulers. *Recommended:* yes; it makes §2's "only the current claim writes" one mechanism, and
+   tasks no longer keep `attempts` to match on.
 2. **How a scheduler engine names its task engine.** An attribute name (`emitsInto="heavy"`) is
    checkable when the app is built; a reference to the declaration (`emitsInto=heavy`) is checkable
-   where it is written but only works for engines declared above it in the class.
+   where it is written but only works for engines declared above it in the class. *Recommended:*
+   the attribute name, checked in `__init_subclass__`.
 3. **Where lease length lives (P1).** It decides when another process may take work over, so it is
    shared behaviour: declared and fingerprinted, or a per-process constructor argument only.
+   *Recommended:* declared per engine and fingerprinted; the constructor keeps only pacing (poll
+   intervals, worker counts).
 4. **Distributions registry placement (P3).** A class attribute, `distributions = MyDistributions`,
-   rather than a constructor argument.
+   rather than a constructor argument. *Recommended:* yes.
 5. **What the fingerprint covers (P4).** Add each declared model's schema, collection name and key,
    so a changed payload or scheduler field refuses a mismatched worker like a changed signature does.
+   *Recommended:* yes.
 6. **Names (N2, N3, N7).** One noun per kind across descriptor, defaults, registry and default
-   collection — e.g. `pile` / `pileMaxAttempts` / `app.piles` / `pymonque_piles_<name>`, and
-   `tasks` / `taskTimeout` / `app.taskEngines` / `pymonque_tasks_<name>`. Singular or plural
-   descriptors is part of this.
-7. **Status vocabulary (N4).** One set of words for the states tasks and items share — for example
-   `pending` / `running` / `done` / `failed`, with task-only `timeout`, `canceled`, `outdated`,
-   `incompatible`.
-8. **Verbs (N5, N6, B4).** Keep inherited signatures intact and add new names beside them; decide
-   the create verb per kind (`schedule`, `add`, `ensure`, `create`); decide whether cancel, wait and
-   finish-by-hand exist on both tasks and items, or stay held.
-9. **Custom tasks (§3).** Whether context is stamped only on the task, and whether extra fields may
-   steer claiming (a priority order) or stay data.
+   collection. *Recommended:* singular descriptors `task` / `scheduler` / `pile` / `collection`;
+   defaults `taskTimeout`, `pileMaxAttempts`, `schedulerMissed`; collections
+   `pymonque_<kind>_<name>`.
+7. **Status vocabulary (N4).** *Recommended:* `pending` / `running` / `done` / `failed` shared by
+   tasks and items; task-only `timeout`, `canceled`, `outdated`, `incompatible`.
+8. **Verbs (N5, N6, B4).** *Recommended:* tasks `schedule`, items `add`, schedulers `add` / `ensure`;
+   cancel, wait and finish-by-hand on items stay held; no new verbs until something needs one.
+9. **Custom tasks (§3).** *Recommended:* context is stamped only on the task, with schedulers passing
+   it through `taskFields()`; extra fields are data only, and a priority order can come later.
 
 ## 6. How to build it — Proposed
 
