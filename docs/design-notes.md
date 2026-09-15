@@ -40,6 +40,33 @@ here, plus the invariants the rebuild must keep and the decisions to make before
   - how `init()`, the backlog warning and the fingerprint span several task engines;
   - whether the declaration can shape the engine's model, collection and indexes (the rest of B5).
 
+### Release an item mid-block in `work()`
+
+```python
+with app.outbox.work() as w:
+    if w is None:
+        return                  # pile empty
+    if rateLimited():
+        w.release()             # only the with block ends; nothing below it in the block runs
+    send(w.data)
+    w.result = "sent"           # optional, stored by done()
+# carries on here, after done() or release()
+```
+
+- `work()` claims, renews the lease, calls `done()` when the block ends and `fail()` if it raises,
+  as today; calling `release()` on the yielded item ends the block early and releases the item.
+- Python can only leave a block by raising, so the bound `Item.release()` inside a `work()` block
+  raises a private `_Released(claimId)`, derived from `BaseException` so `except Exception:` in the
+  block does not catch it. `work()` catches it, releases the item and suppresses it: only the block
+  ends, and nothing outside sees an exception. Helpers and loops inside the block are unwound on the
+  way; `finally` and inner `with` cleanups run.
+- `work()` suppresses only its own claim's `_Released` and re-raises anyone else's, so nested blocks
+  release the right item.
+- `pile.release(item)` outside a block writes directly and does not raise.
+- Caveat to document: a bare `except:` or `except BaseException:` inside the block swallows the
+  release, and the item is marked done at the end.
+- Open: whether `w.done(result)` and `w.fail(error)` end the block early the same way.
+
 ## Proposed, not decided
 
 ### Custom tasks, shaped like custom schedulers

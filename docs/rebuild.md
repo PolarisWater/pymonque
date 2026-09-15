@@ -42,6 +42,8 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
   and running out of tries gives it up. `release()` hands an item back unfinished and returns the
   try, since the holder says the work did not happen. `fail()` is final — the item is marked failed
   and never claimed again. Items have no retry delay.
+- Inside `with pile.work() as w:`, `w.release()` ends just that block and releases the item —
+  **Decided**, details in `docs/design-notes.md`.
 - Tasks and items that have not started can be cancelled (`cancel`, `cancelMany`); running work
   cannot be interrupted, only waited out.
 - `sys.exit()` in work is a failure, not a dead worker thread.
