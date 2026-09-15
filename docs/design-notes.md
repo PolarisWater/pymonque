@@ -14,10 +14,16 @@ here, plus the invariants the rebuild must keep and the decisions to make before
   that must succeed retries inside its own code; one that may fail needs no retry.
 - Task `maxAttempts` and `retryDelay`, and the app's `taskMaxAttempts` / `taskRetryDelay`, go.
   A task whose worker dies is written off as failed, never rerun.
-- Pile items keep tries, because the task holding one can die before freeing it. An item's lease
-  lapsing (no response) or its holder releasing it (free) counts as a try. `fail()` is final: the
-  item is marked failed and never claimed again. No retry delay.
+- Pile items keep tries, because the task holding one can die before freeing it. A claim uses a
+  try, so a lapsed lease (no response) leaves it used. `fail()` is final: the item is marked failed
+  and never claimed again. No retry delay.
+- `release()` hands an item back unfinished and gives its try back: the holder says the work did
+  not happen (shutting down, a rate limit, not ready yet), so a try means only "a run whose outcome
+  nobody knows". An endless release loop is visible and the caller's to stop.
 - Max tries is set at two levels: an app default and each pile's declaration.
+- **Items can be cancelled, like tasks:** `cancel(uid)` and `cancelMany(where)` mark an item that is
+  not running `canceled` and set `finishedAt`; a running item cannot be cancelled, only waited out.
+  `canceled` becomes a status tasks and items share.
 
 ### Several task engines (B5, which also settles B1)
 
@@ -65,8 +71,8 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
 
 ## On hold
 
-- **Verbs that differ between tasks and items (B4, Matrix 3):** cancelling or waiting on an item,
-  finishing a task by hand. Revisit after several task engines.
+- **Verbs that differ between tasks and items (B4, Matrix 3):** waiting on an item, finishing a
+  task by hand. Revisit after several task engines. (Cancelling an item is decided, above.)
 - **A hold duration for pile items,** like a task's `executionTime`. To be designed as something
   modular after several task engines, rather than forced onto items now.
 - **Not yet discussed:** B6 (three claim-identity mechanisms), P1–P4 (setting placement and

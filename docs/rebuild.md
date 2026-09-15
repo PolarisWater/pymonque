@@ -38,9 +38,12 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
   not handed to the next worker — it may have done half its work.
 - A timeout frees the worker and writes the task off, since the call may still be running.
 - Work that has to happen survives a dead process through a pile: the item holds it, a task drains
-  it. An item's lease lapsing, or its holder releasing it, counts as a try and puts it back to be
-  claimed; running out of tries gives it up. `fail()` is final — the item is marked failed and never
-  claimed again. Items have no retry delay.
+  it. A claim uses a try; if the lease lapses the item goes back to be claimed with that try spent,
+  and running out of tries gives it up. `release()` hands an item back unfinished and returns the
+  try, since the holder says the work did not happen. `fail()` is final — the item is marked failed
+  and never claimed again. Items have no retry delay.
+- Tasks and items that have not started can be cancelled (`cancel`, `cancelMany`); running work
+  cannot be interrupted, only waited out.
 - `sys.exit()` in work is a failure, not a dead worker thread.
 - A result the driver cannot encode is checked before writing, and recorded as a failure.
 
@@ -139,7 +142,7 @@ a scheduler's context to the tasks it emits. Details in `docs/design-notes.md`.
 | | Declared on | App default | Stored on documents |
 |---|---|---|---|
 | Task limits: `timeout`, `skipAfter` | `@task(...)` | `task*` | no |
-| Item tries: `maxAttempts` — lapsed leases and releases | `pile(...)` | `item*` (N3) | no |
+| Item tries: `maxAttempts` — claims whose outcome never came back | `pile(...)` | `item*` (N3) | no |
 | Missed beats: `skip`, `once`, `replay` | `schedulers(...)` | `schedulerMissed` | no |
 
 Deliberate differences, not asymmetries: schedulers have no retries, timeouts or staleness rule,
@@ -203,10 +206,11 @@ agreed yet.
    collection. *Recommended:* singular descriptors `task` / `scheduler` / `pile` / `collection`;
    defaults `taskTimeout`, `pileMaxAttempts`, `schedulerMissed`; collections
    `pymonque_<kind>_<name>`.
-7. **Status vocabulary (N4).** *Recommended:* `pending` / `running` / `done` / `failed` shared by
-   tasks and items; task-only `timeout`, `canceled`, `outdated`, `incompatible`.
+7. **Status vocabulary (N4).** *Recommended:* `pending` / `running` / `done` / `failed` /
+   `canceled` shared by tasks and items; task-only `timeout`, `outdated`, `incompatible`.
 8. **Verbs (N5, N6, B4).** *Recommended:* tasks `schedule`, items `add`, schedulers `add` / `ensure`;
-   cancel, wait and finish-by-hand on items stay held; no new verbs until something needs one.
+   `cancel` / `cancelMany` on both (decided); waiting on items and finishing tasks by hand stay held;
+   no new verbs until something needs one.
 9. **Custom tasks (§3).** *Recommended:* context is stamped only on the task, with schedulers passing
    it through `taskFields()`; extra fields are data only, and a priority order can come later.
 
