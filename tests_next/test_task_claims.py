@@ -135,6 +135,15 @@ def test_a_written_off_task_keeps_the_time_it_was_started(engine):
     assert engine.get(task.uid).claimedAt == started
 
 
+def test_a_written_off_task_keeps_the_time_its_worker_died(engine):
+    task = engine.schedule(CallSpec.new("ping"))
+    lapsed = (utc_now() - timedelta(minutes=10)).replace(microsecond=0)
+    abandoned(engine, task, leaseUntil=lapsed)
+    engine.work()
+
+    assert engine.get(task.uid).leaseUntil == lapsed
+
+
 def test_writing_off_a_task_is_logged(engine, caplog):
     abandoned(engine, engine.schedule(CallSpec.new("ping")))
 

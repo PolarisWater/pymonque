@@ -109,7 +109,7 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
     limits, defaults filled in.
   - **`work()` writes the outcome inside `leases.holding(...)`,** so a claim is renewed until its
     outcome is written, not only until its call returns.
-- **To fix before layer 3** (found checking the review's build, `5a4732e`):
+- **Fixed before layer 3** (found checking the review's build, `5a4732e`):
   - **A task written off by a claim loses when its worker died.** The worker-died error no longer
     carries the time, on the grounds that the stored `leaseUntil` keeps it; but the claim that finds
     the task sets a fresh lease first, and the write-off writes only the outcome fields, so the stored
@@ -117,6 +117,52 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
     `writeOffStuck()` is unaffected, since it does not touch `leaseUntil`. Fix: `_writeOff` also
     writes back the `leaseUntil` it found (`before["leaseUntil"]`), beside the `claimedAt` it already
     restores; a test checks the stored `leaseUntil` equals the lapsed one.
+
+### Layer 3: scheduler engines and piles
+
+The scheduler engine in `schedulers.py`, the pile engine and the `work()` block in `piles.py`. Small
+decisions made along the way:
+
+- **A scheduler engine takes the task engine it emits into** (`tasks=`), and draws intervals from that
+  engine's `DistributionEngine`, so an app has one registry. Which engine that is — `emitsInto`, or
+  the default — is layer 4's wiring.
+- **A held scheduler has a `claimId` too** (B6). The claim sets only the claimId and the lease —
+  `status` still means enabled or disabled — and the deadline write lets the claim go, landing only
+  while the claim and the deadline are both unchanged, so `ensure()` or `update()` restarting the
+  rhythm mid-claim wins. A held scheduler is still not renewed.
+- **A scheduler's claim index is `leaseUntil` alone,** because its claim does not look at `status`;
+  tasks and piles keep `(status, leaseUntil)`.
+- **A beat's task is built by the target engine's `_newTask()`:** the scheduler's work unchanged, its
+  `taskFields()`, the scheduler as factory, and a uid fixed to the beat. `add`, `upsert`, `update` and
+  `ensure` build it the same way to check a scheduler as it will run: one whose fields the target
+  `Task` does not have is refused with the `TypeError` `schedule()` gives, and one that leaves out a
+  field the target needs with pydantic's `ValidationError`.
+- **A beat the app cannot run is skipped with a warning** — no function (`TaskNotFound`), or a stored
+  call that no longer fits (`TaskValidationError`) — and the scheduler stays enabled and walks on.
+- **`build()`, `add()` and `ensure()` pass their fields to the model as given,** `uid`, `name` and
+  `status` included, since `ensure()` sets those itself — unlike `schedule()`, which refuses `Task`'s
+  own fields. For review.
+- **`schedulerUid()` and `beatUid()` keep 2.0's namespace,** so a scheduler declared by name keeps its
+  uid across the upgrade.
+- **Items are `running` while held.** A claim uses a try; an item found out of tries is given up at
+  that claim, which moves on to the next item. `done()` no longer clears an earlier error, since
+  nothing retries. `renewLease()` and `release()` need the item `running`. Passing an `Item` acts
+  under its claim; passing a uid is an operator's verdict, whatever holds the item.
+- **Cancelling is one mechanism:** `claims.notStarted()` and `claims.cancelled()` serve tasks and
+  items — waiting, or held by a worker whose lease lapsed — and a cancel clears the claimId.
+- **`work()` yields a `Work`, not the `Item`:** `w.data`, `w.uid`, `w.attempts`, `w.item`, and
+  `w.done()`, `w.fail()`, `w.release()`, which call the pile's own and then raise `_Ended`.
+  `pile.done/fail/release(item)` called outside a block write and return whether they did.
+- **Decided while building, for review: an outer block's early end releases the inner block's
+  item.** When `outer.release()` (or `done` / `fail`) unwinds through a nested `work()` block, the
+  inner item is handed back with its try, since its work did not happen, and the early end is passed
+  on. The alternative, writing nothing, would spend a try and hold the item until its lease lapsed.
+- **Engine reprs are `CollectionEngine`'s one pattern** (N7): `PileEngine outbox
+  (pymonque_pile_outbox)`, not 2.0's `Pile outbox (…)`.
+- **`CollectionEngine._assign()`** sets fields validated against the model; `update()` and the
+  scheduler engine's merges share it.
+- **Left for layer 4:** worker threads on scheduler engines and poll intervals; `init()`; and a pile
+  item held by a timed-out call no longer being renewed (§5.10 — a hold will need its thread).
 
 ## Decided, not built yet
 

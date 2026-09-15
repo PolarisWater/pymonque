@@ -14,7 +14,7 @@ from pymongo import IndexModel
 from pymongo.collection import Collection
 
 from .calls import CallSpec, Functions
-from .claims import Leases, claimNext, writeClaimed
+from .claims import Leases, cancelled, claimNext, notStarted, writeClaimed
 from .distributions import DistributionEngine
 from .documents import CollectionEngine, Document, Duration, UtcDatetime, WorkStatus, utc_now
 from .exceptions import TaskNotFound, TaskValidationError
@@ -329,12 +329,12 @@ class TaskEngine(CollectionEngine[T]):
             task.executionTime = timedelta(seconds=time.perf_counter() - start)
             task.finishedAt = utc_now()
 
-    def _record(self, task: T) -> bool:
+    def _record(self, task: T, fields: frozenset[str] = OUTCOME_FIELDS) -> bool:
         """Write a task's outcome, if the claim that ran it still holds it."""
 
         recorded = writeClaimed(
             self.collection, task.uid, task.claimId,
-            task.model_dump(include=OUTCOME_FIELDS),
+            task.model_dump(include=fields),
             where={"status": "running"},
         )
 
@@ -349,12 +349,14 @@ class TaskEngine(CollectionEngine[T]):
         return recorded
 
     def _writeOff(self, task: T, before: Mapping[str, Any]) -> T:
+        # when it was started, and when its worker's lease ran out — not the claim that found it abandoned
         task.status = "failed"
-        task.claimedAt = before.get("claimedAt")     # when it was started, not when it was found abandoned
+        task.claimedAt = before.get("claimedAt")
+        task.leaseUntil = before.get("leaseUntil")
         task.finishedAt = utc_now()
         task.error = WORKER_DIED
 
-        if self._record(task):
+        if self._record(task, OUTCOME_FIELDS | {"leaseUntil"}):
             logger.error("%r failed: %s", task, task.error)
 
         return task
@@ -382,32 +384,18 @@ class TaskEngine(CollectionEngine[T]):
 
     # --- managing tasks ---
 
-    @staticmethod
-    def _notStarted() -> dict[str, Any]:
-        """Tasks nobody is running: waiting, or held by a worker that stopped renewing its lease."""
-
-        return {"$or": [
-            {"status": "pending"},
-            {"status": "running", "leaseUntil": {"$lte": utc_now()}},
-        ]}
-
-    @staticmethod
-    def _cancelled() -> dict[str, Any]:
-        # the claimId goes too, so a worker whose lease lapsed cannot write an outcome over the cancel
-        return {"$set": {"status": "canceled", "finishedAt": utc_now(), "claimId": None}}
-
     def cancel(self, uid: str) -> bool:
         """Cancel a task that has not started. False if there is no such task, or it is running or
         finished — running work cannot be interrupted, only waited out."""
 
-        return self.collection.update_one({"uid": uid, **self._notStarted()}, self._cancelled()).matched_count > 0
+        return self.collection.update_one({"uid": uid, **notStarted()}, cancelled()).matched_count > 0
 
     def cancelMany(self, where: Mapping[str, Any] | None = None) -> int:
         """Cancel every task matching `where` that has not started. Returns how many were."""
 
-        query = {"$and": [dict(where), self._notStarted()]} if where else self._notStarted()
+        query = {"$and": [dict(where), notStarted()]} if where else notStarted()
 
-        return self.collection.update_many(query, self._cancelled()).matched_count
+        return self.collection.update_many(query, cancelled()).matched_count
 
     def wait(self, task: Task | str, timeout: float | None = None, interval: float = 0.1) -> T:
         """Block until a task has ended, and return it as it ended.

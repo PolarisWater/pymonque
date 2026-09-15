@@ -105,6 +105,22 @@ def writeClaimed(
     ).matched_count > 0
 
 
+def notStarted() -> dict[str, Any]:
+    """Matches work nobody is running: waiting, or held by a worker that stopped renewing its lease."""
+
+    return {"$or": [
+        {"status": "pending"},
+        {"status": "running", "leaseUntil": {"$lte": utc_now()}},
+    ]}
+
+
+def cancelled() -> dict[str, Any]:
+    """The write that cancels work. The claimId goes with it, so a holder whose lease lapsed cannot
+    write an outcome over the cancel."""
+
+    return {"$set": {"status": "canceled", "finishedAt": utc_now(), "claimId": None}}
+
+
 class Leases:
     """The claims this process holds in one collection, and the thread that keeps them held.
 

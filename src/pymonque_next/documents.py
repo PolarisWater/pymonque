@@ -252,6 +252,14 @@ class CollectionEngine(Generic[M]):
 
         return document._bind(self, stored=True)
 
+    def _assign(self, document: M, fields: Mapping[str, Any]) -> M:
+        """Set fields on a document, each validated against the model, so nothing invalid is written."""
+
+        for name, value in fields.items():
+            document.__pydantic_validator__.validate_assignment(document, name, value)
+
+        return document
+
     def update(self, key: Any, **fields: Any) -> M | None:
         """Merge fields into a stored document and return it, or None if there is no such document.
 
@@ -266,11 +274,7 @@ class CollectionEngine(Generic[M]):
             return None
 
         before = document.model_dump()
-
-        for name, value in fields.items():
-            document.__pydantic_validator__.validate_assignment(document, name, value)
-
-        after = self._prepare(document).model_dump()
+        after = self._prepare(self._assign(document, fields)).model_dump()
         changed = {name: value for name, value in after.items() if name not in before or before[name] != value}
 
         if changed:

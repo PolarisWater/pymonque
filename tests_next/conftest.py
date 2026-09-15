@@ -1,6 +1,7 @@
 """Shared fixtures for the rebuilt package.
 
-Every test gets a fresh in-memory MongoDB, so nothing leaks between tests.
+Every test gets a fresh in-memory MongoDB, so nothing leaks between tests. The engine fixtures build
+each engine the way an app will, from what the app resolves for it.
 """
 
 import threading
@@ -9,8 +10,8 @@ import pytest
 from mongomock import MongoClient
 from mongomock.collection import Collection
 
-from pymonque_next import Task, TaskEngine, TaskLimits
-from pymonque_next.settings import TaskEngineSettings
+from pymonque_next import PileEngine, Scheduler, SchedulerEngine, Task, TaskEngine, TaskLimits
+from pymonque_next.settings import PileSettings, SchedulerEngineSettings, TaskEngineSettings
 from pymonque_next.tasks import taskFunctions
 
 
@@ -42,8 +43,7 @@ def db():
 
 @pytest.fixture
 def taskEngine(db):
-    """Build a task engine the way an app will, from its tasks, every task's limits — none, unless given
-    — and its lease."""
+    """Build a task engine from its tasks, every task's limits — none, unless given — and its lease."""
 
     def build(functions=None, model=Task, *, name="task", collection=None, leaseSeconds=300, limits=None, **kwargs):
         functions = functions or {}
@@ -55,6 +55,39 @@ def taskEngine(db):
             functions=taskFunctions(functions),
             settings=TaskEngineSettings(leaseSeconds=leaseSeconds),
             limits=limits if limits is not None else {task: TaskLimits() for task in functions},
+            **kwargs,
+        )
+
+    return build
+
+
+@pytest.fixture
+def pileEngine(db):
+    """Build a pile engine from its payload model — none takes any dict — and its settings."""
+
+    def build(model=None, *, name="jobs", collection=None, maxAttempts=1, leaseSeconds=300, **kwargs):
+        return PileEngine(
+            db[collection or f"pymonque_pile_{name}"],
+            model,
+            name=name,
+            settings=PileSettings(maxAttempts=maxAttempts, leaseSeconds=leaseSeconds),
+            **kwargs,
+        )
+
+    return build
+
+
+@pytest.fixture
+def schedulerEngine(db):
+    """Build a scheduler engine from its model and settings, emitting into the task engine it is given."""
+
+    def build(model=Scheduler, *, tasks, name="scheduler", collection=None, missed="once", leaseSeconds=300, **kwargs):
+        return SchedulerEngine(
+            db[collection or f"pymonque_scheduler_{name}"],
+            model,
+            name=name,
+            tasks=tasks,
+            settings=SchedulerEngineSettings(missed=missed, leaseSeconds=leaseSeconds),
             **kwargs,
         )
 
