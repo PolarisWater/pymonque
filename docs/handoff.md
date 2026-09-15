@@ -88,15 +88,27 @@ with app.outbox.work() as w:
 - Worker counts: an int means that many threads on every engine of the kind (default task engine
   included); a dict sets engines by name.
 - **One claim check:** a `claimId` on every claimed document — tasks, items, held schedulers (B6).
-- **Lease length** is declared per engine and fingerprinted (P1). **Distributions** are a class
-  attribute (P3). The **fingerprint** also covers each model's schema, collection name and key (P4).
-- One declaration shape, `kind(Model, collection=, extraIndexes=, …)`; singular nouns; defaults
-  like `taskTimeout`, `pileMaxAttempts`, `schedulerMissed`; collections `pymonque_<kind>_<name>`.
+- **Lease length** is declared per engine and fingerprinted (P1), with one app default per kind:
+  `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds` (300 each), overridden by
+  `leaseSeconds=`. **Distributions** are a class attribute (P3). The **fingerprint** also covers
+  each model's schema, collection name and key (P4).
+- One declaration shape, `kind(Model, collection=, extraIndexes=, …)`.
+- **Names:** engine declarations are plural, `tasks(...)` / `schedulers(...)`, because `task` is the
+  `@task` decorator; `pile(...)` and `collection(...)` stay. Everything else is singular: defaults
+  (`taskTimeout`, `pileMaxAttempts`, `schedulerMissed`), default engines `app.task` / `app.scheduler`.
+  `task = tasks(...)` replaces the default and hides `@task` below it in the class body; using a
+  declaration as a decorator raises a clear error.
+- **Collections:** `pymonque_task_<name>`, `pymonque_scheduler_<name>`, `pymonque_pile_<name>`; the
+  default engines use `pymonque_task` and `pymonque_scheduler` (a declaration of that name takes
+  over). Upgrading from 2.0 renames `pymonque_tasks` / `pymonque_schedulers`.
 - Statuses: `pending` / `running` / `done` / `failed` / `canceled`, plus task-only `timeout`,
   `outdated`, `incompatible`.
 - Verbs: tasks `schedule`, items `add`, schedulers `add` / `ensure`; `cancel` on tasks and items.
 - **Custom tasks:** a task engine declaration takes a `Task` subclass with extra fields, given to
-  `schedule(…)`; `Scheduler.taskFields()` passes a scheduler's context on. Fields are data only.
+  `schedule(…)`. **Context is stamped only on the task**, by `Task.runWork()`;
+  `Scheduler.emitWork()` is removed, and `Scheduler.taskFields()` passes a scheduler's fields to the
+  tasks it emits. A scheduler with context must emit into an engine whose `Task` has those fields.
+  Fields are data only.
 
 **Still on hold** (not part of the first build): waiting on items, finishing a task by hand,
 recording how long an item was held, a child process per task.
@@ -106,7 +118,9 @@ recording how long an item was held, a child process per task.
 Follow `rebuild.md` §6:
 
 1. Build bottom-up in `src/pymonque_next/`, beside the old package, one layer per session:
-   1. settings, declarations, documents, calls;
+   1. settings, declarations, documents, calls — plus the `Task`, `Scheduler` and `Item` models
+      (fields only; declarations check against them) and distributions; checks that need
+      `BaseApp` (reserved names, app defaults at class definition) are wired in layer 4;
    2. claims and task engines;
    3. scheduler engines and piles (including the `work()` block);
    4. app, versions, workers, shutdown, timeouts;

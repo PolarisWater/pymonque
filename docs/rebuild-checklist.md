@@ -113,15 +113,17 @@ nothing; **New** — no old test, decided since.
 
 - [ ] Engines are collected, each with its own collection; class access gives the declaration [engines]
 - [ ] A declaration named `scheduler` replaces the default; a subclass can override an engine [engines, app]
+- [ ] **New:** a declaration named `task` replaces the default task engine; a declaration used as a decorator raises a clear error
 - [ ] Per-engine `missed` and poll interval; extra indexes created; `init()` and workers cover every engine [engines]
-- [ ] The default scheduler emits its work unchanged; a subclass stamps context via `emitWork()` [engines]
-- [ ] The context reaches the emitted task, which runs; the stored work stays uncontextualised [engines]
-- [ ] Work is validated as it will be emitted; an engine that cannot supply the context refuses it [engines]
+- [ ] A scheduler emits its stored work unchanged [engines]
+- [ ] **Changed:** a scheduler's context reaches the emitted task as task fields via `taskFields()`, and the task's `runWork()` stamps it; the task runs; the stored work stays uncontextualised [engines]
+- [ ] **Dropped:** a scheduler subclass stamping context via `emitWork()` [engines]
+- [ ] **Changed:** a scheduler is validated as it will run — its `taskFields()` against the target engine's `Task` model, and that task's `runWork()` against the signature; an engine that cannot supply the context refuses it [engines]
 - [ ] Bad kwarg, unknown task, unknown distribution, missing context field are refused [engines]
 - [ ] Each engine reads its own model; context survives a fire [engines]
 - [ ] `upsert` creates then replaces and validates; `find` and `count` filter; `get` misses cleanly [engines]
 - [ ] `update` changes work or context, keeps or restarts the rhythm, toggles enabled, validates the merge, writes nothing if invalid, `None` if missing [engines]
-- [ ] `ensure` takes context fields, stays idempotent, can change context, validates through `emitWork()` [engines]
+- [ ] **Changed:** `ensure` takes context fields, stays idempotent, can change context, validates through `taskFields()` and the target task's `runWork()` [engines]
 - [ ] `delete` and `deleteMany` [engines]
 - [ ] **Changed:** schedulers share the default task engine unless `emitsInto=<declaration>` names another [engines]
 - [ ] **New:** `emitsInto` must reference a declaration above it on the same app class
@@ -139,6 +141,7 @@ nothing; **New** — no old test, decided since.
 - [ ] `wait` returns the finished task, takes a uid, works from another process, counts a failure as finished, times out, errors on an unknown task [wait]
 - [ ] **New:** several task engines, each with its own collection; any engine runs any task
 - [ ] **New:** a `Task` subclass on a declaration adds fields given to `schedule(…)`; `Scheduler.taskFields()` supplies them
+- [ ] **New:** `Task.runWork()` is the only place context is stamped; `schedule()` validates it; a plain `Task` runs `work` unchanged
 
 ## Processes and versions
 
@@ -189,7 +192,10 @@ nothing; **New** — no old test, decided since.
 - [ ] A bare task takes the defaults; a declared limit wins, the rest default; both decorator forms work [limits]
 - [ ] A task runs under its function's limits; declared once; calls, stored tasks and schedulers carry no limits [limits]
 - [ ] A declaration or task cannot shadow the app; the reserved names cover every attribute `__init__` sets [app]
-- [ ] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)`, and one noun per kind (N1–N3)
+- [ ] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)` (N1)
+- [ ] **Changed:** declarations `tasks` / `schedulers` / `pile` / `collection` / `@task`; defaults `task*`, `pile*`, `scheduler*` (N3)
+- [ ] **Changed:** collections `pymonque_task_<name>`, `pymonque_scheduler_<name>`, `pymonque_pile_<name>`; defaults `pymonque_task` and `pymonque_scheduler`, taken over by a declaration of that name (N2)
+- [ ] **New:** lease defaults `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds` (300), overridden by `leaseSeconds=` on a declaration
 - [ ] **Changed:** status vocabulary `pending` / `running` / `done` / `failed` / `canceled` (+ task-only `timeout`, `outdated`, `incompatible`) (N4)
 
 ## Calls

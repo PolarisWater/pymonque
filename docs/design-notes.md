@@ -89,7 +89,7 @@ with app.outbox.work() as w:
 
 ## Proposed, not decided
 
-### Custom tasks, shaped like custom schedulers
+### Custom tasks, shaped like custom schedulers — decided (rebuild §5.9)
 
 Builds on several task engines, and answers its open question about whether a declaration can
 shape the engine's model, collection and indexes: yes, the way `schedulers()` does.
@@ -101,20 +101,21 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
 - **Fields are given where a task is created,** and validated by pydantic:
   `app.accountTasks.schedule(App.sync(), accountId=42)`, like
   `app.accountOps.add(App.sync(), daily, accountId=42)`.
-- **`Task.runWork() -> CallSpec` mirrors `Scheduler.emitWork()`:** the call that actually runs, by
-  default `self.work`. A subclass can stamp its fields onto the call —
+- **`Task.runWork() -> CallSpec` is the one place context is stamped:** the call that actually
+  runs, by default `self.work`. A subclass stamps its fields onto the call —
   `return self.work.bind(accountId=self.accountId)`. `schedule()` validates `runWork()` against the
-  signature, as `validateScheduler()` validates `emitWork()`.
-- **A scheduler builds the model of the task engine it emits into.** `Scheduler.taskFields() -> dict`
-  (default `{}`) supplies the extra fields, so an `AccountScheduler` hands its `accountId` to an
-  `AccountTask`. A required field it doesn't supply fails when the scheduler is added, not when it
-  emits.
+  signature.
+- **Decided: `Scheduler.emitWork()` is removed.** A scheduler never stamps a call; it builds the
+  model of the task engine it emits into. `Scheduler.taskFields() -> dict` (default `{}`) supplies
+  the extra fields, so an `AccountScheduler` hands its `accountId` to an `AccountTask`, whose
+  `runWork()` stamps it. A required field it doesn't supply fails when the scheduler is added, not
+  when it emits. The scheduler's stored work is emitted unchanged.
+- **Cost, accepted:** a scheduler with context cannot emit into a plain task engine; it needs one
+  whose `Task` subclass has the fields — a declared engine, or `task = tasks(AccountTask)`. In
+  return, context has one home, and tasks scheduled by hand get it the same way.
 - **Tasks still belong to no engine,** so a subclass's fields and `runWork()` apply to every task
   stored in that engine, whichever function it names.
-- Open:
-  - whether context should be stamped in one place only — on the task, with schedulers just passing
-    fields through `taskFields()` — rather than by both `emitWork()` and `runWork()`;
-  - whether extra fields may steer claiming, such as a priority sort, or stay data only.
+- **Decided:** extra fields are data only and do not steer claiming; a priority order can come later.
 
 ## On hold
 

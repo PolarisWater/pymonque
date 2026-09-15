@@ -121,12 +121,19 @@ This retires N1 (`itemsCollection`, `schedulersCollection`, `tasksCollection`, `
 class App(BaseApp):
     groups  = collection(Group, key="groupId")
     heavy   = tasks(RenderTask, leaseSeconds=900)       # beside the default engine, `task`
-    nightly = schedulers(emitsInto="heavy", missed="skip")
+    nightly = schedulers(emitsInto=heavy, missed="skip")
     outbox  = pile(Email, maxAttempts=3)
 
-    @task(timeout=60, maxAttempts=3)
+    @task(timeout=60)
     def sync(self, accountId: int): ...
 ```
+
+Engine declarations are plural — `tasks(...)`, `schedulers(...)` — because `task` is the `@task`
+decorator. `pile` and `collection` stay singular. The singular noun is used everywhere else:
+defaults (`taskTimeout`), collections (`pymonque_task_<name>`), and the default engines `app.task`
+and `app.scheduler`. `task = tasks(...)` replaces the default task engine (as `scheduler = …` does),
+and hides the `@task` decorator for the rest of that class body; a declaration used as a decorator
+raises an error saying so.
 
 ### Several task engines — Decided
 
@@ -136,19 +143,24 @@ class App(BaseApp):
 - Worker counts: `taskWorkers` and `schedulerWorkers` take an int — that many threads on every
   engine of the kind — or a dict of engine name to count; engines a dict leaves out get none.
 
-### Custom tasks — Proposed
+### Custom tasks — Decided
 
 A task engine declaration takes a `Task` subclass, the way `schedulers()` takes a `Scheduler`
 subclass: extra fields stored on every task in that engine, given where the task is created and
-validated by pydantic. `Task.runWork()` returns the call that runs; `Scheduler.taskFields()` hands
-a scheduler's context to the tasks it emits. Details in `docs/design-notes.md`.
+validated by pydantic. **Context is stamped in one place only, the task:** `Task.runWork()` returns
+the call that runs, and is the only thing that adds context to it. A scheduler never stamps a call:
+`Scheduler.emitWork()` is gone, and `Scheduler.taskFields()` hands the scheduler's fields to the
+tasks it emits. A scheduler with context therefore emits into a task engine whose `Task` subclass
+has those fields — a declared one, or the default replaced with `task = tasks(AccountTask)`.
+Extra fields are data only; they do not steer claiming. Details in `docs/design-notes.md`.
 
 ### Rules, per kind
 
 | | Declared on | App default | Stored on documents |
 |---|---|---|---|
 | Task limits: `timeout`, `skipAfter` | `@task(...)` | `task*` | no |
-| Item tries: `maxAttempts` — claims whose outcome never came back | `pile(...)` | `item*` (N3) | no |
+| Item tries: `maxAttempts` — claims whose outcome never came back | `pile(...)` | `pileMaxAttempts` | no |
+| Lease length: `leaseSeconds` | `tasks(...)`, `schedulers(...)`, `pile(...)` | `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds` | no |
 | Missed beats: `skip`, `once`, `replay` | `schedulers(...)` | `schedulerMissed` | no |
 
 Deliberate differences, not asymmetries: schedulers have no retries, timeouts or staleness rule,
@@ -177,7 +189,7 @@ pymonque/
   settings.py       the shared constraints, TaskLimits, ItemLimits, AppDefaults, the "left out" marker
   documents.py      Document, CollectionEngine, bound documents, validated update
   claims.py         leases, claim ids, renewal, the worker loop
-  tasks.py          Task, TaskEngine: execute, retries, timeouts, skipAfter, cancel, wait
+  tasks.py          Task, TaskEngine: execute, timeouts, skipAfter, cancel, wait
   schedulers.py     Scheduler, SchedulerEngine: beats, missed, ensure
   piles.py          Item, PileEngine: claim, work(), done/fail/release
   calls.py          CallSpec, signature validators, call-time validation
@@ -204,23 +216,36 @@ Ordered by how much of the shape depends on them. **All ten are decided** as wri
 3. **Where lease length lives (P1).** It decides when another process may take work over, so it is
    shared behaviour: declared and fingerprinted, or a per-process constructor argument only.
    *Recommended:* declared per engine and fingerprinted; the constructor keeps only pacing (poll
-   intervals, worker counts).
+   intervals, worker counts). **Decided default:** one per kind on the app class —
+   `taskLeaseSeconds`, `schedulerLeaseSeconds`, `pileLeaseSeconds`, 300 each — overridden by
+   `leaseSeconds=` on a declaration. Scheduler leases may be set shorter, since emitting takes
+   milliseconds.
 4. **Distributions registry placement (P3).** A class attribute, `distributions = MyDistributions`,
    rather than a constructor argument. *Recommended:* yes.
 5. **What the fingerprint covers (P4).** Add each declared model's schema, collection name and key,
    so a changed payload or scheduler field refuses a mismatched worker like a changed signature does.
    *Recommended:* yes.
 6. **Names (N2, N3, N7).** One noun per kind across descriptor, defaults, registry and default
-   collection. *Recommended:* singular descriptors `task` / `scheduler` / `pile` / `collection`;
-   defaults `taskTimeout`, `pileMaxAttempts`, `schedulerMissed`; collections
-   `pymonque_<kind>_<name>`.
+   collection. **Decided** (replacing the earlier singular-descriptor recommendation, which
+   collided with `@task`):
+   - Declarations: `tasks(...)` and `schedulers(...)` for engines; `@task`, `pile(...)` and
+     `collection(...)` unchanged. See §3.
+   - Defaults: `taskTimeout`, `taskSkipAfter`, `taskLeaseSeconds`, `pileMaxAttempts`,
+     `pileLeaseSeconds`, `schedulerMissed`, `schedulerLeaseSeconds`.
+   - Default engines: `app.task` and `app.scheduler`, named after their attributes.
+   - Collections: declared engines and piles `pymonque_task_<name>`, `pymonque_scheduler_<name>`,
+     `pymonque_pile_<name>`; the default engines `pymonque_task` and `pymonque_scheduler`. A
+     declaration named `task` or `scheduler` replaces the default and takes over its collection.
+     Upgrading from 2.0 renames `pymonque_tasks` / `pymonque_schedulers`, in the migration the new
+     statuses and fields need anyway.
 7. **Status vocabulary (N4).** *Recommended:* `pending` / `running` / `done` / `failed` /
    `canceled` shared by tasks and items; task-only `timeout`, `outdated`, `incompatible`.
 8. **Verbs (N5, N6, B4).** *Recommended:* tasks `schedule`, items `add`, schedulers `add` / `ensure`;
    `cancel` / `cancelMany` on both (decided); waiting on items and finishing tasks by hand stay held;
    no new verbs until something needs one.
-9. **Custom tasks (§3).** *Recommended:* context is stamped only on the task, with schedulers passing
-   it through `taskFields()`; extra fields are data only, and a priority order can come later.
+9. **Custom tasks (§3).** **Decided, strictly:** context is stamped only on the task, by
+   `Task.runWork()`; schedulers pass their fields through `taskFields()`, and `Scheduler.emitWork()`
+   is removed. Extra fields are data only; a priority order can come later.
 10. **What a timeout can stop — Decided.** Python cannot kill a thread. A timeout still frees the
     worker and writes the task off; on top of that:
     - **An exception is injected into the thread** (`PyThreadState_SetAsyncExc`). It stops
