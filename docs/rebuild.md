@@ -36,7 +36,10 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
   asked to rerun is worse than a failure you can see.
 - A task runs at most once. If its worker dies (the lease lapses), the task is written off as failed,
   not handed to the next worker — it may have done half its work.
-- A timeout frees the worker and writes the task off, since the call may still be running.
+- A timeout frees the worker and writes the task off, since the call may still be running. A pile
+  item that call holds stops being renewed at the timeout, so its lease lapses (a spent try) and
+  another worker can take it. (Whether a timeout can also stop the call is open — §5.10.)
+- A task whose worker died ends as plain `failed`, with an error saying so.
 - Work that has to happen survives a dead process through a pile: the item holds it, a task drains
   it. A claim uses a try; if the lease lapses the item goes back to be claimed with that try spent,
   and running out of tries gives it up. `release()` hands an item back unfinished and returns the
@@ -185,8 +188,8 @@ pymonque/
 
 ## 5. Decide before building — Open
 
-Ordered by how much of the shape depends on them. Each carries the recommended answer; none is
-agreed yet.
+Ordered by how much of the shape depends on them. **All nine are decided** as written below
+(the *Recommended* answer, except where 2 says otherwise).
 
 1. **Claim identity (B6).** One `claimId` on every claimed document — task, item, and a scheduler
    while it is held — replacing `attempts` matching for tasks and `deadline` matching for
@@ -194,8 +197,10 @@ agreed yet.
    tasks no longer keep `attempts` to match on.
 2. **How a scheduler engine names its task engine.** An attribute name (`emitsInto="heavy"`) is
    checkable when the app is built; a reference to the declaration (`emitsInto=heavy`) is checkable
-   where it is written but only works for engines declared above it in the class. *Recommended:*
-   the attribute name, checked in `__init_subclass__`.
+   where it is written but only works for engines declared above it in the class. **Decided:** a
+   reference to the declaration (`nightly = schedulers(emitsInto=heavy)`), for editor hints and safe
+   renames. The engine must be declared above; left out means the default task engine, which lives
+   on `BaseApp`. A reference to another app class's declaration is refused when the class is defined.
 3. **Where lease length lives (P1).** It decides when another process may take work over, so it is
    shared behaviour: declared and fingerprinted, or a per-process constructor argument only.
    *Recommended:* declared per engine and fingerprinted; the constructor keeps only pacing (poll
@@ -216,6 +221,19 @@ agreed yet.
    no new verbs until something needs one.
 9. **Custom tasks (§3).** *Recommended:* context is stamped only on the task, with schedulers passing
    it through `taskFields()`; extra fields are data only, and a priority order can come later.
+10. **What a timeout can stop — Open.** Python cannot kill a thread, so today a timeout frees the
+    worker and writes the task off while the call keeps running; an infinite loop spins until the
+    process exits. Proposed: keep that as the baseline, and add an exception injected into the
+    thread (stops pure-Python loops, not calls blocked in C, I/O or sleep) plus an opt-in to retire
+    a worker process once abandoned threads pile up, for a supervisor to restart. A child process
+    per task is left for later.
+
+Also settled with these:
+- **Worker counts:** an int means that many threads on every engine of the kind, the default task
+  engine included; a dict sets engines by name.
+- **P2:** limits live on what is declared — task limits per function, item tries per pile; said once
+  in the docs.
+- **N6:** only the task engine and distributions are callable, building a call; documented as such.
 
 ## 6. How to build it — Proposed
 

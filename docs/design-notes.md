@@ -35,7 +35,9 @@ here, plus the invariants the rebuild must keep and the decisions to make before
   **every** engine of that kind, or a dict of engine name to count. Engines a dict leaves out get
   none.
 - Still open when this is picked up:
-  - how a scheduler engine names its task engine (attribute name, or a reference);
+  - ~~how a scheduler engine names its task engine~~ — decided: a reference,
+    `schedulers(emitsInto=heavy)`, declared above; left out means the default engine;
+  - an int worker count covers the default task engine too (decided);
   - the collection name of a declared task engine (`pymonque_tasks_<name>`, matching schedulers);
   - how `init()`, the backlog warning and the fingerprint span several task engines;
   - whether the declaration can shape the engine's model, collection and indexes (the rest of B5).
