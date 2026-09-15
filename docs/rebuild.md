@@ -103,7 +103,7 @@ Each of these was paid for with a bug. The rebuild keeps all of them and tests e
 Every storage kind is a typed collection engine underneath, so `get`, `find`, `count`, `update`,
 `delete` and bound documents work the same everywhere.
 
-### One declaration shape — Proposed
+### One declaration shape — Decided
 
 Every storage declaration takes the same leading arguments, spelled the same way, and adds only
 what its kind needs:
@@ -169,7 +169,7 @@ because emitting is a database write assumed not to fail; tasks have no retries,
 either works or fails; items have tries because the task holding one can die before releasing it;
 only tasks record `executionTime`.
 
-### Documents — Keep, with one Open question
+### Documents — Keep
 
 | | Task | Scheduler | Item |
 |---|---|---|---|
@@ -178,7 +178,7 @@ only tasks record `executionTime`.
 | Outcome | `result`, `error` | — | `result`, `error`, `attempts` |
 | Duration | `executionTime` | — | on hold — a modular hook, not forced |
 
-## 4. Code layout — Proposed
+## 4. Code layout — Decided
 
 `core.py` is about 2,700 lines. The rebuild splits it by responsibility, so each invariant has one
 home:
@@ -199,10 +199,11 @@ pymonque/
   exceptions.py
 ```
 
-## 5. Decide before building — Open
+## 5. Decisions
 
-Ordered by how much of the shape depends on them. **All ten are decided** as written below
-(the *Recommended* answer, except where 2 and 10 say otherwise).
+Ordered by how much of the shape depends on them. **1–10 are decided** as written below (the
+*Recommended* answer, except where 2 and 10 say otherwise). **11 is open**, and must be settled
+before layer 4.
 
 1. **Claim identity (B6).** One `claimId` on every claimed document — task, item, and a scheduler
    while it is held — replacing `attempts` matching for tasks and `deadline` matching for
@@ -213,7 +214,9 @@ Ordered by how much of the shape depends on them. **All ten are decided** as wri
    where it is written but only works for engines declared above it in the class. **Decided:** a
    reference to the declaration (`nightly = schedulers(emitsInto=heavy)`), for editor hints and safe
    renames. The engine must be declared above; left out means the default task engine, which lives
-   on `BaseApp`. A reference to another app class's declaration is refused when the class is defined.
+   on `BaseApp`. A reference to a declaration of a class it does not inherit from is refused when
+   the class is defined; an inherited one (`emitsInto=Parent.heavy`) is accepted, and follows the
+   name if a subclass replaces that engine.
 3. **Where lease length lives (P1).** It decides when another process may take work over, so it is
    shared behaviour: declared and fingerprinted, or a per-process constructor argument only.
    *Recommended:* declared per engine and fingerprinted; the constructor keeps only pacing (poll
@@ -266,6 +269,9 @@ Ordered by how much of the shape depends on them. **All ten are decided** as wri
     - on retiring: an error listing each abandoned task, how long it has run and where it is stuck,
       then "no longer claiming, draining N", then the exit — `run()` reports it so the process can
       exit with a code of its own.
+11. **Housekeeping and versions across several task engines — Open, before layer 4.** How `init()`
+    (flagging incompatible tasks), the backlog warning and the fingerprint span more than one task
+    engine: per engine or for the app as a whole, and what the warning names.
 
 Also settled with these:
 - **Worker counts:** an int means that many threads on every engine of the kind, the default task
@@ -274,7 +280,7 @@ Also settled with these:
   in the docs.
 - **N6:** only the task engine and distributions are callable, building a call; documented as such.
 
-## 6. How to build it — Proposed
+## 6. How to build it — Decided
 
 1. **Settle §5,** and fold the answers into this document.
 2. **Turn the current tests into a behaviour checklist,** grouped by §2's headings, so nothing the

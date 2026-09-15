@@ -15,7 +15,8 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
 - **Two kinds of declaration error.** A bad value raises pydantic's `ValidationError` naming the
   setting; a setting that does not exist raises `TypeError` naming it. Settings removed since 2.0
   (`maxAttempts` / `retryDelay` on `@task`; `retryDelay`, `itemsCollection`, `payload` on `pile`;
-  `schedulersCollection`, `schedulerModel`, `policy` on `schedulers`; `tasksCollection` on `tasks`)
+  `schedulersCollection`, `schedulerModel`, `taskEngine`, `policy` on `schedulers`;
+  `tasksCollection`, `taskModel` on `tasks`)
   say what became of them. Removed app defaults (`taskMaxAttempts`, `taskRetryDelay`,
   `itemMaxAttempts`, `itemRetryDelay`) are refused the same way by `AppDefaults.of()`, which layer 4
   calls when an app class is defined.
@@ -87,9 +88,10 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
 - Still open when this is picked up:
   - ~~how a scheduler engine names its task engine~~ — decided: a reference,
     `schedulers(emitsInto=heavy)`, declared above; left out means the default engine;
-  - an int worker count covers the default task engine too (decided);
+  - ~~whether an int worker count covers the default task engine~~ — decided: yes;
   - ~~the collection name of a declared task engine~~ — decided: `pymonque_task_<name>` (rebuild §5.6);
-  - how `init()`, the backlog warning and the fingerprint span several task engines;
+  - **still open, before layer 4:** how `init()`, the backlog warning and the fingerprint span
+    several task engines (rebuild §5.11);
   - ~~whether the declaration can shape the engine's model, collection and indexes~~ — decided: yes,
     see custom tasks (rebuild §5.9).
 
@@ -138,9 +140,7 @@ with app.outbox.work() as w:
   check on every outcome, done at the end, fail on an exception, the lost-claim case — with the
   caveat beside it.
 
-## Proposed, not decided
-
-### Custom tasks, shaped like custom schedulers — decided (rebuild §5.9)
+### Custom tasks, shaped like custom schedulers (rebuild §5.9)
 
 Builds on several task engines, and answers its open question about whether a declaration can
 shape the engine's model, collection and indexes: yes, the way `schedulers()` does.

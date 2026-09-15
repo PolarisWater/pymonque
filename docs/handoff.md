@@ -48,7 +48,8 @@ tasks), **distributions** (interval functions for schedulers).
 
 ## Decisions made most recently
 
-All ten open decisions in `rebuild.md` §5 are settled. The ones that change the most:
+Decisions 1–10 in `rebuild.md` §5 are settled; 11 (housekeeping and versions across several task
+engines) is open and must be settled before layer 4. The ones that change the most:
 
 **Failure and retries**
 - **Tasks have no retries.** A task either works or fails; one that must succeed retries inside its
