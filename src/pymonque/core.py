@@ -1,12 +1,13 @@
 from __future__ import annotations
 from pydantic import (
-    create_model, field_validator, field_serializer, model_validator,
-    ConfigDict, BaseModel, Field, PrivateAttr, PositiveFloat, ValidationError
+    create_model, field_validator, field_serializer, model_validator, validate_call,
+    ConfigDict, BaseModel, Field, PrivateAttr, PositiveFloat, ValidationError,
+    TypeAdapter, AfterValidator
 )
 
 from typing import (
-    Any, Literal, Callable, TypeVar, Mapping, Iterable, Sequence, Generic, Self,
-    get_type_hints, get_args, overload
+    Annotated, Any, Literal, Callable, TypeVar, Mapping, Iterable, Sequence, Generic, Self,
+    get_type_hints, overload
 )
 
 from types import MethodType
@@ -32,6 +33,7 @@ import socket
 import os
 import signal
 import re
+import functools
 
 from contextlib import contextmanager
 
@@ -64,15 +66,6 @@ MAX_ATTEMPTS = 1            # runs a task or item gets before a failure is final
 RETRY_DELAY = 60            # seconds a failed task or item waits before it is claimable again
 
 HOSTNAME = socket.gethostname()
-
-
-def checkMissed(missed: str) -> str:
-    if missed not in get_args(MISSED_BEATS):
-        raise ValueError(
-            f"missed is one of {', '.join(map(repr, get_args(MISSED_BEATS)))}, not {missed!r}"
-        )
-
-    return missed
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -170,6 +163,72 @@ def beatUid(scheduler: str, deadline: datetime) -> str:
 MONGO_CONFIG = ConfigDict(serialize_by_alias=True)  # aliases are how a model matches an existing schema
 
 
+# What each kind of setting may be, written once and shared by the declarations,
+# the app's defaults and the resolved limits, so all three refuse the same values.
+Seconds = Annotated[float, Field(gt=0)]
+Timeout = Annotated[float, Field(gt=0)] | None          # seconds a call may run; None: no limit
+SkipAfter = Annotated[float, Field(ge=0)] | None        # seconds past its deadline still worth running; None: however late
+MaxAttempts = Annotated[int, Field(ge=1)]               # runs before a failure is final
+RetryDelay = Annotated[float, Field(ge=0)]              # seconds before a retry is claimable
+
+MISSED = TypeAdapter(MISSED_BEATS)
+
+
+def _notNone(value: Any) -> Any:
+    if value is None:
+        raise ValueError("leave it out for the default; None is not a collection")
+
+    return value
+
+CollectionRef = Annotated[Any, AfterValidator(_notNone)]    # a Collection, or the name of one
+
+
+class _Unset:
+    """A setting left out of a declaration, as opposed to one given as None.
+
+    Leaving a setting out is the only way to take the app's default. None is a
+    value in its own right, and only means something where there is a limit to
+    lift: a timeout or a skipAfter.
+    """
+
+    def __repr__(self) -> str:
+        return "<the app's default>"
+
+UNSET = _Unset()
+
+
+def orDefault(value: Any, default: Any) -> Any:
+    """A declared setting, or the default when it was left out."""
+
+    return default if value is UNSET else value
+
+
+# declarations are checked where they are written; a Collection or an IndexModel
+# is checked as an instance, having no schema of its own
+DECLARATION = ConfigDict(arbitrary_types_allowed=True)
+
+
+def declaration(init: Callable) -> Callable:
+    """Check a declaration's settings where it is written.
+
+    Arguments are bound to their names first, so an error names the setting even
+    when it was passed by position — `collection(Group)` is the usual spelling,
+    and "1" would tell nobody which argument was wrong.
+    """
+
+    checked = validate_call(init, config=DECLARATION)
+    signature = inspect.signature(init)
+
+    @functools.wraps(init)
+    def wrapper(self, *args, **kwargs):
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        arguments.pop("self")
+
+        return checked(self, **arguments)
+
+    return wrapper
+
+
 class TaskLimits(BaseModel):
     """What a task may do, declared on @task and filled in from the app's defaults.
 
@@ -179,19 +238,35 @@ class TaskLimits(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    timeout:        float | None    = Field(default=None, gt=0)   # seconds a call may run; None: no limit
-    skipAfter:      float | None    = Field(default=None, ge=0)   # seconds past its deadline it is still worth running; None: always
-    maxAttempts:    int             = Field(default=MAX_ATTEMPTS, ge=1)  # runs before a failure is final
-    retryDelay:     float           = Field(default=RETRY_DELAY, ge=0)   # seconds before a retry is claimable
+    timeout:        Timeout         = None
+    skipAfter:      SkipAfter       = None
+    maxAttempts:    MaxAttempts     = MAX_ATTEMPTS
+    retryDelay:     RetryDelay      = RETRY_DELAY
 
 
-class _Unset:
-    """A limit left off @task, as opposed to one given as None, which means no limit."""
+class ItemLimits(BaseModel):
+    """What a pile's items may do, declared on pile() and filled in from the app's defaults."""
 
-    def __repr__(self) -> str:
-        return "<the app's default>"
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-UNSET = _Unset()
+    maxAttempts:    MaxAttempts     = MAX_ATTEMPTS
+    retryDelay:     RetryDelay      = RETRY_DELAY
+
+
+class AppDefaults(BaseModel):
+    """The defaults a BaseApp subclass declares, checked when the class is defined."""
+
+    schedulerMissed:    MISSED_BEATS
+    taskTimeout:        Timeout
+    taskSkipAfter:      SkipAfter
+    taskMaxAttempts:    MaxAttempts
+    taskRetryDelay:     RetryDelay
+    itemMaxAttempts:    MaxAttempts
+    itemRetryDelay:     RetryDelay
+
+    @classmethod
+    def of(cls, app: type) -> AppDefaults:
+        return cls.model_validate({name: getattr(app, name) for name in cls.model_fields})
 
 
 class Document(BaseModel):
@@ -565,6 +640,11 @@ class Task(Document):
     deadline:       datetime
     factory:        TaskFactory
 
+    # the same three moments a pile item records
+    createdAt:      datetime            = Field(default_factory=utc_now)
+    claimedAt:      datetime | None     = None   # the current claim; cleared while waiting for a retry
+    finishedAt:     datetime | None     = None   # set once the status is final
+
     # when this becomes claimable: its deadline while pending, the end of the
     # holder's lease while processing. One field, so claiming is one comparison.
     leaseUntil:     datetime | None     = None
@@ -790,11 +870,11 @@ class TaskEngine(CollectionEngine, WorkerLoop):
         }
 
         # each task's limits: what its @task declares, and the app's defaults for the rest
+        appDefaults = AppDefaults.of(type(app))
         defaults = {
-            "timeout": app.taskTimeout, "skipAfter": app.taskSkipAfter,
-            "maxAttempts": app.taskMaxAttempts, "retryDelay": app.taskRetryDelay,
+            "timeout": appDefaults.taskTimeout, "skipAfter": appDefaults.taskSkipAfter,
+            "maxAttempts": appDefaults.taskMaxAttempts, "retryDelay": appDefaults.taskRetryDelay,
         }
-        TaskLimits(**defaults)      # checked even when no task uses them, so a bad default can't lie in wait
 
         self.limits: dict[str, TaskLimits] = {
             name: TaskLimits(**{**defaults, **declaration.limits})
@@ -831,7 +911,11 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         self.tasksCollection.update_many(
             {"status": "pending", "work.functionName": {"$nin": list(self.functions)}},
-            {"$set": {"status": "incompatible", "error": "Function for this task does not exist in this app"}},
+            {"$set": {
+                "status": "incompatible",
+                "error": "Function for this task does not exist in this app",
+                "finishedAt": utc_now(),
+            }},
         )  # flag pending tasks that can no longer be executed
 
     def createIndexes(self):
@@ -867,7 +951,11 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 "work.functionName": {"$in": list(self.functions)},  # never claim what we cannot run
             },
             {
-                "$set": {"status": "processing", "leaseUntil": now + timedelta(seconds=self.leaseSeconds)},
+                "$set": {
+                    "status": "processing",
+                    "claimedAt": now,
+                    "leaseUntil": now + timedelta(seconds=self.leaseSeconds),
+                },
                 "$inc": {"attempts": 1},
             },
             sort=[("leaseUntil", 1)],
@@ -902,6 +990,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
                 task, task.attempts, limits.maxAttempts, limits.retryDelay
             )
             task.status = "pending"
+            task.claimedAt = None       # waiting again, as a retried item does
             task.leaseUntil = utc_now() + timedelta(seconds=limits.retryDelay)
 
         try:
@@ -910,6 +999,9 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             task.status = "failed"
             task.result = None
             task.error = traceback.format_exc()
+
+        if task.status in FINAL_TASK_STATUSES:
+            task.finishedAt = utc_now()
 
         if not self._record(task):
             logger.warning(
@@ -945,6 +1037,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             f"gave up after {task.attempts - 1} attempt(s): the worker running the last "
             f"one died without reporting back — killed, or taken down by the task itself"
         )
+        task.finishedAt = utc_now()
 
         self._record(task)
         logger.error("%r %s", task, task.error)
@@ -967,6 +1060,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
             f"claimed {late:.0f}s after its deadline, past the "
             f"{self.limitsFor(task).skipAfter}s it was worth running for"
         )
+        task.finishedAt = utc_now()
 
         self._record(task)
         logger.warning("%r was outdated: %s", task, task.error)
@@ -1060,7 +1154,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         return self.tasksCollection.update_one(
             {"uid": uid, **self._notStarted()},
-            {"$set": {"status": "canceled"}}
+            {"$set": {"status": "canceled", "finishedAt": utc_now()}}
         ).modified_count > 0
 
     def cancelMany(self, where: Mapping[str, Any] | None = None) -> int:
@@ -1071,7 +1165,7 @@ class TaskEngine(CollectionEngine, WorkerLoop):
 
         return self.tasksCollection.update_many(
             query,
-            {"$set": {"status": "canceled"}}
+            {"$set": {"status": "canceled", "finishedAt": utc_now()}}
         ).modified_count
 
     def wait(self, task: Task | str, timeout: float | None = None, interval: float = 0.1) -> Task:
@@ -1189,7 +1283,7 @@ class SchedulerEngine(CollectionEngine, WorkerLoop):
         self.pollInterval = pollInterval
         self.leaseSeconds = leaseSeconds
         self.taskEngine: TaskEngine = taskEngine or app.task
-        self.missed: MISSED_BEATS = checkMissed(missed)
+        self.missed: MISSED_BEATS = MISSED.validate_python(missed)
 
         self._initWorkers()
 
@@ -1524,21 +1618,21 @@ class PileEngine(CollectionEngine):
             name:               str,
             payload:            type[BaseModel] | None = None,
             itemsCollection:    Collection | str | None = None,
-            maxAttempts:        int | None = None,
-            retryDelay:         float | None = None,
+            maxAttempts:        int | _Unset = UNSET,
+            retryDelay:         float | _Unset = UNSET,
             leaseSeconds:       float = LEASE_SECONDS
         ):
 
         self.leaseSeconds = leaseSeconds
         self.payload: type[BaseModel] | None = payload
-        self.maxAttempts: int = maxAttempts if maxAttempts is not None else app.itemMaxAttempts
-        self.retryDelay: float = retryDelay if retryDelay is not None else app.itemRetryDelay
 
-        if self.maxAttempts < 1:
-            raise ValueError(f"maxAttempts must be at least 1, not {self.maxAttempts}")
-
-        if self.retryDelay < 0:
-            raise ValueError(f"retryDelay is seconds and cannot be negative, not {self.retryDelay}")
+        # what pile() declares, and the app's defaults for the rest
+        appDefaults = AppDefaults.of(type(app))
+        declared = {name: value for name, value in (("maxAttempts", maxAttempts), ("retryDelay", retryDelay))
+                    if value is not UNSET}
+        self.limits: ItemLimits = ItemLimits(**{
+            "maxAttempts": appDefaults.itemMaxAttempts, "retryDelay": appDefaults.itemRetryDelay, **declared,
+        })
 
         self._held: set[str] = set()
         self._heldLock = threading.Lock()
@@ -1558,6 +1652,14 @@ class PileEngine(CollectionEngine):
     @property
     def itemsCollection(self) -> Collection:
         return self.collection
+
+    @property
+    def maxAttempts(self) -> int:
+        return self.limits.maxAttempts
+
+    @property
+    def retryDelay(self) -> float:
+        return self.limits.retryDelay
 
     def createIndexes(self):
         super().createIndexes()  # unique uid
@@ -1853,20 +1955,21 @@ class pile:
             emails = pile(EmailPayload)
     """
 
+    @declaration
     def __init__(
             self,
-            payload:            type[BaseModel] | None = None,
-            itemsCollection:    Collection | str | None = None,
-            maxAttempts:        int | None = None,
-            retryDelay:         float | None = None,
-            leaseSeconds:       float | None = None
+            payload:            type[BaseModel] | None = None,  # None: items carry any dict
+            itemsCollection:    CollectionRef = UNSET,          # left out: pymonque_pile_<name>
+            maxAttempts:        MaxAttempts | _Unset = UNSET,   # left out: the app's itemMaxAttempts
+            retryDelay:         RetryDelay | _Unset = UNSET,    # left out: the app's itemRetryDelay
+            leaseSeconds:       Seconds | _Unset = UNSET        # left out: the app's leaseSeconds
         ):
 
         self.__is_pile__: bool = True
         self.payload = payload
         self.itemsCollection = itemsCollection
-        self.maxAttempts = maxAttempts      # None: the app's itemMaxAttempts
-        self.retryDelay = retryDelay        # None: the app's itemRetryDelay
+        self.maxAttempts = maxAttempts
+        self.retryDelay = retryDelay
         self.leaseSeconds = leaseSeconds
         self.name: str = ""
 
@@ -1878,10 +1981,10 @@ class pile:
             app,
             name=self.name,
             payload=self.payload,
-            itemsCollection=self.itemsCollection,
+            itemsCollection=orDefault(self.itemsCollection, None),
             maxAttempts=self.maxAttempts,
             retryDelay=self.retryDelay,
-            leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds
+            leaseSeconds=orDefault(self.leaseSeconds, leaseSeconds)
         )
 
     def __get__(self, obj, objtype=None) -> PileEngine | pile:
@@ -1901,20 +2004,14 @@ class collection:
             groups = collection(Group)          # -> the "groups" collection
     """
 
+    @declaration
     def __init__(
             self,
-            model:          type[Document],
-            collection:     Collection | str | None = None,
+            model:          type[Document],                     # a stored model needs a uid: subclass Document
+            collection:     CollectionRef = UNSET,              # left out: the attribute name
             key:            str = "uid",
-            extraIndexes:   Sequence[IndexModel] | None = None
+            extraIndexes:   Sequence[IndexModel] | None = None  # None: no extra indexes
         ):
-
-        if not (isinstance(model, type) and issubclass(model, Document)):
-            raise TypeError(
-                f"collection() needs a Document subclass, not {getattr(model, '__name__', model)!r}. "
-                f"A stored model needs a uid and the ability to save itself; "
-                f"subclass pymonque.Document rather than pydantic's BaseModel."
-            )
 
         self.__is_collection__: bool = True
         self.model = model
@@ -1931,7 +2028,7 @@ class collection:
             app,
             name=self.name,
             model=self.model,
-            collection=self.collection,
+            collection=orDefault(self.collection, None),
             key=self.key,
             extraIndexes=self.extraIndexes
         )
@@ -1955,27 +2052,22 @@ class schedulers:
     Declaring one named `scheduler` replaces the app's default engine.
     """
 
+    @declaration
     def __init__(
             self,
             schedulerModel:         type[Scheduler] = Scheduler,
-            schedulersCollection:   Collection | str | None = None,
-            missed:                 MISSED_BEATS | None = None,
-            pollInterval:           float | None = None,
-            extraIndexes:           Sequence[IndexModel] | None = None,
-            leaseSeconds:           float | None = None
+            schedulersCollection:   CollectionRef = UNSET,          # left out: pymonque_schedulers_<name>
+            missed:                 MISSED_BEATS | _Unset = UNSET,  # left out: the app's schedulerMissed
+            pollInterval:           Seconds | _Unset = UNSET,       # left out: the app's schedulerPollInterval
+            extraIndexes:           Sequence[IndexModel] | None = None,  # None: no extra indexes
+            leaseSeconds:           Seconds | _Unset = UNSET        # left out: the app's leaseSeconds
         ):
-
-        if not (isinstance(schedulerModel, type) and issubclass(schedulerModel, Scheduler)):
-            raise TypeError(
-                f"schedulers() needs a Scheduler subclass, not "
-                f"{getattr(schedulerModel, '__name__', schedulerModel)!r}"
-            )
 
         self.__is_schedulers__: bool = True
         self.leaseSeconds = leaseSeconds
         self.schedulerModel = schedulerModel
         self.schedulersCollection = schedulersCollection
-        self.missed = checkMissed(missed) if missed is not None else None    # None: the app's schedulerMissed
+        self.missed = missed
         self.pollInterval = pollInterval
         self.extraIndexes = extraIndexes
         self.name: str = ""
@@ -1991,18 +2083,16 @@ class schedulers:
             leaseSeconds:   float
         ) -> SchedulerEngine:
 
-        collection = self.schedulersCollection
-        if collection is None:
-            collection = "pymonque_schedulers" if self.name == "scheduler" else f"pymonque_schedulers_{self.name}"
+        defaultCollection = "pymonque_schedulers" if self.name == "scheduler" else f"pymonque_schedulers_{self.name}"
 
         return SchedulerEngine(
             app,
-            schedulersCollection=collection,
-            pollInterval=self.pollInterval if self.pollInterval is not None else pollInterval,
-            missed=self.missed or missed,
+            schedulersCollection=orDefault(self.schedulersCollection, defaultCollection),
+            pollInterval=orDefault(self.pollInterval, pollInterval),
+            missed=orDefault(self.missed, missed),
             schedulerModel=self.schedulerModel,
             extraIndexes=self.extraIndexes,
-            leaseSeconds=self.leaseSeconds if self.leaseSeconds is not None else leaseSeconds,
+            leaseSeconds=orDefault(self.leaseSeconds, leaseSeconds),
             name=self.name
         )
 
@@ -2136,6 +2226,9 @@ class BaseApp:
             raise TypeError(
                 f"{cls.__name__}.{name} would replace BaseApp.{name}; declare it under another name"
             )
+
+        # the defaults are checked here, where they are written, like every declaration
+        AppDefaults.of(cls)
 
     # Defaults, declared in code like everything they apply to: every process that
     # imports this app must agree on them, and they are part of the fingerprint so

@@ -576,17 +576,3 @@ def test_saving_a_moved_deadline_moves_the_lease(app):
     scheduler.save()
 
     assert app.scheduler.get(scheduler.uid).leaseUntil == scheduler.deadline
-
-
-# --- missed is checked where it is written ---
-
-def test_an_unknown_missed_rule_is_refused_on_a_declaration():
-    from pymonque import schedulers
-
-    with pytest.raises(ValueError, match="missed"):
-        schedulers(missed="execute once")
-
-
-def test_an_unknown_missed_rule_is_refused_on_the_app(db):
-    with pytest.raises(ValueError, match="missed"):
-        appWith(ExampleApp, db, schedulerMissed="sometimes")

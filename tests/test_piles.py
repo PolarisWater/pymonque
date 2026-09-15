@@ -480,12 +480,10 @@ def test_a_pile_can_override_the_app_limits(db):
 
 
 @pytest.mark.parametrize("limits", [{"maxAttempts": 0}, {"retryDelay": -1}])
-def test_invalid_item_limits_are_rejected(db, limits):
-    class Q(BaseApp):
-        jobs = pile(**limits)
-
-    with pytest.raises(ValueError):
-        Q(db)
+def test_invalid_item_limits_are_rejected_where_they_are_written(limits):
+    with pytest.raises(ValidationError, match=next(iter(limits))):
+        class Q(BaseApp):
+            jobs = pile(**limits)
 
 
 def test_finished_items_survive_a_restart(db, app):

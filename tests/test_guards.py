@@ -164,7 +164,9 @@ def test_a_collection_needs_a_document(db):
     class Plain(BaseModel):
         name: str = ""
 
-    with pytest.raises(TypeError, match="Document subclass"):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="subclass of Document"):
         collection(Plain)
 
 
@@ -172,7 +174,9 @@ def test_a_scheduler_engine_needs_a_scheduler(db):
     class Plain(BaseModel):
         name: str = ""
 
-    with pytest.raises(TypeError, match="Scheduler subclass"):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="subclass of Scheduler"):
         schedulers(Plain)
 
 

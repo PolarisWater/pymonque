@@ -26,6 +26,12 @@ code too — [limits](#limits) on `@task(...)` and `pile(...)`, [missed beats](#
 a failure another treats as final, so it is part of the [fingerprint](#one-version-at-a-time) and two
 that disagree cannot both run workers. Pacing and lease lengths are per-process and stay arguments.
 
+**Declarations are checked where they are written.** A bad setting on `@task(...)`, `pile(...)`,
+`schedulers(...)` or `collection(...)`, or a bad default on the class, raises pydantic's
+`ValidationError` naming the setting, as the class is defined. Leaving a setting out is the only way
+to take the default: `None` is refused everywhere except `timeout` and `skipAfter`, where it means no
+limit.
+
 A declaration can't reuse a name `BaseApp` already has — a pile called `backlog`, a task called
 `init` or `run` — because it would replace that part of the app; the class raises `TypeError` when
 it is defined. The one exception is `scheduler = schedulers(...)`, which replaces the default engine.
@@ -106,7 +112,7 @@ class App(BaseApp):
 
 ```python
 collection(model: type[Document],
-           collection: Collection | str | None = None,   # default: the attribute name
+           collection: Collection | str,                 # left out: the attribute name
            key: str = "uid",
            extraIndexes: Sequence[IndexModel] | None = None)
 ```
@@ -240,6 +246,7 @@ twice. See [Leases](#leases) for why one field covers both due and abandoned.
 | `work` | `CallSpec` |
 | `deadline` | `datetime` (naive UTC) |
 | `factory` | `TaskFactory` — `{uid, name}` |
+| `createdAt` / `claimedAt` / `finishedAt` | `datetime` — the same three moments an item records. `claimedAt` is cleared while a task waits for a retry; `finishedAt` is set once the status is final, including `canceled`, `outdated` and `incompatible` |
 | `executionTime` | `timedelta`, stored as seconds |
 | `result` | anything BSON can encode |
 | `error` | traceback of the last failure |
@@ -290,8 +297,8 @@ A limit left off `@task(...)` takes the app's default, and that is all: a schedu
 limits of its own, and neither does a scheduler, so a task emitted by one runs under the same limits
 as any other call of that task. To run a function under different limits, declare a second task.
 
-Limits are checked where they are written — a bad one on `@task(...)` fails as the class is defined,
-a bad default as the app is built. `app.task.limits` holds what every task resolved to, and all of it
+Limits are checked where they are written — a bad one on `@task(...)`, or a bad default, fails as
+the class is defined. `app.task.limits` holds what every task resolved to, and all of it
 is in the [fingerprint](#one-version-at-a-time): whether a task ends up `timeout`, `outdated` or
 retried must not depend on which process picked it up.
 
@@ -391,11 +398,11 @@ class App(BaseApp):
 
 ```python
 schedulers(schedulerModel: type[Scheduler] = Scheduler,
-           schedulersCollection: Collection | str | None = None,
-           missed: "skip" | "once" | "replay" | None = None,  # default: the app's schedulerMissed
-           pollInterval: float | None = None,                 # default: the app's
+           schedulersCollection: Collection | str,          # left out: pymonque_schedulers_<name>
+           missed: "skip" | "once" | "replay",              # left out: the app's schedulerMissed
+           pollInterval: float,                             # left out: the app's schedulerPollInterval
            extraIndexes: Sequence[IndexModel] | None = None,
-           leaseSeconds: float | None = None)                 # default: the app's
+           leaseSeconds: float)                             # left out: the app's leaseSeconds
 ```
 
 They land in `app.schedulerEngines` and are reachable as `app.<name>`. `app.startWorkers()` starts
@@ -532,6 +539,14 @@ class App(BaseApp):
     scraps = pile()                               # payload is any dict
     other  = pile(Email, itemsCollection="x")     # explicit collection
     retried = pile(Email, maxAttempts=5, retryDelay=10)   # override itemMaxAttempts / itemRetryDelay
+```
+
+```python
+pile(payload: type[BaseModel] | None = None,        # None: items carry any dict
+     itemsCollection: Collection | str,             # left out: pymonque_pile_<name>
+     maxAttempts: int,                              # left out: the app's itemMaxAttempts
+     retryDelay: float,                             # left out: the app's itemRetryDelay
+     leaseSeconds: float)                           # left out: the app's leaseSeconds
 ```
 
 Each pile gets `pymonque_pile_<name>` unless told otherwise.

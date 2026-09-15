@@ -85,11 +85,9 @@ def test_a_bad_limit_fails_where_it_is_written(limits):
 @pytest.mark.parametrize("default", [
     {"taskTimeout": 0}, {"taskSkipAfter": -1}, {"taskMaxAttempts": 0}, {"taskRetryDelay": -1},
 ])
-def test_a_bad_default_fails_when_the_app_is_built(db, default):
-    Broken = type("Broken", (BaseApp,), default)    # no tasks, and it is still checked
-
-    with pytest.raises(ValidationError):
-        Broken(db)
+def test_a_bad_default_fails_where_it_is_written(default):
+    with pytest.raises(ValidationError, match=next(iter(default))):
+        type("Broken", (BaseApp,), default)         # the class itself, with no tasks and no app built
 
 
 # --- nowhere else ---
