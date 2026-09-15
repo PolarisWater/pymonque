@@ -9,29 +9,29 @@ nothing; **New** — no old test, decided since.
 
 ## Claiming and leases
 
-- [ ] A due task is claimed and run; a future one is left alone; working nothing is a no-op [tasks]
-- [ ] Oldest deadline first; a task is never claimed twice, also across worker threads [tasks, app]
-- [ ] A fresh task carries a lease equal to its deadline; claiming pushes it out [leases]
-- [ ] A long task is not taken over while its lease is renewed; renewal stops when the work does [leases, tasks]
+- [x] A due task is claimed and run; a future one is left alone; working nothing is a no-op [tasks]
+- [x] Oldest deadline first; a task is never claimed twice, also across worker threads [tasks, app]
+- [x] A fresh task carries a lease equal to its deadline; claiming pushes it out [leases]
+- [x] A long task is not taken over while its lease is renewed; renewal stops when the work does [leases, tasks]
 - [ ] A lapsed lease is claimable by the next worker; a live one is left alone — tasks, schedulers, items [tasks, schedulers, piles, leases]
 - [ ] A new app instance does not disturb work in flight or live leases [leases, piles]
 - [ ] Leases keep renewing while a shutdown drains [leases]
 - [ ] Indexes back the claim query — tasks, schedulers, piles [tasks, schedulers, piles]
 - [ ] **Changed:** every claim gets its own `claimId` — tasks, items and held schedulers, one mechanism (B6) [claims]
 - [ ] A stale holder cannot finish, fail, release or renew; the current holder can [claims]
-- [ ] Renewal skips work another worker took; a renewal never overwrites an outcome [claims, tasks]
-- [ ] A lost task claim does not overwrite a cancel; a taken-over task keeps the new claim's outcome [claims]
+- [x] Renewal skips work another worker took; a renewal never overwrites an outcome [claims, tasks]
+- [x] A lost task claim does not overwrite a cancel; a taken-over task keeps the new claim's outcome [claims]
 - [ ] `work()` logs when its outcome was not recorded [claims]
 - [ ] Moving a deadline by hand (save or update) moves a waiting task's or scheduler's lease [tasks, schedulers]
 - [ ] **Dropped:** a waiting retry keeps its retry time on save; renewal skips a waiting retry [tasks]
 
 ## Failure
 
-- [ ] A raising task is marked failed with the traceback [tasks]
+- [x] A raising task is marked failed with the traceback [tasks]
 - [ ] `sys.exit()` in a task or a `work()` block is a failure, not a dead worker thread [tasks, piles]
-- [ ] A result the driver cannot encode is a failure and does not leave the task claimed [tasks]
+- [x] A result the driver cannot encode is a failure and does not leave the task claimed [tasks]
 - [ ] A task whose function vanished is flagged incompatible at `init()`; a finished one is not [tasks]
-- [ ] **Changed:** a task whose worker died is `failed`, never rerun, with an error saying so [retries]
+- [x] **Changed:** a task whose worker died is `failed`, never rerun, with an error saying so [retries]
 - [ ] **Dropped:** task retries — retried until the last attempt, retry delay, success clears the old error, app default for retries, emitted tasks retry, crash below the limit recovered, outdated retry not run, `wait` treats a retry as unfinished [retries, wait, timestamps]
 - [ ] **New:** no `maxAttempts` / `retryDelay` on `@task` or the app; declaring them is refused
 
@@ -47,9 +47,9 @@ nothing; **New** — no old test, decided since.
 
 ### skipAfter
 
-- [ ] Without a limit a task runs however late; `None` makes a task unskippable [stale]
-- [ ] The app default applies to a bare task; a task declares its own in either direction [stale]
-- [ ] An outdated task is not run, says how late, and was claimed and finished [stale, timestamps]
+- [x] Without a limit a task runs however late; `None` makes a task unskippable [stale]
+- [x] The app default applies to a bare task; a task declares its own in either direction [stale]
+- [x] An outdated task is not run, says how late, and was claimed and finished [stale, timestamps]
 - [ ] An emitted task goes stale by its task's limit [stale]
 
 ## Piles
@@ -130,18 +130,18 @@ nothing; **New** — no old test, decided since.
 
 ## Task engines
 
-- [ ] `schedule` stores a pending task, validates first, defaults to now, stamps the default or a named factory [tasks]
-- [ ] `scheduleFromDistribution` pushes the deadline out and validates the distribution [tasks]
-- [ ] `work` returns the task it ran; a queue drains by looping on it [tasks]
+- [x] `schedule` stores a pending task, validates first, defaults to now, stamps the default or a named factory [tasks]
+- [x] `scheduleFromDistribution` pushes the deadline out and validates the distribution [tasks]
+- [x] `work` returns the task it ran; a queue drains by looping on it [tasks]
 - [ ] An instance task runs with its app; a classmethod can be a task; a subclass's plain method unregisters it [tasks]
-- [ ] A task gets models and coerced values, not stored data [tasks]
-- [ ] `update` validates before writing [tasks]
-- [ ] A task can be given a model [collections]
-- [ ] Cancel: a waiting or abandoned task can be; running or finished cannot; unknown uid reports nothing; `cancelMany` filters and leaves running work alone; a cancelled task never runs [cancel]
-- [ ] `wait` returns the finished task, takes a uid, works from another process, counts a failure as finished, times out, errors on an unknown task [wait]
+- [x] A task gets models and coerced values, not stored data [tasks]
+- [x] `update` validates before writing [tasks]
+- [x] A task can be given a model [collections]
+- [x] Cancel: a waiting or abandoned task can be; running or finished cannot; unknown uid reports nothing; `cancelMany` filters and leaves running work alone; a cancelled task never runs [cancel]
+- [x] `wait` returns the finished task, takes a uid, works from another process, counts a failure as finished, times out, errors on an unknown task [wait]
 - [ ] **New:** several task engines, each with its own collection; any engine runs any task
 - [ ] **New:** a `Task` subclass on a declaration adds fields given to `schedule(…)`; `Scheduler.taskFields()` supplies them
-- [ ] **New:** `Task.runWork()` is the only place context is stamped; `schedule()` validates it; a plain `Task` runs `work` unchanged
+- [x] **New:** `Task.runWork()` is the only place context is stamped; `schedule()` validates it; a plain `Task` runs `work` unchanged
 
 ## Processes and versions
 
@@ -190,7 +190,7 @@ nothing; **New** — no old test, decided since.
 - [x] Left-out settings take the app's defaults; given ones win; `None` only means no limit [declarations, limits]
 - [x] An existing collection object is accepted [declarations]
 - [x] A bare task takes the defaults; a declared limit wins, the rest default; both decorator forms work [limits]
-- [ ] A task runs under its function's limits; declared once; calls, stored tasks and schedulers carry no limits [limits]
+- [x] A task runs under its function's limits; declared once; calls, stored tasks and schedulers carry no limits [limits]
 - [ ] A declaration or task cannot shadow the app; the reserved names cover every attribute `__init__` sets [app]
 - [x] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)` (N1)
 - [x] **Changed:** declarations `tasks` / `schedulers` / `pile` / `collection` / `@task`; defaults `task*`, `pile*`, `scheduler*` (N3)
@@ -238,8 +238,8 @@ nothing; **New** — no old test, decided since.
 ### Timestamps
 
 - [ ] Tasks and items record `createdAt`, `claimedAt`, `finishedAt` [timestamps]
-- [ ] A new task has only been created; a run one records its claim and finish [timestamps]
-- [ ] Cancelled finished without a claim; incompatible and given-up tasks are finished [timestamps]
+- [x] A new task has only been created; a run one records its claim and finish [timestamps]
+- [x] Cancelled finished without a claim; incompatible and given-up tasks are finished [timestamps]
 - [ ] **New:** a cancelled item finished without a claim
 
 ## Reprs

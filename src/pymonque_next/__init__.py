@@ -11,7 +11,7 @@ from .documents import CollectionEngine, Document, utc_now
 from .piles import Item
 from .schedulers import Scheduler
 from .settings import AppDefaults, TaskLimits
-from .tasks import Task, TaskFactory
+from .tasks import Task, TaskEngine, TaskFactory
 
 __all__ = [
     "AppDefaults",
@@ -25,6 +25,7 @@ __all__ = [
     "Item",
     "Scheduler",
     "Task",
+    "TaskEngine",
     "TaskFactory",
     "TaskLimits",
     "collection",

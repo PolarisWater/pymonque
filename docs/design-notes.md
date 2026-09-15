@@ -54,8 +54,50 @@ Built in `src/pymonque_next/`, tested in `tests_next/`. Small decisions made alo
   `BaseDistributions`.
 - **Left for later layers,** because they need an engine or `BaseApp`: a declaration named `task` or
   `scheduler` replacing the default; reserved names; app defaults checked at class definition;
-  `Task.runWork()` and `Scheduler.taskFields()`; emitting and scheduling. Checklist items that
-  straddle layers stay unticked until their last part has a test.
+  `Scheduler.taskFields()` and emitting (`Task.runWork()` and scheduling came with layer 2).
+  Checklist items that straddle layers stay unticked until their last part has a test.
+
+### Layer 2: claims and task engines
+
+`claims.py` and the task engine in `tasks.py`. Small decisions made along the way:
+
+- **Renewal follows the claim, not the worker threads.** Each claiming engine has a `Leases`: a claim
+  is held while its work runs and let go when it ends, and one thread per collection renews what is
+  held, starting with the first claim and ending with the last. A lease is therefore renewed through
+  a shutdown that waits for the work, with no tie to the worker loop. It renews every
+  `leaseSeconds / 3` with no one-second floor, so a short lease is still kept. For layer 4: a timeout
+  must stop renewing the pile items its thread holds (§5.10), so a hold will need to know its thread.
+- **An outcome clears the claimId.** `writeClaimed` writes only while the claimId matches, and clears
+  it in the same write, so a claim gets one outcome and a renewal racing it matches nothing. A
+  cancel clears it too, so a worker whose lease lapsed cannot write over the cancel.
+- **A claim returns the document as it found it.** A task still `running` was held by a worker that
+  stopped renewing: the claim that finds it writes it off as `failed`, keeps the time it was
+  started, logs an error, and does not run it.
+- **A task's outcome writes only the outcome** — `status`, `claimedAt`, `finishedAt`,
+  `executionTime`, `result`, `error` — so a field changed while the task ran survives.
+- **The task engine takes what the app resolved:** the collection, model and name; the app's tasks as
+  `taskFunctions(...)`, one `Functions` every task engine shares; `TaskEngineSettings`; each task's
+  `TaskLimits`, where a task without an entry has none; the `DistributionEngine`; and a default
+  factory, `TaskFactory(name="default")` unless given. `pollInterval` belongs to the worker loop.
+- **`work()` claims and runs one task,** returning it as it ended, or None. The worker threads that
+  loop on it come with layer 4, and so do timeouts: layer 2 resolves `timeout` but does not enforce it.
+- **`schedule(work, deadline=, factory=, **fields)` takes only the fields the model adds to `Task`.**
+  A limit is refused as belonging to `@task`, a field of `Task` itself as the engine's to keep, and
+  anything else by naming the fields the model does add. The call is checked as `runWork()` returns
+  it. `_newTask()` builds that checked task unstored, for a scheduler to emit.
+- **`flagIncompatible()` marks waiting tasks with no function as incompatible, per engine;** when the
+  app calls it, and across which engines, is §5.11.
+- **In tests,** mongomock's `find_one_and_update` finds, then updates by `_id`, so two threads can
+  take one document. `tests_next/conftest.py` locks it, standing in for MongoDB's atomic claim.
+- **Open:**
+  - Calling a task engine (`app.accountTasks("sync")`) checks the whole call against the signature,
+    as calling the distribution engine does. On an engine whose `Task` supplies an argument through
+    `runWork()`, that refuses the call for the very argument the task would supply; the class form
+    `App.sync()` builds it unchecked, and `schedule()` checks it. The alternative: calling the engine
+    checks only the arguments given, and `schedule()` checks the rest.
+  - A task left `running` by a dead worker, whose function has since gone, is claimed by no engine —
+    a claim only takes tasks it can run — so it stays `running`. For §5.11: `flagIncompatible()`
+    could write those off as well.
 
 ## Decided, not built yet
 
