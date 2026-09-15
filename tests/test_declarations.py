@@ -20,6 +20,7 @@ BAD_DECLARATIONS = {
     "pile leaseSeconds 0":          (lambda: pile(leaseSeconds=0), "leaseSeconds"),
     "pile collection None":         (lambda: pile(itemsCollection=None), "itemsCollection"),
     "pile payload not a model":     (lambda: pile(payload=int), "payload"),
+    "pile extraIndexes not indexes": (lambda: pile(extraIndexes=["data.to"]), "extraIndexes"),
     "schedulers missed unknown":    (lambda: schedulers(missed="execute once"), "missed"),
     "schedulers missed None":       (lambda: schedulers(missed=None), "missed"),
     "schedulers pollInterval None": (lambda: schedulers(pollInterval=None), "pollInterval"),

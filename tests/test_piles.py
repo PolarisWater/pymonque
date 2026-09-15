@@ -545,3 +545,15 @@ def test_done_after_a_retry_clears_the_earlier_error(db):
         pass
 
     assert app.jobs.get(item.uid).error is None
+
+
+def test_a_pile_can_declare_extra_indexes(db):
+    from pymongo import ASCENDING, IndexModel
+
+    class Q(BaseApp):
+        jobs = pile(Email, extraIndexes=[IndexModel([("data.to", ASCENDING)], name="to_idx")])
+
+    names = set(Q(db).jobs.collection.index_information())
+
+    assert "to_idx" in names
+    assert "status_1_leaseUntil_1" in names      # alongside the claim index, not instead of it

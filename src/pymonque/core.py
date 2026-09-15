@@ -1620,7 +1620,8 @@ class PileEngine(CollectionEngine):
             itemsCollection:    Collection | str | None = None,
             maxAttempts:        int | _Unset = UNSET,
             retryDelay:         float | _Unset = UNSET,
-            leaseSeconds:       float = LEASE_SECONDS
+            leaseSeconds:       float = LEASE_SECONDS,
+            extraIndexes:       Sequence[IndexModel] | None = None
         ):
 
         self.leaseSeconds = leaseSeconds
@@ -1643,7 +1644,8 @@ class PileEngine(CollectionEngine):
             name=name,
             # a concrete Item type whose `data` is validated against the payload model
             model=Item[payload] if payload is not None else Item[dict[str, Any]],
-            collection=itemsCollection
+            collection=itemsCollection,
+            extraIndexes=extraIndexes
         )
 
     def defaultCollectionName(self) -> str:
@@ -1962,7 +1964,8 @@ class pile:
             itemsCollection:    CollectionRef = UNSET,          # left out: pymonque_pile_<name>
             maxAttempts:        MaxAttempts | _Unset = UNSET,   # left out: the app's itemMaxAttempts
             retryDelay:         RetryDelay | _Unset = UNSET,    # left out: the app's itemRetryDelay
-            leaseSeconds:       Seconds | _Unset = UNSET        # left out: the app's leaseSeconds
+            leaseSeconds:       Seconds | _Unset = UNSET,       # left out: the app's leaseSeconds
+            extraIndexes:       Sequence[IndexModel] | None = None  # None: no extra indexes
         ):
 
         self.__is_pile__: bool = True
@@ -1971,6 +1974,7 @@ class pile:
         self.maxAttempts = maxAttempts
         self.retryDelay = retryDelay
         self.leaseSeconds = leaseSeconds
+        self.extraIndexes = extraIndexes
         self.name: str = ""
 
     def __set_name__(self, owner, name: str):
@@ -1984,7 +1988,8 @@ class pile:
             itemsCollection=orDefault(self.itemsCollection, None),
             maxAttempts=self.maxAttempts,
             retryDelay=self.retryDelay,
-            leaseSeconds=orDefault(self.leaseSeconds, leaseSeconds)
+            leaseSeconds=orDefault(self.leaseSeconds, leaseSeconds),
+            extraIndexes=self.extraIndexes
         )
 
     def __get__(self, obj, objtype=None) -> PileEngine | pile:

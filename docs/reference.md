@@ -546,7 +546,8 @@ pile(payload: type[BaseModel] | None = None,        # None: items carry any dict
      itemsCollection: Collection | str,             # left out: pymonque_pile_<name>
      maxAttempts: int,                              # left out: the app's itemMaxAttempts
      retryDelay: float,                             # left out: the app's itemRetryDelay
-     leaseSeconds: float)                           # left out: the app's leaseSeconds
+     leaseSeconds: float,                           # left out: the app's leaseSeconds
+     extraIndexes: Sequence[IndexModel] | None = None)
 ```
 
 Each pile gets `pymonque_pile_<name>` unless told otherwise.
