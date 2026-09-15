@@ -8,16 +8,15 @@ Finding ids (B1, P3, N2…) refer to the engine anatomy review of `c3e75e2`.
 ### Several task engines (B5, which also settles B1)
 
 - An app may declare more than one task engine, each with its own collection.
-- Tasks are **not** assigned to an engine where they are declared. Scheduler engines are told which
-  task engine to emit into, and code that queues work calls `schedule()` on the right task engine
-  itself.
+- Tasks belong to no engine: every task engine can run any of the app's tasks. A scheduler engine
+  emits into the task engine selected for it; everywhere else, users schedule on whichever task
+  engine they want.
 - Worker counts: `taskWorkers` and `schedulerWorkers` take an int, meaning that many threads on
   **every** engine of that kind, or a dict of engine name to count. Engines a dict leaves out get
   none.
 - Still open when this is picked up:
   - how a scheduler engine names its task engine (attribute name, or a reference);
   - the collection name of a declared task engine (`pymonque_tasks_<name>`, matching schedulers);
-  - whether every task engine can run every task of the app, and what its claim filter becomes;
   - how `init()`, the backlog warning and the fingerprint span several task engines;
   - whether the declaration can shape the engine's model, collection and indexes (the rest of B5).
 
