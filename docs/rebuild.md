@@ -188,8 +188,8 @@ pymonque/
 
 ## 5. Decide before building — Open
 
-Ordered by how much of the shape depends on them. **All nine are decided** as written below
-(the *Recommended* answer, except where 2 says otherwise).
+Ordered by how much of the shape depends on them. **All ten are decided** as written below
+(the *Recommended* answer, except where 2 and 10 say otherwise).
 
 1. **Claim identity (B6).** One `claimId` on every claimed document — task, item, and a scheduler
    while it is held — replacing `attempts` matching for tasks and `deadline` matching for
@@ -221,12 +221,25 @@ Ordered by how much of the shape depends on them. **All nine are decided** as wr
    no new verbs until something needs one.
 9. **Custom tasks (§3).** *Recommended:* context is stamped only on the task, with schedulers passing
    it through `taskFields()`; extra fields are data only, and a priority order can come later.
-10. **What a timeout can stop — Open.** Python cannot kill a thread, so today a timeout frees the
-    worker and writes the task off while the call keeps running; an infinite loop spins until the
-    process exits. Proposed: keep that as the baseline, and add an exception injected into the
-    thread (stops pure-Python loops, not calls blocked in C, I/O or sleep) plus an opt-in to retire
-    a worker process once abandoned threads pile up, for a supervisor to restart. A child process
-    per task is left for later.
+10. **What a timeout can stop — Decided.** Python cannot kill a thread. A timeout still frees the
+    worker and writes the task off; on top of that:
+    - **An exception is injected into the thread** (`PyThreadState_SetAsyncExc`). It stops
+      pure-Python loops, not calls blocked in C, I/O or sleep, and a bare `except:` can catch it.
+    - **Opt-in retiring:** once a process holds N abandoned threads it stops claiming, drains what
+      it holds, and exits for its supervisor (Docker, systemd) to restart.
+    - A child process per task is left for later.
+
+    **Only because it can be logged clearly** — each step names the task and shows where the thread
+    is (`sys._current_frames()` gives any thread's stack):
+    - at the timeout: warning with task uid, function, the limit, and the thread's stack; the same
+      stack goes into the task's `error`;
+    - a few seconds later: "stopped" or "still running after being stopped — blocked outside Python,
+      abandoned", with the stack again;
+    - the abandoned-thread count is published on the worker's registry heartbeat, so other
+      processes and operators see it;
+    - on retiring: an error listing each abandoned task, how long it has run and where it is stuck,
+      then "no longer claiming, draining N", then the exit — `run()` reports it so the process can
+      exit with a code of its own.
 
 Also settled with these:
 - **Worker counts:** an int means that many threads on every engine of the kind, the default task
@@ -239,7 +252,7 @@ Also settled with these:
 
 1. **Settle §5,** and fold the answers into this document.
 2. **Turn the current tests into a behaviour checklist,** grouped by §2's headings, so nothing the
-   old code guarantees is lost silently.
+   old code guarantees is lost silently — done: `docs/rebuild-checklist.md`.
 3. **Build bottom-up beside the old package** — settings and declarations, documents, calls, claims,
    then tasks, schedulers and piles, then the app, versions and workers — each layer with its tests
    before the next.
