@@ -107,9 +107,10 @@ def refusePositional(func: Callable, *, bound: bool = False, name: str | None = 
             raise TypeError(f"{label} takes {parameter.name} positionally; a stored call passes keyword arguments only")
 
 
-def argumentsOf(func: Callable) -> TypeAdapter[dict[str, Any]]:
+def argumentsOf(func: Callable, *, complete: bool = True) -> TypeAdapter[dict[str, Any]]:
     """What a call of `func` may pass: each named parameter as its annotation declares it — anything
     if unannotated, required unless it has a default — and other names only if it takes **kwargs.
+    With `complete=False` nothing is required: the arguments given are checked, and more may follow.
 
     Arguments left out stay left out, so the function applies its own defaults.
     """
@@ -126,7 +127,8 @@ def argumentsOf(func: Callable) -> TypeAdapter[dict[str, Any]]:
             continue
 
         annotation = hints.get(name, Any)
-        fields[name] = Required[annotation] if parameter.default is parameter.empty else NotRequired[annotation]
+        required = complete and parameter.default is parameter.empty
+        fields[name] = Required[annotation] if required else NotRequired[annotation]
 
     # a TypedDict rather than a model, so a parameter may have any name a model field could not
     arguments = TypedDict(f"{getattr(func, '__name__', 'call')}Arguments", fields)  # type: ignore[misc]
@@ -161,6 +163,10 @@ class Functions:
             name: argumentsOf(func) for name, func in self.functions.items()
         }
 
+        self.given: dict[str, TypeAdapter[dict[str, Any]]] = {
+            name: argumentsOf(func, complete=False) for name, func in self.functions.items()
+        }
+
     def __contains__(self, name: object) -> bool:
         return name in self.functions
 
@@ -170,8 +176,8 @@ class Functions:
     def __len__(self) -> int:
         return len(self.functions)
 
-    def _checked(self, call: CallSpec) -> dict[str, Any]:
-        arguments = self.arguments.get(call.functionName)
+    def _checked(self, call: CallSpec, complete: bool = True) -> dict[str, Any]:
+        arguments = (self.arguments if complete else self.given).get(call.functionName)
 
         if arguments is None:
             raise self.notFound(f"there is no {self.what} {call.functionName}")
@@ -181,10 +187,11 @@ class Functions:
         except ValidationError as e:
             raise self.invalid(f"{call!r} does not fit {self.what} {call.functionName}: {e}") from e
 
-    def validate(self, call: CallSpec) -> CallSpec:
-        """Raise unless the call fits its function; return it unchanged."""
+    def validate(self, call: CallSpec, *, complete: bool = True) -> CallSpec:
+        """Raise unless the call fits its function; return it unchanged. With `complete=False` only the
+        arguments given are checked, for a call that something adds to before it runs."""
 
-        self._checked(call)
+        self._checked(call, complete)
 
         return call
 

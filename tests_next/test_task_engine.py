@@ -64,12 +64,23 @@ def test_calling_the_engine_builds_a_checked_call(engine):
 
 @pytest.mark.parametrize("name, kwargs, error", [
     ("nope", {}, TaskNotFound),
-    ("greet", {}, TaskValidationError),
+    ("greet", {"name": 42}, TaskValidationError),
     ("greet", {"name": "Ada", "nope": 1}, TaskValidationError),
 ])
-def test_calling_the_engine_refuses_a_call_that_does_not_fit(engine, name, kwargs, error):
+def test_calling_the_engine_refuses_arguments_that_do_not_fit(engine, name, kwargs, error):
     with pytest.raises(error):
         engine(name, **kwargs)
+
+
+def test_calling_the_engine_leaves_a_missing_argument_to_schedule(engine):
+    call = engine("greet")
+
+    assert call == CallSpec.new("greet")
+
+    with pytest.raises(TaskValidationError):
+        engine.schedule(call)
+
+    assert engine.count() == 0
 
 
 # --- scheduling ---
@@ -252,15 +263,20 @@ def test_a_call_is_checked_again_when_it_runs(engine):
 # --- limits ---
 
 def test_a_task_runs_under_its_functions_limits(taskEngine):
-    engine = taskEngine({"greet": greet, "boom": boom}, limits={"greet": TaskLimits(skipAfter=5)})
+    engine = taskEngine({"greet": greet, "boom": boom}, limits={"greet": TaskLimits(skipAfter=5), "boom": TaskLimits(timeout=9)})
 
-    assert engine.limitsFor(engine.schedule(engine("greet", name="Ada"))).skipAfter == 5
-    assert engine.limitsFor(engine.schedule(engine("boom"))) == TaskLimits()
+    assert engine.limitsFor(engine.schedule(engine("greet", name="Ada"))) == TaskLimits(skipAfter=5)
+    assert engine.limitsFor(engine.schedule(engine("boom"))) == TaskLimits(timeout=9)
 
 
 def test_limits_for_a_task_the_engine_does_not_have_are_refused(taskEngine):
-    with pytest.raises(TypeError, match="nope"):
-        taskEngine({"greet": greet}, limits={"nope": TaskLimits()})
+    with pytest.raises(TypeError, match="limits given for nope"):
+        taskEngine({"greet": greet}, limits={"greet": TaskLimits(), "nope": TaskLimits()})
+
+
+def test_a_task_without_limits_is_refused_rather_than_run_without_the_defaults(taskEngine):
+    with pytest.raises(TypeError, match="no limits given for boom"):
+        taskEngine({"greet": greet, "boom": boom}, limits={"greet": TaskLimits()})
 
 
 # --- the collection ---
@@ -337,6 +353,28 @@ def test_a_waiting_task_whose_function_is_gone_is_flagged_incompatible(engine, t
     assert stored(engine, finished).status == "done"
 
 
+def test_a_task_a_dead_worker_left_running_whose_function_is_gone_is_written_off(engine, taskEngine):
+    def running(name, leaseUntil):
+        task = engine.schedule(engine("greet", name=name))
+        engine.collection.update_one({"uid": task.uid}, {"$set": {"status": "running", "claimId": "a-worker", "leaseUntil": leaseUntil}})
+
+        return task
+
+    stuck = running("stuck", utc_now() - timedelta(seconds=1))
+    live = running("live", utc_now() + timedelta(minutes=5))
+    waiting = engine.schedule(engine("greet", name="waiting"))
+
+    assert engine.writeOffStuck() == 0      # an engine that can run it leaves it to a claim
+    assert taskEngine({"boom": boom}).writeOffStuck() == 1
+
+    ended = stored(engine, stuck)
+
+    assert (ended.status, ended.claimId) == ("failed", None)
+    assert "stopped renewing the lease" in ended.error and ended.finishedAt is not None
+    assert stored(engine, live).status == "running"
+    assert stored(engine, waiting).status == "pending"
+
+
 # --- several engines ---
 
 def test_any_task_engine_runs_any_task_from_its_own_collection(taskEngine):
@@ -383,6 +421,12 @@ def test_a_call_is_checked_as_runWork_gives_it(accounts, engine):
 
     with pytest.raises(TaskValidationError):
         engine.schedule(CallSpec.new("sync"))                       # a plain task has none to give
+
+
+def test_calling_an_engine_leaves_out_what_runWork_supplies(accounts):
+    accounts.schedule(accounts("sync", full=True), accountId=42)
+
+    assert accounts.work().result == "synced 42 full=True"
 
 
 def test_a_plain_task_runs_its_work_unchanged(engine):

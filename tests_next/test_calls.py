@@ -128,6 +128,29 @@ def test_arguments_that_do_not_fit_are_refused(functions, kwargs):
         functions.build("greet", **kwargs)
 
 
+def test_a_partial_check_takes_the_arguments_given_and_leaves_the_rest(functions):
+    call = CallSpec.new("greet", greeting="Hi")
+
+    assert functions.validate(call, complete=False) is call
+
+    with pytest.raises(TaskValidationError):
+        functions.validate(call)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"nope": 1},
+    {"greeting": object()},
+], ids=["unknown", "wrongly typed"])
+def test_a_partial_check_still_refuses_arguments_given_wrong(functions, kwargs):
+    with pytest.raises(TaskValidationError, match="greet"):
+        functions.validate(CallSpec.new("greet", **kwargs), complete=False)
+
+
+def test_a_partial_check_refuses_an_unknown_function(functions):
+    with pytest.raises(TaskNotFound):
+        functions.validate(CallSpec.new("does_not_exist"), complete=False)
+
+
 def test_an_optional_argument_may_be_omitted_and_the_function_applies_its_default(functions):
     call = functions.build("greet", name="Ada")
 

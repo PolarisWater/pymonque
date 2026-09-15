@@ -25,9 +25,10 @@ tasks), **distributions** (interval functions for schedulers).
 - **The library is being rebuilt, not refactored.** Too many fixes were fitted onto a shape that grew
   one kind at a time. The rebuild is designed in full.
 - **Layers 1 and 2 are built:** settings, declarations, documents, calls, distributions, and the
-  `Task`, `Scheduler` and `Item` models; then claims, lease renewal and the task engine — 345 tests in
-  `tests_next/`. The small decisions made along the way, what each leaves for later layers, and two
-  open questions from layer 2 are in `design-notes.md` under "Decided while building".
+  `Task`, `Scheduler` and `Item` models; then claims, lease renewal and the task engine, with the
+  layer 2 review's decisions and fixes built — 354 tests in `tests_next/`. The small decisions made
+  along the way, and what each leaves for later layers, are in `design-notes.md` under "Decided while
+  building".
   **Next: layer 3**, scheduler engines and piles, including the `work()` block.
 - **Branches:** `main` holds the current library and all docs. `rebuild` was branched from it and
   holds the checklist, this file and the rebuild code. Neither is pushed — `main` is ahead of

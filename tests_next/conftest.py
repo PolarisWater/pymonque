@@ -9,7 +9,7 @@ import pytest
 from mongomock import MongoClient
 from mongomock.collection import Collection
 
-from pymonque_next import Task, TaskEngine
+from pymonque_next import Task, TaskEngine, TaskLimits
 from pymonque_next.settings import TaskEngineSettings
 from pymonque_next.tasks import taskFunctions
 
@@ -42,15 +42,19 @@ def db():
 
 @pytest.fixture
 def taskEngine(db):
-    """Build a task engine the way an app will, from its tasks, their limits and its lease."""
+    """Build a task engine the way an app will, from its tasks, every task's limits — none, unless given
+    — and its lease."""
 
-    def build(functions=None, model=Task, *, name="task", collection=None, leaseSeconds=300, **kwargs):
+    def build(functions=None, model=Task, *, name="task", collection=None, leaseSeconds=300, limits=None, **kwargs):
+        functions = functions or {}
+
         return TaskEngine(
             db[collection or f"pymonque_task_{name}"],
             model,
             name=name,
-            functions=taskFunctions(functions or {}),
+            functions=taskFunctions(functions),
             settings=TaskEngineSettings(leaseSeconds=leaseSeconds),
+            limits=limits if limits is not None else {task: TaskLimits() for task in functions},
             **kwargs,
         )
 

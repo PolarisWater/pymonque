@@ -98,7 +98,11 @@ OUTCOME_FIELDS = frozenset({"status", "claimedAt", "finishedAt", "executionTime"
 # what schedule() refuses by name, rather than as a field the model lacks
 LIMITS = frozenset({"timeout", "skipAfter"})
 
-NO_LIMITS = TaskLimits()
+# the error of a task written off because its worker died; when is in its leaseUntil, which stays
+WORKER_DIED = (
+    "its worker stopped renewing the lease while running it — killed, or taken down by the task "
+    "itself; not run again, since it may have done part of its work"
+)
 
 
 def taskFunctions(functions: Mapping[str, Callable]) -> Functions:
@@ -123,7 +127,7 @@ class TaskEngine(CollectionEngine[T]):
             name:           str,
             functions:      Functions,
             settings:       TaskEngineSettings,
-            limits:         Mapping[str, TaskLimits] | None = None,
+            limits:         Mapping[str, TaskLimits],
             distributions:  DistributionEngine | None = None,
             factory:        TaskFactory | None = None,
             extraIndexes:   Sequence[IndexModel] | None = None
@@ -132,14 +136,20 @@ class TaskEngine(CollectionEngine[T]):
         if not (isinstance(model, type) and issubclass(model, Task)):
             raise TypeError(f"a task engine stores a Task or a subclass of it, not {model!r}")
 
-        unknown = sorted(set(limits or {}) - set(functions))
+        unknown = sorted(set(limits) - set(functions))
+        missing = sorted(set(functions) - set(limits))
 
         if unknown:
             raise TypeError(f"limits given for {', '.join(unknown)}, which {name} has no task for")
 
+        # every task's limits, defaults filled in: a task left out would silently run without the
+        # app's taskTimeout and taskSkipAfter
+        if missing:
+            raise TypeError(f"no limits given for {', '.join(missing)}; every task runs under its resolved limits")
+
         self.functions = functions
         self.settings = settings
-        self.limits: dict[str, TaskLimits] = dict(limits or {})
+        self.limits: dict[str, TaskLimits] = dict(limits)
         self.distributions = distributions or DistributionEngine()
         self.factory: TaskFactory = factory or TaskFactory(name="default")
 
@@ -152,9 +162,15 @@ class TaskEngine(CollectionEngine[T]):
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])    # the claim
 
     def __call__(self, functionName: str, /, **kwargs: Any) -> CallSpec:
-        """A call of the task of this name, checked."""
+        """A call of the task of this name, the arguments given checked: no unknown names, and each of
+        the type the function declares.
 
-        return self.functions.build(functionName, **kwargs)
+        Whether any are missing is left to schedule(), which checks the call as the task's runWork()
+        gives it, since a Task subclass may supply arguments of its own. A distribution call is
+        checked in full, because nothing adds to it.
+        """
+
+        return self.functions.validate(CallSpec.new(functionName, **kwargs), complete=False)
 
     def limitsFor(self, task: Task) -> TaskLimits:
         """The limits a task runs under: those its function declares, with the app's defaults for the rest."""
@@ -164,7 +180,7 @@ class TaskEngine(CollectionEngine[T]):
         if name not in self.functions:
             raise TaskNotFound(f"there is no task {name}")
 
-        return self.limits.get(name, NO_LIMITS)
+        return self.limits[name]
 
     # --- scheduling ---
 
@@ -287,11 +303,11 @@ class TaskEngine(CollectionEngine[T]):
         if self._tooLate(task, now):
             return self._outdate(task, now)
 
-        # no time limit is enforced yet: timeouts arrive with the workers, in layer 4
+        # held until the outcome is written, not only until the call returns, so the lease cannot lapse
+        # in between. No time limit is enforced yet: timeouts arrive with the workers, in layer 4.
         with self.leases.holding(task.uid, task.claimId):
             self._run(task)
-
-        self._record(task)
+            self._record(task)
 
         return task
 
@@ -336,10 +352,7 @@ class TaskEngine(CollectionEngine[T]):
         task.status = "failed"
         task.claimedAt = before.get("claimedAt")     # when it was started, not when it was found abandoned
         task.finishedAt = utc_now()
-        task.error = (
-            f"its worker stopped renewing the lease while running it, at {before.get('leaseUntil')} — killed, "
-            f"or taken down by the task itself; not run again, since it may have done part of its work"
-        )
+        task.error = WORKER_DIED
 
         if self._record(task):
             logger.error("%r failed: %s", task, task.error)
@@ -436,4 +449,20 @@ class TaskEngine(CollectionEngine[T]):
                 "error": "this app has no task of this name",
                 "finishedAt": utc_now(),
             }},
+        ).matched_count
+
+    def writeOffStuck(self) -> int:
+        """Write off tasks a dead worker left running whose function this engine does not have. Returns
+        how many.
+
+        A claim only takes tasks it can run, so none would ever find these. They fail with the error a
+        claim would write — not incompatible, since the worker died before the function went.
+        Housekeeping like flagIncompatible(), and checked by the app the same way.
+        """
+
+        now = utc_now()
+
+        return self.collection.update_many(
+            {"status": "running", "leaseUntil": {"$lte": now}, "work.functionName": {"$nin": list(self.functions)}},
+            {"$set": {"status": "failed", "error": WORKER_DIED, "finishedAt": now, "claimId": None}},
         ).matched_count

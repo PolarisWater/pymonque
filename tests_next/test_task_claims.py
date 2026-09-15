@@ -81,6 +81,22 @@ def test_an_outcome_lets_go_of_the_claim(engine):
     assert len(engine.leases) == 0
 
 
+def test_a_claim_is_held_until_its_outcome_is_written(engine, monkeypatch):
+    heldWhileWriting = []
+    record = engine._record
+
+    def recording(task):
+        heldWhileWriting.append(len(engine.leases))
+
+        return record(task)
+
+    monkeypatch.setattr(engine, "_record", recording)
+    engine.schedule(CallSpec.new("ping"))
+    engine.work()
+
+    assert heldWhileWriting == [1]
+
+
 def test_a_task_held_under_a_live_lease_is_left_alone(engine):
     task = engine.schedule(CallSpec.new("ping"))
     engine.collection.update_one({"uid": task.uid}, {"$set": {
