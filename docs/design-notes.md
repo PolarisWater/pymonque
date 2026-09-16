@@ -141,7 +141,7 @@ decisions made along the way:
   call that no longer fits (`TaskValidationError`) — and the scheduler stays enabled and walks on.
 - **`build()`, `add()` and `ensure()` pass their fields to the model as given,** `uid`, `name` and
   `status` included, since `ensure()` sets those itself — unlike `schedule()`, which refuses `Task`'s
-  own fields. For review.
+  own fields. **Superseded** — see "To fix before layer 4" below.
 - **`schedulerUid()` and `beatUid()` keep 2.0's namespace,** so a scheduler declared by name keeps its
   uid across the upgrade.
 - **Items are `running` while held.** A claim uses a try; an item found out of tries is given up at
@@ -153,8 +153,8 @@ decisions made along the way:
 - **`work()` yields a `Work`, not the `Item`:** `w.data`, `w.uid`, `w.attempts`, `w.item`, and
   `w.done()`, `w.fail()`, `w.release()`, which call the pile's own and then raise `_Ended`.
   `pile.done/fail/release(item)` called outside a block write and return whether they did.
-- **Decided while building, for review: an outer block's early end releases the inner block's
-  item.** When `outer.release()` (or `done` / `fail`) unwinds through a nested `work()` block, the
+- **Superseded — see "To fix before layer 4" below.** Built as: an outer block's early end
+  releases the inner block's item. When `outer.release()` (or `done` / `fail`) unwinds through a nested `work()` block, the
   inner item is handed back with its try, since its work did not happen, and the early end is passed
   on. The alternative, writing nothing, would spend a try and hold the item until its lease lapsed.
 - **Engine reprs are `CollectionEngine`'s one pattern** (N7): `PileEngine outbox
@@ -163,6 +163,38 @@ decisions made along the way:
   scheduler engine's merges share it.
 - **Left for layer 4:** worker threads on scheduler engines and poll intervals; `init()`; and a pile
   item held by a timed-out call no longer being renewed (§5.10 — a hold will need its thread).
+- **To fix before layer 4** (from the layer 3 review of `2eab7ff`; these replace the two "for review"
+  points above):
+  - **Bug — a scheduler whose beat cannot be built sticks.** `_emit` catches only `TaskNotFound` and
+    `TaskValidationError`. Building a beat also raises pydantic's `ValidationError` (the target `Task`
+    now needs a field the scheduler does not supply) or `TypeError` (`taskFields()` gives a field the
+    target does not have). `add`/`ensure` check that, but schedulers stored before a deploy that
+    changed the task model are not rechecked. `work()` then raises before the deadline write, so the
+    scheduler stays claimed, its deadline never moves, and it fails again after every lease.
+    Reproduced: stored against `Task`, redeployed with `AccountTask(accountId: int)` → `ValidationError`,
+    deadline not moved, claimId held. **Fix:** any error building the beat is handled like a missing
+    task — the beat is skipped with a warning naming the scheduler and the error, the deadline moves on,
+    and the scheduler stays enabled. An error drawing the interval (a removed distribution) cannot move
+    the deadline; leaving it to retry after the lease is acceptable, logged by layer 4's worker loop. A
+    test covers both model-change cases.
+  - **Nested blocks: an outer early end requeues the inner item with its try spent.** Changes the
+    "releases the inner block's item" choice above. The inner holder never said its work did not
+    happen — the block may have done part of it — so returning the try contradicts what a try means,
+    "a run whose outcome nobody knows". The inner item goes back to be claimed immediately (as a
+    lapsed lease would, without waiting for the lapse) and keeps the try it used; out of tries, the
+    next claim gives it up as usual.
+  - **Scheduler fields: refuse the engine's own, as `schedule()` does.** Changes the "passed as given"
+    choice above. `add()`, `upsert()`'s builders, `update()` and `ensure()` refuse `uid`, `claimId`,
+    `leaseUntil` and `status` by name — enabling goes through `enabled=` — and keep `name`, and
+    `deadline` on `update()` (moving a deadline by hand is a feature). `ensure()` sets `uid` and
+    `status` itself, internally, not through the public fields.
+  - **A deadline moved mid-claim releases the claim.** `update()` / `ensure()` moving a deadline also
+    clear `claimId`, so the stored document matches "moving the deadline releases that claim" (today
+    the stale claimId stays; harmless, but untrue).
+  - **By-hand verdicts only touch unfinished work.** `done(uid)`, `fail(uid)` and `release(uid)` on a
+    pile act only on an item that is `pending` or `running`; a finished one (`done`, `failed`,
+    `canceled`) is left alone and they return False. 2.0 let an operator overwrite any status; this
+    API does not. The same rule for any by-hand verdict tasks get later.
 
 ## Decided, not built yet
 
