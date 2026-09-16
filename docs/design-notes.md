@@ -203,6 +203,19 @@ decisions made along the way:
     `_build()`; `_changes()` clears `claimId` whenever it writes a deadline; a uid given to `done`,
     `fail` or `release` matches only `pending` or `running` items.
 
+- **Open, found after the fixes** (neither is in the review; for you to decide):
+  - **Saving a whole scheduler skips the new rules.** `upsert(scheduler)` and `save()` store the
+    document as built: fields the engine keeps are not refused, and a moved deadline does not clear
+    `claimId`. A hand-built scheduler carrying a `claimId` is stored with it. Harmless — a claim
+    ignores a stale `claimId`, and the lease moves with the deadline — but it is the one path the
+    rules do not cover. Proposed: `upsert()` clears `claimId` when the deadline differs from the
+    stored one, and leaves the rest, since a whole document is the caller's to shape.
+  - **A stored scheduler that no longer fits its own model.** If a `Scheduler` subclass gains a
+    required field, loading the stored document in `work()` raises before the beat, so it fails again
+    after every lease, as a removed distribution does. Proposed: accept it, like the distribution
+    case — layer 4's worker loop logs it — since documents in any collection break the same way after
+    a schema change, and a migration is the fix.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen
