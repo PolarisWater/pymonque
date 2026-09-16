@@ -210,6 +210,35 @@ def test_a_scheduler_whose_task_is_gone_skips_the_beat_and_stays_enabled(engine,
     assert "beat was skipped" in caplog.text
 
 
+def test_a_scheduler_whose_beat_needs_a_field_it_does_not_give_skips_the_beat_and_walks_on(engine, taskEngine, schedulerEngine, caplog):
+    scheduler = due(engine, added(engine))                                          # stored against a plain Task
+    redeployed = schedulerEngine(tasks=taskEngine(FUNCTIONS, AccountTask))         # the task model now needs accountId
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        assert redeployed.work() is not None
+
+    after = engine.get(scheduler.uid)
+
+    assert (after.status, after.claimId) == ("enabled", None)
+    assert after.deadline > scheduler.deadline
+    assert redeployed.tasks.count() == 0
+    assert "beat was skipped" in caplog.text and "accountId" in caplog.text
+
+
+def test_a_scheduler_giving_a_field_the_task_no_longer_has_skips_the_beat_and_walks_on(accountOps, taskEngine, schedulerEngine, caplog):
+    scheduler = due(accountOps, accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7))
+    redeployed = schedulerEngine(AccountScheduler, name="accountOps", tasks=taskEngine(FUNCTIONS, name="accountTasks"))
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        assert redeployed.work() is not None
+
+    after = accountOps.get(scheduler.uid)
+
+    assert (after.status, after.claimId) == ("enabled", None)
+    assert after.deadline > scheduler.deadline
+    assert "beat was skipped" in caplog.text and "accountId" in caplog.text
+
+
 def test_a_lapsed_lease_is_claimable_and_a_live_one_is_left_alone(engine, tasks):
     scheduler = added(engine)
     engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"leaseUntil": utc_now() + timedelta(minutes=5), "deadline": utc_now() - timedelta(hours=2)}})
@@ -351,6 +380,22 @@ def test_moving_the_deadline_by_hand_moves_the_lease(engine):
     assert (updated.deadline, updated.leaseUntil) == (later, later)
 
 
+def test_moving_a_held_schedulers_deadline_by_hand_releases_its_claim(engine):
+    def held(scheduler):
+        engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker"}})
+
+    updated = added(engine, name="updated")
+    held(updated)
+
+    assert engine.update(updated.uid, deadline=utc_now() + timedelta(days=1)).claimId is None
+
+    declared = engine.ensure("nightly", CallSpec.new("greet"), engine.distributions("constant", dailyFrequency=1))
+    held(declared)
+
+    assert engine.ensure("nightly", CallSpec.new("greet", name="Grace"), engine.distributions("constant", dailyFrequency=1)).claimId == "a-worker"
+    assert engine.ensure("nightly", CallSpec.new("greet"), hourly(engine)).claimId is None       # a new rhythm moved it
+
+
 # --- ensure ---
 
 def declare(engine, name="nightly", to="Ada", dailyFrequency=1, enabled=None, **fields):
@@ -468,6 +513,44 @@ def test_added_and_declared_schedulers_coexist_and_unnamed_ones_do_not_collide(e
 
     assert engine.count() == 3
     assert engine.count({"name": "Scheduler"}) == 2
+
+
+@pytest.mark.parametrize("field, message", [
+    ("uid", "the engine keeps it"),
+    ("claimId", "the engine keeps it"),
+    ("leaseUntil", "the engine keeps it"),
+    ("status", "enabled="),
+])
+def test_a_field_the_engine_keeps_is_refused_wherever_fields_are_given(engine, field, message):
+    stored = added(engine)
+    calls = {
+        "build":    lambda: engine.build(CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "add":      lambda: engine.add(CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "ensure":   lambda: engine.ensure("nightly", CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "update":   lambda: engine.update(stored.uid, **{field: "x"}),
+    }
+
+    for verb, call in calls.items():
+        with pytest.raises(TypeError, match=message):
+            call()
+
+    assert engine.count() == 1
+    assert engine.get(stored.uid).status == "enabled"
+
+
+def test_a_field_the_scheduler_does_not_have_is_refused(engine):
+    with pytest.raises(TypeError, match="Scheduler has no field accountId"):
+        engine.add(CallSpec.new("greet"), hourly(engine), accountId=7)
+
+    assert engine.count() == 0
+
+
+def test_a_scheduler_is_still_named_and_its_deadline_moved_by_hand(engine):
+    later = (utc_now() + timedelta(days=2)).replace(microsecond=0)
+    scheduler = engine.add(CallSpec.new("greet"), hourly(engine), name="greeter")
+    updated = engine.update(scheduler.uid, name="renamed", deadline=later)
+
+    assert (scheduler.name, updated.name, updated.deadline) == ("greeter", "renamed", later)
 
 
 # --- changing stored schedulers ---

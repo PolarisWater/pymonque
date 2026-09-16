@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Literal, Self, Sequence, TypeVar
+from typing import Any, Literal, Mapping, Self, Sequence, TypeVar
 
 from pydantic import model_validator
 from pymongo import IndexModel
@@ -16,7 +16,6 @@ from pymongo.errors import DuplicateKeyError
 from .calls import CallSpec
 from .claims import claimNext, writeClaimed
 from .documents import CollectionEngine, UtcDatetime, utc_now
-from .exceptions import TaskNotFound, TaskValidationError
 from .settings import Missed, SchedulerEngineSettings
 from .tasks import Task, TaskEngine, TaskFactory
 
@@ -87,6 +86,9 @@ class Scheduler(TaskFactory):
 
 
 S = TypeVar("S", bound=Scheduler)
+
+# what the engine keeps for itself, refused by name where a scheduler's fields are given
+KEPT = frozenset({"uid", "claimId", "leaseUntil", "status"})
 
 
 class SchedulerEngine(CollectionEngine[S]):
@@ -159,10 +161,33 @@ class SchedulerEngine(CollectionEngine[S]):
 
     # --- adding ---
 
+    def _refuseFields(self, fields: Mapping[str, Any]):
+        known = {
+            label
+            for name, field in self.model.model_fields.items()
+            for label in (name, field.alias) if label
+        }
+
+        for name in fields:
+            if name == "status":
+                raise TypeError("status is not given to a scheduler; enable or disable it with enabled=")
+
+            if name in KEPT:
+                raise TypeError(f"{name} is not given to a scheduler; the engine keeps it")
+
+            if name not in known:
+                raise TypeError(f"{self.model.__name__} has no field {name}")
+
     def build(self, work: CallSpec, distribution: CallSpec, deadline: datetime | None = None, **fields: Any) -> S:
         """A scheduler of this engine's model, not stored and not checked; its first beat one interval
-        from now unless given a deadline. `fields` go to the model."""
+        from now unless given a deadline. `fields` are the model's own, such as `name`; what the engine
+        keeps — uid, claim, lease and status — is refused."""
 
+        self._refuseFields(fields)
+
+        return self._build(work, distribution, deadline, **fields)
+
+    def _build(self, work: CallSpec, distribution: CallSpec, deadline: datetime | None = None, **fields: Any) -> S:
         if deadline is None:
             deadline = utc_now() + self.distributions.gen(distribution)     # gen checks the call first
 
@@ -211,6 +236,11 @@ class SchedulerEngine(CollectionEngine[S]):
             # the rhythm itself changed, so the new one starts from now
             write.update(self._at(utc_now() + self.distributions.gen(distribution)))
 
+        if "deadline" in write:
+            # a deadline moved by hand releases whatever claim held the beat it replaces, whose own
+            # deadline write will not land
+            write["claimId"] = None
+
         if enabled is not None:
             write["status"] = "enabled" if enabled else "disabled"
 
@@ -219,6 +249,7 @@ class SchedulerEngine(CollectionEngine[S]):
     def update(
             self,
             uid:            str,
+            /,                                  # so a uid among the fields is refused, not confused with this one
             work:           CallSpec | None = None,
             distribution:   CallSpec | None = None,
             enabled:        bool | None = None,
@@ -228,9 +259,11 @@ class SchedulerEngine(CollectionEngine[S]):
         """Change parts of a stored scheduler, or return None if there is no such uid.
 
         Everything is checked as the merged scheduler, so its fields are checked against the task it
-        emits. A new distribution restarts the rhythm from now; new work keeps it.
+        emits. A new distribution restarts the rhythm from now; new work keeps it. Enabling goes through
+        `enabled`; a deadline may be moved by hand.
         """
 
+        self._refuseFields(fields)
         existing = self.get(uid)
 
         if existing is None:
@@ -259,11 +292,12 @@ class SchedulerEngine(CollectionEngine[S]):
         is left as the database has it unless `enabled` is given.
         """
 
+        self._refuseFields(fields)
         uid = schedulerUid(name)
         existing = self.get(uid)
 
         if existing is None:
-            scheduler = self.validateScheduler(self.build(
+            scheduler = self.validateScheduler(self._build(
                 work, distribution, uid=uid, name=name, status="disabled" if enabled is False else "enabled", **fields
             ))
 
@@ -323,9 +357,12 @@ class SchedulerEngine(CollectionEngine[S]):
     def _emit(self, scheduler: S):
         try:
             task = self._beat(scheduler)
-        except (TaskNotFound, TaskValidationError) as e:
-            # skipped, not disabled: disabling is the operator's word, and would outlast the task coming back
-            logger.warning("%r emits a task this app cannot run, so this beat was skipped: %s", scheduler, e)
+        except Exception as e:
+            # whatever stops the beat being built — its task gone, or its call or fields no longer fitting
+            # a model changed since it was stored — skips this beat, not the scheduler: raising would leave
+            # it claimed with its deadline unmoved, failing again after every lease. Skipped, not disabled:
+            # disabling is the operator's word, and would outlast the fix.
+            logger.warning("%r emits a task this app cannot build, so this beat was skipped: %r", scheduler, e)
 
             return
 

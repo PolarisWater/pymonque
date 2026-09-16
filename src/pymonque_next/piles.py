@@ -213,8 +213,8 @@ class PileEngine(CollectionEngine[Item]):
     def _giveUp(self, item: Item):
         spent = item.attempts - 1
         error = (
-            f"gave up after {spent} {'try' if spent == 1 else 'tries'}: the worker holding the last one "
-            f"stopped renewing the lease — killed, or taken down by the item itself"
+            f"gave up after {spent} {'try' if spent == 1 else 'tries'} whose outcome never came back — a holder "
+            f"that stopped renewing its lease, or a block ended from outside it"
         )
 
         self._finish(item, "failed", error=error)
@@ -227,11 +227,12 @@ class PileEngine(CollectionEngine[Item]):
         """Which document an action on `item` may touch.
 
         An Item stands for the claim it came from, so a holder whose lease lapsed cannot finish work
-        another worker has taken over. A bare uid is an operator acting on the item, whatever holds it.
+        another worker has taken over. A bare uid is an operator's verdict on unfinished work, whatever
+        holds it; an item already done, failed or cancelled is left as it ended.
         """
 
         if isinstance(item, str):
-            return {"uid": item}
+            return {"uid": item, "status": {"$in": ["pending", "running"]}}
 
         if item.claimId is None:
             raise ValueError(
@@ -271,15 +272,18 @@ class PileEngine(CollectionEngine[Item]):
         the item goes back to its own place in the pile rather than the end of it.
         """
 
+        return self._handBack(item, returnTry=True)
+
+    def _handBack(self, item: Item | str, *, returnTry: bool) -> bool:
+        # back to its own place in the pile, not the end of it, and claimable at once
+        back: dict[str, Any] = {"status": "pending", "claimId": None, "claimedAt": None, "leaseUntil": "$createdAt"}
+
+        if returnTry:
+            back["attempts"] = {"$subtract": ["$attempts", 1]}
+
         return self.collection.update_one(
             {**self._matching(item), "status": "running"},
-            [{"$set": {
-                "status": "pending",
-                "claimId": None,
-                "claimedAt": None,
-                "leaseUntil": "$createdAt",
-                "attempts": {"$subtract": ["$attempts", 1]},
-            }}],
+            [{"$set": back}],
         ).matched_count > 0
 
     def renewLease(self, item: Item | str) -> bool:
@@ -327,9 +331,10 @@ class PileEngine(CollectionEngine[Item]):
                 yield working
             except _Ended as ended:
                 if ended.claimId != item.claimId:
-                    # another block's early end, on its way out through this one: this item's work did
-                    # not happen, so it goes back with its try
-                    if working.ended is None and not self.release(item):
+                    # another block's early end, on its way out through this one. Nobody said this item's
+                    # work did not happen — the block may have done part of it — so it goes straight back
+                    # to be claimed with its try spent, as a lapsed lease would leave it
+                    if working.ended is None and not self._handBack(item, returnTry=False):
                         self._lostClaim(item)
 
                     raise

@@ -163,7 +163,7 @@ decisions made along the way:
   scheduler engine's merges share it.
 - **Left for layer 4:** worker threads on scheduler engines and poll intervals; `init()`; and a pile
   item held by a timed-out call no longer being renewed (§5.10 — a hold will need its thread).
-- **To fix before layer 4** (from the layer 3 review of `2eab7ff`; these replace the two "for review"
+- **Fixed before layer 4** (from the layer 3 review of `2eab7ff`; these replace the two "for review"
   points above):
   - **Bug — a scheduler whose beat cannot be built sticks.** `_emit` catches only `TaskNotFound` and
     `TaskValidationError`. Building a beat also raises pydantic's `ValidationError` (the target `Task`
@@ -195,6 +195,13 @@ decisions made along the way:
     pile act only on an item that is `pending` or `running`; a finished one (`done`, `failed`,
     `canceled`) is left alone and they return False. 2.0 let an operator overwrite any status; this
     API does not. The same rule for any by-hand verdict tasks get later.
+  - **Built as:** `_emit` skips the beat on any error building it; `PileEngine._handBack(item,
+    returnTry=)` serves both `release()` and the nested case, and a given-up item's error now says
+    its tries' outcomes never came back, which covers both; `SchedulerEngine._refuseFields()` guards
+    `build`, `add`, `ensure` and `update` (whose `uid` is positional-only, so a `uid=` field is
+    refused rather than clashing), and `ensure()` sets `uid` and `status` through the internal
+    `_build()`; `_changes()` clears `claimId` whenever it writes a deadline; a uid given to `done`,
+    `fail` or `release` matches only `pending` or `running` items.
 
 ## Decided, not built yet
 

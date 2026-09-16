@@ -285,6 +285,24 @@ def test_an_item_can_be_finished_by_uid_whatever_holds_it(outbox):
     assert outbox.get(item.uid).status == "done"
 
 
+@pytest.mark.parametrize("verdict", ["done", "fail", "release"])
+def test_a_verdict_by_uid_leaves_a_finished_item_as_it_ended(outbox, verdict):
+    ended = {}
+
+    for status, finish in (("done", outbox.done), ("failed", outbox.fail)):
+        item = outbox.add(to=f"{status}@x.y")
+        finish(outbox.claim())
+        ended[item.uid] = status
+
+    cancelled = outbox.add(to="canceled@x.y")
+    outbox.cancel(cancelled.uid)
+    ended[cancelled.uid] = "canceled"
+
+    for uid, status in ended.items():
+        assert getattr(outbox, verdict)(uid) is False
+        assert outbox.get(uid).status == status
+
+
 def test_an_item_never_claimed_cannot_be_finished_as_a_claim(outbox):
     added = outbox.add(to="a@b.c")
 

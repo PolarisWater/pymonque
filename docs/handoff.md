@@ -26,9 +26,9 @@ tasks), **distributions** (interval functions for schedulers).
   one kind at a time. The rebuild is designed in full.
 - **Layers 1–3 are built:** settings, declarations, documents, calls, distributions, and the
   `Task`, `Scheduler` and `Item` models; claims, lease renewal and the task engine, with the layer 2
-  review's decisions and fixes; then the scheduler engine, the pile engine and the `work()` block —
-  487 tests in `tests_next/`. The small decisions made along the way, what each leaves for later
-  layers, and two layer 3 points marked for review are in `design-notes.md` under "Decided while
+  review's decisions and fixes; then the scheduler engine, the pile engine and the `work()` block,
+  with the layer 3 review's fixes — 500 tests in `tests_next/`. The small decisions made along the
+  way, and what each leaves for later layers, are in `design-notes.md` under "Decided while
   building".
   **Next: layer 4**, the app, versions, workers, shutdown and timeouts — after settling §5.11.
 - **Branches:** `main` holds the current library and all docs. `rebuild` was branched from it and

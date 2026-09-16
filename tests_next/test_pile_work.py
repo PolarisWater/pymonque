@@ -204,7 +204,20 @@ def test_a_nested_block_passes_on_an_outer_blocks_early_end(pileEngine):
 
     assert ran == ["after both"]
     assert first.get(a.uid).status == "pending"
-    assert (second.get(b.uid).status, second.get(b.uid).attempts) == ("pending", 0)     # its work did not happen
+    assert (second.get(b.uid).status, second.get(b.uid).attempts) == ("pending", 1)     # back at once, its try spent
+
+
+def test_an_inner_item_requeued_by_an_outer_early_end_is_given_up_when_out_of_tries(pileEngine):
+    first, second = pileEngine(name="first"), pileEngine(name="second")
+    first.add({"n": 1})
+    b = second.add({"n": 2})
+
+    with first.work() as outer:
+        with second.work():
+            outer.release()
+
+    assert second.claim() is None       # its one try went with the block that was ended from outside
+    assert second.get(b.uid).status == "failed"
 
 
 # --- when something gets in the way ---
