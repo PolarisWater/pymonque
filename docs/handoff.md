@@ -27,7 +27,7 @@ tasks), **distributions** (interval functions for schedulers).
 - **Layers 1–3 are built:** settings, declarations, documents, calls, distributions, and the
   `Task`, `Scheduler` and `Item` models; claims, lease renewal and the task engine, with the layer 2
   review's decisions and fixes; then the scheduler engine, the pile engine and the `work()` block,
-  with the layer 3 review's fixes — 500 tests in `tests_next/`. The small decisions made along the
+  with the layer 3 review's fixes — 503 tests in `tests_next/`. The small decisions made along the
   way, and what each leaves for later layers, are in `design-notes.md` under "Decided while
   building".
   **Next: layer 4**, the app, versions, workers, shutdown and timeouts — after settling §5.11.

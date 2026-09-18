@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal, Mapping, Self, Sequence, TypeVar
 
 from pydantic import model_validator
@@ -33,6 +33,11 @@ def schedulerUid(name: str) -> str:
     """A stable uid for a named scheduler, so declaring it on every startup declares it once."""
 
     return str(uuid.uuid5(SCHEDULER_NAMESPACE, name))
+
+
+def _sameMoment(stored: datetime, given: datetime) -> bool:
+    # MongoDB keeps milliseconds, so a deadline read back can differ from the one written by less than one
+    return abs(stored.replace(tzinfo=None) - given.replace(tzinfo=None)) < timedelta(milliseconds=1)
 
 
 def beatUid(scheduler: str, deadline: datetime) -> str:
@@ -134,9 +139,30 @@ class SchedulerEngine(CollectionEngine[S]):
         return {"deadline": deadline, "leaseUntil": deadline}
 
     def _prepare(self, document: S) -> S:
-        document.leaseUntil = document.deadline
+        # a held scheduler keeps its holder's lease; any other is claimable at its deadline
+        if document.claimId is None:
+            document.leaseUntil = document.deadline
 
         return document
+
+    def save(self, document: S) -> S:
+        """Store a whole scheduler, creating or replacing it.
+
+        The claim is the engine's, whatever the document carries: a stored scheduler whose deadline is
+        unchanged keeps the claim and lease holding it, so its holder's deadline write still lands; a
+        moved deadline releases the claim, as update() and ensure() do.
+        """
+
+        stored = self.collection.find_one(
+            {self.keyField: self._rowKey(document)}, {"_id": 0, "deadline": 1, "claimId": 1, "leaseUntil": 1}
+        )
+
+        if stored is not None and stored.get("claimId") is not None and _sameMoment(stored["deadline"], document.deadline):
+            document.claimId, document.leaseUntil = stored["claimId"], stored["leaseUntil"]
+        else:
+            document.claimId = None
+
+        return super().save(document)
 
     # --- checking ---
 

@@ -203,18 +203,17 @@ decisions made along the way:
     `_build()`; `_changes()` clears `claimId` whenever it writes a deadline; a uid given to `done`,
     `fail` or `release` matches only `pending` or `running` items.
 
-- **Open, found after the fixes** (neither is in the review; for you to decide):
-  - **Saving a whole scheduler skips the new rules.** `upsert(scheduler)` and `save()` store the
-    document as built: fields the engine keeps are not refused, and a moved deadline does not clear
-    `claimId`. A hand-built scheduler carrying a `claimId` is stored with it. Harmless — a claim
-    ignores a stale `claimId`, and the lease moves with the deadline — but it is the one path the
-    rules do not cover. Proposed: `upsert()` clears `claimId` when the deadline differs from the
-    stored one, and leaves the rest, since a whole document is the caller's to shape.
-  - **A stored scheduler that no longer fits its own model.** If a `Scheduler` subclass gains a
-    required field, loading the stored document in `work()` raises before the beat, so it fails again
-    after every lease, as a removed distribution does. Proposed: accept it, like the distribution
-    case — layer 4's worker loop logs it — since documents in any collection break the same way after
-    a schema change, and a migration is the fix.
+- **Decided after the fixes** (two gaps found checking them):
+  - **Saving a whole scheduler: the claim is the engine's — built.** `SchedulerEngine.save()` (so
+    `upsert()` and a bound scheduler's `save()`) ignores whatever `claimId` the document carries. A
+    stored scheduler whose deadline is unchanged keeps the claim and lease holding it, so the holder's
+    deadline write still lands; a moved deadline releases the claim and puts the lease at the new
+    deadline, as `update()` / `ensure()` do. Deadlines compare to the millisecond MongoDB keeps. The
+    other fields are the caller's to shape. Three tests in `test_schedulers.py`.
+  - **A stored scheduler that no longer fits its own model — accepted.** If a `Scheduler` subclass
+    gains a required field, loading the stored document in `work()` raises before the beat, and it
+    fails again after every lease, as a removed distribution does. Layer 4's worker loop logs it;
+    documents in any collection break the same way after a schema change, and a migration is the fix.
 
 ## Decided, not built yet
 

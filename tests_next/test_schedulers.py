@@ -396,6 +396,44 @@ def test_moving_a_held_schedulers_deadline_by_hand_releases_its_claim(engine):
     assert engine.ensure("nightly", CallSpec.new("greet"), hourly(engine)).claimId is None       # a new rhythm moved it
 
 
+def test_saving_a_held_scheduler_with_its_deadline_unchanged_keeps_the_claim_and_lease(engine):
+    scheduler = added(engine)
+    held = utc_now() + timedelta(minutes=5)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker", "leaseUntil": held}})
+
+    loaded = engine.get(scheduler.uid)
+    loaded.claimId = None       # as a copy read before the claim would carry it
+    loaded.name = "renamed"
+    engine.upsert(loaded)
+
+    stored = engine.collection.find_one({"uid": scheduler.uid})
+    assert (stored["name"], stored["claimId"]) == ("renamed", "a-worker")
+    assert abs(stored["leaseUntil"] - held) < timedelta(milliseconds=1)
+
+
+def test_saving_a_held_scheduler_with_a_moved_deadline_releases_the_claim(engine):
+    scheduler = added(engine)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker"}})
+
+    loaded = engine.get(scheduler.uid)
+    loaded.deadline = utc_now() + timedelta(days=1)
+    loaded.save()
+
+    stored = engine.get(scheduler.uid)
+    assert stored.claimId is None
+    assert stored.leaseUntil == stored.deadline
+
+
+def test_a_claim_carried_by_a_saved_scheduler_is_not_stored(engine):
+    scheduler = engine.build(CallSpec.new("greet"), hourly(engine))
+    scheduler.claimId = "made-up"
+    engine.upsert(scheduler)
+
+    stored = engine.get(scheduler.uid)
+    assert stored.claimId is None
+    assert stored.leaseUntil == stored.deadline
+
+
 # --- ensure ---
 
 def declare(engine, name="nightly", to="Ada", dailyFrequency=1, enabled=None, **fields):
