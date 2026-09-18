@@ -350,6 +350,50 @@ def test_only_a_held_item_can_be_released(outbox):
     assert outbox.release("no-such-uid") is False
 
 
+
+def test_a_delayed_release_is_claimable_only_once_the_delay_has_passed(outbox):
+    item = outbox.add(to="a@b.c")
+    outbox.release(outbox.claim(), delay=60)
+
+    released = outbox.get(item.uid)
+
+    assert (released.status, released.attempts, released.claimId) == ("pending", 0, None)     # try given back
+    assert abs(released.leaseUntil - (utc_now() + timedelta(seconds=60))) < timedelta(seconds=1)
+    assert outbox.claim() is None
+
+    outbox.collection.update_one({"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(seconds=1)}})
+    assert outbox.claim().uid == item.uid
+
+
+def test_a_delayed_item_no_longer_blocks_the_front_of_the_pile(outbox):
+    """The case the delay exists for: an item not ready yet, released on every claim, used to go back to
+    the front and be taken first by every claim after, so nothing behind it was ever reached."""
+
+    stuck, second, third = fill(outbox, 3)
+
+    notReady = outbox.claim()
+    assert notReady.uid == stuck.uid
+    outbox.release(notReady, delay=timedelta(minutes=5))
+
+    assert outbox.claim().uid == second.uid         # not the stuck item again
+    assert outbox.claim().uid == third.uid
+    assert outbox.claim() is None                   # the stuck one waits out its delay
+
+
+def test_a_release_delay_is_seconds_or_a_timedelta_and_not_negative(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
+
+    with pytest.raises(TypeError, match="release delay"):
+        outbox.release(item, delay="soon")
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        outbox.release(item, delay=-1)
+
+    assert outbox.get(item.uid).status == "running"     # nothing written
+
+
+
 # --- renewing ---
 
 def test_a_held_items_lease_can_be_renewed(outbox):

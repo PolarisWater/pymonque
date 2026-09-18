@@ -56,6 +56,23 @@ class Item(Document, Generic[P]):
         return f"Item {self.uid} ({self.status})"
 
 
+def _delay(delay: float | timedelta | None) -> timedelta | None:
+    """A release delay as a timedelta, refused unless it is a number of seconds or a timedelta, not negative."""
+
+    if delay is None:
+        return None
+
+    if isinstance(delay, bool) or not isinstance(delay, (int, float, timedelta)):
+        raise TypeError(f"a release delay is a number of seconds or a timedelta, not {delay!r}")
+
+    delay = delay if isinstance(delay, timedelta) else timedelta(seconds=delay)
+
+    if delay < timedelta(0):
+        raise ValueError(f"a release delay cannot be negative: {delay}")
+
+    return delay
+
+
 class _Ended(BaseException):
     """Raised by w.done(), w.fail() and w.release() once the outcome is written, to leave that block
     and nothing else.
@@ -107,10 +124,11 @@ class Work:
 
         self._end("fail", error=error)
 
-    def release(self) -> NoReturn:
-        """Hand the item back unfinished, with its try, and end the block here."""
+    def release(self, delay: float | timedelta | None = None) -> NoReturn:
+        """Hand the item back unfinished, with its try, and end the block here — claimable again at once,
+        or after `delay` seconds."""
 
-        self._end("release")
+        self._end("release", delay=delay)
 
     def _end(self, outcome: str, **fields: Any) -> NoReturn:
         # written first, then the block is left: an outcome recorded is one nothing can take back
@@ -265,18 +283,21 @@ class PileEngine(CollectionEngine[Item]):
 
         return self._finish(item, "failed", error=error)
 
-    def release(self, item: Item | str) -> bool:
+    def release(self, item: Item | str, delay: float | timedelta | None = None) -> bool:
         """Hand a held item back unfinished, and give its try back.
 
-        The holder is saying the work did not happen — shutting down, rate limited, not ready yet — so
-        the item goes back to its own place in the pile rather than the end of it.
+        The holder is saying the work did not happen — shutting down, rate limited, not ready yet. With
+        no `delay` the item goes back to its own place in the pile, claimable at once. With one — seconds,
+        or a timedelta — it is claimable only once the delay has passed, and queues by that time: an item
+        that is not ready yet does not sit at the front of the pile, taken and handed back by every claim.
         """
 
-        return self._handBack(item, returnTry=True)
+        return self._handBack(item, returnTry=True, delay=_delay(delay))
 
-    def _handBack(self, item: Item | str, *, returnTry: bool) -> bool:
-        # back to its own place in the pile, not the end of it, and claimable at once
-        back: dict[str, Any] = {"status": "pending", "claimId": None, "claimedAt": None, "leaseUntil": "$createdAt"}
+    def _handBack(self, item: Item | str, *, returnTry: bool, delay: timedelta | None = None) -> bool:
+        # back to its own place in the pile, not the end of it — or, delayed, due when the delay has passed
+        due: Any = "$createdAt" if delay is None else utc_now() + delay
+        back: dict[str, Any] = {"status": "pending", "claimId": None, "claimedAt": None, "leaseUntil": due}
 
         if returnTry:
             back["attempts"] = {"$subtract": ["$attempts", 1]}

@@ -623,7 +623,7 @@ for as long as the block runs. It yields a `Work` (`w.data`, `w.uid`, `w.attempt
 | the block raises | `failed`, with the traceback; the exception is re-raised |
 | `w.done(result=None)` | `done`, and the block ends there |
 | `w.fail(error=None)` | `failed` — final — and the block ends there |
-| `w.release()` | back on the pile with its try returned, and the block ends there |
+| `w.release(delay=None)` | back on the pile with its try returned — claimable at once, or after `delay` — and the block ends there |
 | the claim was lost meanwhile | nothing is written, and it is logged |
 
 **What the block does for you:** the lease is renewed in the background for as long as it runs;
@@ -650,7 +650,10 @@ try.** An item whose holder stopped renewing its lease goes back to be claimed w
 out of tries, the next claim gives it up as `failed`, saying its tries' outcomes never came back.
 `fail()` is final. `release()` hands an item back unfinished and **returns the try**, since the
 holder says the work did not happen (shutting down, rate limited, not ready yet). Items have no retry
-delay: a released item is claimable at once, in its own place in the pile. The default of one try
+delay after a failure. A released item is claimable at once, in its own place in the pile — or, with
+`release(delay=…)` (seconds or a timedelta), only once the delay has passed, queued by that time. Use
+a delay for an item that is not ready yet: released without one, it goes back to the front and is
+taken and handed back by every claim, so nothing behind it is reached. The default of one try
 means an item whose holder died is given up rather than handed on — nobody knows how far it got.
 
 ### PileEngine
@@ -661,7 +664,7 @@ means an item whose holder died is given up rather than handed on — nobody kno
 | `addMany(data)` | Add many in one write, every payload checked first. |
 | `work(where=None)` | The block above. |
 | `claim(where=None)` | Take the item that has waited longest, or `None`. |
-| `done(item, result=None)` / `fail(item, error=None)` / `release(item)` | Record an outcome outside a block. `True` if it was written. |
+| `done(item, result=None)` / `fail(item, error=None)` / `release(item, delay=None)` | Record an outcome outside a block. `True` if it was written. |
 | `renewLease(item)` | Hold an item for another lease. |
 | `cancel(uid)` / `cancelMany(where=None)` | Cancel items nobody is working. |
 | `count(where=None, status=None)` / `counts()` | `counts()` gives every status. |

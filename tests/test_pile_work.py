@@ -5,6 +5,7 @@ the block early — and what happens when something gets in the way of that."""
 import logging
 import sys
 import time
+from datetime import timedelta
 
 import pytest
 from pydantic import BaseModel
@@ -136,6 +137,19 @@ def test_w_release_puts_the_item_back_with_its_try_and_ends_the_block(outbox):
     assert ran == []
     assert (released.status, released.attempts, released.claimId) == ("pending", 0, None)
 
+
+
+def test_w_release_can_delay_the_item(outbox):
+    item = outbox.add(to="a@b.c")
+
+    with outbox.work() as w:
+        w.release(delay=30)
+
+    released = outbox.get(item.uid)
+
+    assert (released.status, released.attempts) == ("pending", 0)
+    assert released.leaseUntil > utc_now() + timedelta(seconds=29)
+    assert outbox.claim() is None
 
 def test_an_early_end_gets_past_except_exception(outbox):
     item = outbox.add(to="a@b.c")

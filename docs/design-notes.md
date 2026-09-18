@@ -317,6 +317,11 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   also covers what `$$NOW` would not — skipAfter, the backlog, heartbeats, documents' own times. A
   server that will not say leaves the host's clock. One offset per process.
 - **Short leases are logged** where the app is built: under 10 s, a stall of 2L/3 hands live work over.
+- **`release(delay=…)`:** an item released with a delay is due once it has passed, and queues by that
+  time rather than in its own place, so an item not ready yet no longer sits at the front of the pile
+  taken and handed back by every claim. The try is still returned. No delay keeps the old behaviour.
+  No pile-wide default delay: that would need a setting, an app default and a fingerprint entry, for
+  what one call-site argument already covers.
 - **Documented, not changed:** a frozen holder is indistinguishable from a dead one, so a pile item
   can be worked twice (use its `uid` as an idempotency key); a task whose worker died shows `running`
   until a worker of its engine claims next.
