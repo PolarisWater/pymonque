@@ -36,6 +36,16 @@ def atomicFindAndModify(monkeypatch):
     monkeypatch.setattr(Collection, "_find_and_modify", atomic)
 
 
+@pytest.fixture(autouse=True)
+def hostClock(monkeypatch):
+    """Every test starts on this host's own clock: the server-clock offset is per process, and a test
+    that moves it must not move it for the next."""
+
+    from pymonque import documents
+
+    monkeypatch.setattr(documents, "_serverOffset", documents.timedelta(0))
+
+
 @pytest.fixture
 def db():
     return MongoClient()["pymonque_test"]

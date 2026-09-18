@@ -32,7 +32,7 @@ from pymongo.database import Database
 from .calls import nearestAttributes
 from .declarations import Declaration, collection, declaredOn, pile, schedulers, task, tasks
 from .distributions import BaseDistributions, DistributionEngine
-from .documents import CollectionEngine, uuid4str
+from .documents import CollectionEngine, syncClock, uuid4str
 from .piles import PileEngine
 from .schedulers import SchedulerEngine
 from .settings import LEASE_SECONDS, UNSET, AppDefaults, orDefault
@@ -44,6 +44,7 @@ logger = logging.getLogger("pymonque")
 
 BACKLOG_WARN_AFTER = 60     # seconds work may sit due before the app says nobody is free to take it
 BACKLOG_INTERVAL = 30       # seconds between those checks
+SHORT_LEASE = 10            # seconds; a shorter lease is lost to one slow write or stall, and is logged
 
 WorkerCounts = int | Mapping[str, int]
 
@@ -166,6 +167,11 @@ class BaseApp:
             raise ValueError(f"retireAfter is a number of abandoned threads, at least 1, or None; not {retireAfter!r}")
 
         self.db = db
+
+        # every process keeps time by the database server's clock, so leases compare across hosts; a
+        # read, like creating indexes, and safe from any process
+        syncClock(db)
+
         self.defaults = AppDefaults.of(cls)
         self.distribution = DistributionEngine(cls.distributions)
 
@@ -225,6 +231,8 @@ class BaseApp:
         self.retireAfter = retireAfter
         self.retired = False
 
+        self._warnShortLeases()
+
         self.fingerprint = fingerprint(self._surface())
         self.workerUid = uuid4str()
         self.registry = Registry(db["pymonque_workers"], uid=self.workerUid, fingerprint=self.fingerprint, staleAfter=workerStaleAfter)
@@ -240,6 +248,26 @@ class BaseApp:
 
         # NB: init() is deliberately not called here. Constructing an app must be safe from any process
         # at any time; housekeeping belongs to a process that is taking over as a worker.
+
+    def _warnShortLeases(self):
+        """Say so when a lease is short enough to be lost without anyone dying.
+
+        A lease is renewed every third of its length, so a lease of L seconds is taken over after a
+        stall of about 2L/3 — a slow write, a paused VM, a thread held by a long C call. At a few
+        seconds that happens in ordinary operation, and live work is written off or worked twice.
+        """
+
+        parts = {**self.taskEngines, **self.schedulerEngines, **self.piles}
+
+        for name, part in parts.items():
+            lease = part.settings.leaseSeconds
+
+            if lease < SHORT_LEASE:
+                logger.warning(
+                    "%s has a lease of %gs: a stall of about %.1fs — one slow write, a paused VM — hands its "
+                    "live work to another worker. Leases under %ds are for tests.",
+                    name, lease, lease * 2 / 3, SHORT_LEASE
+                )
 
     # --- one version at a time ---
 
@@ -405,6 +433,8 @@ class BaseApp:
 
     def _heartbeat(self):
         while not self._quit.wait(self.heartbeatInterval):
+            syncClock(self.db)      # clocks drift; a long-running worker keeps following the server's
+
             try:
                 self.registry.beat(self._report())
             except Exception:

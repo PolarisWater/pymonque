@@ -9,7 +9,7 @@ from .app import BaseApp
 from .calls import CallSpec, FuncSpec, Functions
 from .declarations import collection, pile, schedulers, task, tasks
 from .distributions import BaseDistributions, DistributionEngine
-from .documents import CollectionEngine, Document, utc_now
+from .documents import CollectionEngine, Document, syncClock, utc_now
 from .migrations import upgradeFrom2
 from .piles import Item, PileEngine, Work
 from .schedulers import Scheduler, SchedulerEngine
@@ -39,6 +39,7 @@ __all__ = [
     "exceptions",
     "pile",
     "schedulers",
+    "syncClock",
     "task",
     "tasks",
     "upgradeFrom2",

@@ -723,6 +723,19 @@ scheduler's claim.
 Because a live lease is visible in the document, **constructing an app never disturbs work in
 flight**.
 
+**One clock: the database server's.** A lease written on one host is compared on another, so a host
+whose clock ran ahead would take over work another still holds. Every process therefore keeps time
+by the server: constructing an app reads the server's clock (`hello`'s `localTime`, corrected by half
+the round trip), and a worker process reads it again on every heartbeat, so drift is followed.
+`utc_now()` is this host's clock plus that offset, and a host more than a second off the server is
+logged. Build deadlines from `utc_now()`, not `datetime.now()`, so they share it. `syncClock(db)`
+does the same for a process that builds no app. A server that will not say — mongomock, in tests —
+leaves the host's own clock in use.
+
+**Keep leases long.** A lease of L seconds is renewed every L/3, so a stall of about 2L/3 — one slow
+write, a paused VM, a thread held by a long C call — hands live work to another worker. The default
+is 300 s; a lease under 10 s is logged where the app is built, as one for tests.
+
 ## One version at a time
 
 **Only one version of your code may run workers against a database at once.** Deploy all-or-nothing:
@@ -902,9 +915,16 @@ Deliberate trade-offs and edges not handled, so none comes as a surprise:
 - **A timeout stops Python code, not a call blocked outside it.** Such a call runs on in an abandoned
   daemon thread until it returns or the process exits; `retireAfter` bounds how many a process keeps.
   An abandoned call that later finishes can still record a pile item nobody has claimed since.
-- **A process cut off from the database for longer than its lease can have its work taken over while
-  its own run carries on.** Only the current claim's outcome is recorded, and the other is logged, but
-  both runs' side effects happen. Keep work idempotent where that matters.
+- **A process cut off from the database, or frozen — a paused VM, a suspended laptop, `SIGSTOP`, a
+  long GC pause — for longer than its lease can have its work taken over while its own run carries
+  on.** A lease cannot tell a frozen holder from a dead one. Only the current claim's outcome is
+  recorded, and the other is logged. For a task that means it is written off as `failed` while it
+  still runs; for a pile item, that it is **worked twice**. Keep such work idempotent: an item's
+  `uid` is a natural idempotency key to give the system it writes to.
+- **A task whose worker died stays `running` until a worker of its engine claims next.** Only a claim
+  writes it off, so with no workers on that engine, or all of them busy, it shows `running` long after
+  its worker is gone, and `wait()` goes on waiting. It counts in the backlog, so the backlog warning
+  says nobody is taking it; `cancel()` works on it, since its lease has lapsed.
 - **`stopWorkers()` that times out still checks the process out,** while its unfinished threads may
   still be running. Exit the process afterwards.
 - **`requestStop()` alone leaves the heartbeat running.** Call `stopWorkers()`, or use `run()`.

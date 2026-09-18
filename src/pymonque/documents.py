@@ -3,6 +3,7 @@ on, and the conventions stored documents share."""
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Generic, Iterable, Literal, Mapping, Self, Sequence, TypeVar
@@ -14,10 +15,69 @@ from pymongo.collection import Collection
 from .exceptions import UnboundDocument
 
 
-def utc_now() -> datetime:
-    """Now, as naive UTC: what MongoDB stores and hands back."""
+logger = logging.getLogger("pymonque")
 
+# how far the database server's clock is ahead of this host's; kept by syncClock()
+_serverOffset = timedelta(0)
+
+# an offset this large says this host's clock is wrong, and is logged
+CLOCK_WARN_AFTER = timedelta(seconds=1)
+
+
+def utc_now() -> datetime:
+    """Now, as naive UTC — what MongoDB stores and hands back — by the database server's clock.
+
+    Every process compares leases, deadlines and heartbeats written by every other process, so they
+    must share one clock: the server's. A host whose own clock runs ahead would otherwise take over
+    work another still holds. The offset is measured by syncClock(); until then it is this host's own.
+    """
+
+    return _localNow() + _serverOffset
+
+
+def _localNow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def syncClock(db: Any) -> timedelta | None:
+    """Measure how far the database server's clock is from this host's, and have utc_now() follow the
+    server. Returns the offset, or None if the server would not say (it is then left as it was).
+
+    Reads `hello`'s localTime, corrected by half the round trip, so it is off by at most a few
+    milliseconds. One offset per process: an app's processes share one database.
+    """
+
+    global _serverOffset
+
+    before = _localNow()
+
+    try:
+        reply = db.command("hello")
+    except Exception as e:
+        logger.debug("could not read the database server's clock, so this host's is used: %r", e)
+        return None
+
+    after = _localNow()
+    serverTime = reply.get("localTime") if isinstance(reply, Mapping) else None
+
+    if not isinstance(serverTime, datetime):
+        logger.debug("the database server did not report its clock, so this host's is used")
+        return None
+
+    if serverTime.tzinfo is not None:
+        serverTime = serverTime.astimezone(timezone.utc).replace(tzinfo=None)
+
+    offset = serverTime - (before + (after - before) / 2)
+
+    if abs(offset) >= CLOCK_WARN_AFTER and abs(offset - _serverOffset) >= CLOCK_WARN_AFTER:
+        logger.warning(
+            "this host's clock is %.1fs %s the database server's; pymonque keeps time by the server's",
+            abs(offset.total_seconds()), "behind" if offset > timedelta(0) else "ahead of"
+        )
+
+    _serverOffset = offset
+
+    return offset
 
 
 def uuid4str() -> str:

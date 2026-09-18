@@ -307,6 +307,20 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   while it is not (`tasks._StoppableCall`). A stop that lands as the call ends is swallowed in the
   thread rather than escaping as an unhandled exception.
 
+### Lease edge cases (after 3.0.0)
+
+- **One clock: the database server's.** `utc_now()` is this host's clock plus an offset measured from
+  the server's `hello` `localTime` (half the round trip corrected), so every lease, deadline and
+  heartbeat is compared on the server's clock, whichever host wrote it. Measured when an app is built
+  and on every heartbeat; a host more than 1 s off is logged. Chosen over `$$NOW` in pipeline updates
+  because mongomock ignores `$$NOW` silently, which would have left every lease untested; the offset
+  also covers what `$$NOW` would not — skipAfter, the backlog, heartbeats, documents' own times. A
+  server that will not say leaves the host's clock. One offset per process.
+- **Short leases are logged** where the app is built: under 10 s, a stall of 2L/3 hands live work over.
+- **Documented, not changed:** a frozen holder is indistinguishable from a dead one, so a pile item
+  can be worked twice (use its `uid` as an idempotency key); a task whose worker died shows `running`
+  until a worker of its engine claims next.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen
