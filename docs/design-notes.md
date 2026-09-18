@@ -248,8 +248,9 @@ decisions made along the way:
     `schedulers(emitsInto=heavy)`, declared above; left out means the default engine;
   - ~~whether an int worker count covers the default task engine~~ — decided: yes;
   - ~~the collection name of a declared task engine~~ — decided: `pymonque_task_<name>` (rebuild §5.6);
-  - **still open, before layer 4:** how `init()`, the backlog warning and the fingerprint span
-    several task engines (rebuild §5.11);
+  - ~~how `init()`, the backlog warning and the fingerprint span several task engines~~ — decided
+    (rebuild §5.11): one fingerprint per app; `init()` cleans every task engine; the backlog warning
+    is per engine and names it;
   - ~~whether the declaration can shape the engine's model, collection and indexes~~ — decided: yes,
     see custom tasks (rebuild §5.9).
 

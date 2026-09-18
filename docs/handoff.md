@@ -30,7 +30,7 @@ tasks), **distributions** (interval functions for schedulers).
   with the layer 3 review's fixes — 503 tests in `tests_next/`. The small decisions made along the
   way, and what each leaves for later layers, are in `design-notes.md` under "Decided while
   building".
-  **Next: layer 4**, the app, versions, workers, shutdown and timeouts — after settling §5.11.
+  **Next: layer 4**, the app, versions, workers, shutdown and timeouts (§5.11 is settled).
 - **Branches:** `main` holds the current library and all docs. `rebuild` was branched from it and
   holds the checklist, this file and the rebuild code. Neither is pushed — `main` is ahead of
   `github/main` by the doc commits since `fe85e6b`.
@@ -51,8 +51,8 @@ tasks), **distributions** (interval functions for schedulers).
 
 ## Decisions made most recently
 
-Decisions 1–10 in `rebuild.md` §5 are settled; 11 (housekeeping and versions across several task
-engines) is open and must be settled before layer 4. The ones that change the most:
+Decisions 1–11 in `rebuild.md` §5 are settled; 11: one fingerprint per app, `init()` cleans every
+task engine, the backlog warning is per engine. The ones that change the most:
 
 **Failure and retries**
 - **Tasks have no retries.** A task either works or fails; one that must succeed retries inside its

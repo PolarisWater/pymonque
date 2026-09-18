@@ -201,9 +201,8 @@ pymonque/
 
 ## 5. Decisions
 
-Ordered by how much of the shape depends on them. **1–10 are decided** as written below (the
-*Recommended* answer, except where 2 and 10 say otherwise). **11 is open**, and must be settled
-before layer 4.
+Ordered by how much of the shape depends on them. **All eleven are decided** as written below (the
+*Recommended* answer, except where 2 and 10 say otherwise).
 
 1. **Claim identity (B6).** One `claimId` on every claimed document — task, item, and a scheduler
    while it is held — replacing `attempts` matching for tasks and `deadline` matching for
@@ -269,11 +268,19 @@ before layer 4.
     - on retiring: an error listing each abandoned task, how long it has run and where it is stuck,
       then "no longer claiming, draining N", then the exit — `run()` reports it so the process can
       exit with a code of its own.
-11. **Housekeeping and versions across several task engines — Open, before layer 4.** How `init()`
-    (flagging incompatible tasks), the backlog warning and the fingerprint span more than one task
-    engine: per engine or for the app as a whole, and what the warning names. Already decided to
-    belong here: housekeeping also writes off a task left `running` by a dead worker whose function
-    has since gone (no engine claims it), as `failed` with the worker-died error.
+11. **Housekeeping and versions across several task engines — Decided.**
+    - **One fingerprint per app,** checked once: tasks belong to no engine and any engine runs any
+      task, so the app is one version. It covers every task, distribution, engine (lease, missed
+      beats), pile and model schema; a live worker with another fingerprint refuses the process.
+    - **`init()` is app-wide:** after the one version check it runs `flagIncompatible()` and
+      `writeOffStuck()` on **every** task engine — not only those this process runs workers on, so
+      an engine nobody works is still cleaned — then scheduler engines, piles and collections.
+      `startWorkers()` calls it; the constructor never does.
+    - **The backlog warning is per engine, and names it:** one monitor checks each task engine; the
+      heartbeat records worker counts by engine name; the warning reads "<engine>: N due, oldest
+      waiting Xs, M worker(s) on it across processes", or says no process runs workers on it.
+    - Housekeeping also writes off a task left `running` by a dead worker whose function has since
+      gone (no engine claims it), as `failed` with the worker-died error.
 
 Also settled with these:
 - **Worker counts:** an int means that many threads on every engine of the kind, the default task
