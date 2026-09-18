@@ -1,22 +1,47 @@
-"""BaseDistributions and DistributionEngine."""
+"""Distributions: the built-in intervals, the registry, and the engine that builds, checks and draws
+from calls of them."""
 
 import random
 from datetime import timedelta
 
 import pytest
 
-from pymonque import (
-    BaseApp, BaseDistributions, DistributionEngine, CallSpec, task,
-)
+from pymonque import BaseDistributions, CallSpec, DistributionEngine
 from pymonque.exceptions import DistributionNotFound, DistributionValidationError
-
-from conftest import ExampleApp
 
 
 DAY = 86400
 
 
-# --- the built-in distributions ---
+class Custom(BaseDistributions):
+    @staticmethod
+    def fixed(dailyFrequency: float, seconds: float) -> timedelta:
+        return timedelta(seconds=seconds)
+
+    @staticmethod
+    def stuck(dailyFrequency: float) -> timedelta:
+        return timedelta(0)
+
+    @staticmethod
+    def seconds(dailyFrequency: float) -> float:
+        return 1.0
+
+    @staticmethod
+    def _hidden(dailyFrequency: float) -> timedelta:
+        return timedelta(seconds=1)
+
+
+@pytest.fixture
+def engine() -> DistributionEngine:
+    return DistributionEngine()
+
+
+@pytest.fixture
+def custom() -> DistributionEngine:
+    return DistributionEngine(Custom)
+
+
+# --- the built-ins ---
 
 def test_constant_is_exact():
     assert BaseDistributions.constant(dailyFrequency=4) == timedelta(seconds=DAY / 4)
@@ -28,12 +53,10 @@ def test_constant_is_exact():
     ("lognormal", {"dailyFrequency": 12, "sigma": 0.5}),
     ("exponential", {"dailyFrequency": 12}),
 ])
-def test_every_distribution_returns_a_positive_timedelta(name, kwargs):
+def test_every_distribution_gives_a_positive_interval(engine, name, kwargs):
     random.seed(0)
-    samples = [getattr(BaseDistributions, name)(**kwargs) for _ in range(100)]
 
-    assert all(isinstance(s, timedelta) for s in samples)
-    assert all(s >= timedelta(0) for s in samples)
+    assert all(engine.gen(engine(name, **kwargs)) > timedelta(0) for _ in range(100))
 
 
 @pytest.mark.parametrize("name, kwargs", [
@@ -43,95 +66,88 @@ def test_every_distribution_returns_a_positive_timedelta(name, kwargs):
 ])
 def test_the_mean_interval_matches_the_daily_frequency(name, kwargs):
     random.seed(0)
-    expected = DAY / kwargs["dailyFrequency"]
     samples = [getattr(BaseDistributions, name)(**kwargs).total_seconds() for _ in range(5000)]
-    mean = sum(samples) / len(samples)
+    expected = DAY / kwargs["dailyFrequency"]
 
-    assert expected * 0.9 < mean < expected * 1.1
+    assert expected * 0.9 < sum(samples) / len(samples) < expected * 1.1
 
 
-def test_normal_never_goes_negative():
+def test_normal_never_draws_a_dead_interval(engine):
+    """A spread wider than the mean would draw below zero; the floor keeps it positive."""
+
     random.seed(0)
-    # a std wider than the mean would otherwise produce negative intervals
-    samples = [BaseDistributions.normal(dailyFrequency=1, stdFraction=5) for _ in range(500)]
+    distribution = engine("normal", dailyFrequency=1, stdFraction=5)
 
-    assert min(samples) >= timedelta(0)
-
-
-def test_registry_walks_the_mro():
-    assert set(BaseDistributions._getDistributions()) == {
-        "constant", "normal", "lognormal", "exponential",
-    }
+    assert min(engine.gen(distribution) for _ in range(500)) > timedelta(0)
 
 
-# --- DistributionEngine ---
+# --- the registry ---
 
-def test_call_builds_and_validates_a_callspec(app):
-    spec = app.distribution("constant", dailyFrequency=2)
-
-    assert isinstance(spec, CallSpec)
-    assert spec.functionName == "constant"
+def test_the_registry_holds_the_public_staticmethods(engine, custom):
+    assert set(engine.functions) == {"constant", "normal", "lognormal", "exponential"}
+    assert set(custom.functions) == {"constant", "normal", "lognormal", "exponential", "fixed", "stuck", "seconds"}
 
 
-def test_unknown_distribution_is_rejected(app):
+def test_a_custom_registry_extends_the_built_ins(custom):
+    assert custom.gen(custom("fixed", dailyFrequency=1, seconds=7)) == timedelta(seconds=7)
+    assert custom.gen(custom("constant", dailyFrequency=24)) == timedelta(hours=1)
+
+
+def test_the_default_registry_does_not_see_custom_distributions(engine):
     with pytest.raises(DistributionNotFound):
-        app.distribution("does_not_exist", dailyFrequency=1)
+        engine("fixed", dailyFrequency=1, seconds=7)
 
 
-def test_missing_argument_is_rejected(app):
+def test_a_registry_must_subclass_base_distributions():
+    with pytest.raises(TypeError):
+        DistributionEngine(object)
+
+
+# --- building and checking a call ---
+
+def test_calling_the_engine_builds_a_checked_call(engine):
+    assert engine("constant", dailyFrequency=2) == CallSpec.new("constant", dailyFrequency=2)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"dailyFrequency": 1},                          # stdFraction missing
+    {"dailyFrequency": 1, "stdFraction": 0.1, "nope": 2},
+    {"dailyFrequency": "often", "stdFraction": 0.1},
+    {"dailyFrequency": 1, "stdFraction": -0.1},
+], ids=["missing", "unknown", "wrongly typed", "negative spread"])
+def test_arguments_that_do_not_fit_are_refused(engine, kwargs):
     with pytest.raises(DistributionValidationError):
-        app.distribution("normal", dailyFrequency=1)  # stdFraction is required
+        engine("normal", **kwargs)
 
 
-def test_unknown_argument_is_rejected(app):
-    with pytest.raises(DistributionValidationError):
-        app.distribution("constant", dailyFrequency=1, nope=2)
-
-
-def test_wrongly_typed_argument_is_rejected(app):
-    with pytest.raises(DistributionValidationError):
-        app.distribution("constant", dailyFrequency="often")
-
-
-def test_gen_produces_an_interval(app):
-    assert app.distribution.gen(app.distribution("constant", dailyFrequency=2)) == timedelta(seconds=DAY / 2)
-
-
-def test_gen_rejects_a_distribution_that_returns_the_wrong_type():
-    class Bad(BaseDistributions):
-        @staticmethod
-        def seconds(dailyFrequency: float) -> float:
-            return 1.0  # not a timedelta
-
-    engine = DistributionEngine(Bad)
-
-    with pytest.raises(DistributionValidationError):
-        engine.gen(CallSpec.new("seconds", dailyFrequency=1))
-
-
-# --- custom registries ---
-
-def test_a_custom_registry_extends_the_built_ins(db):
-    class Custom(BaseDistributions):
-        @staticmethod
-        def fixed(dailyFrequency: float, seconds: float) -> timedelta:
-            return timedelta(seconds=seconds)
-
-    class Q(ExampleApp):
-        pass
-
-    app = Q(db, distributionsRegistry=Custom)
-
-    assert app.distribution.gen(app.distribution("fixed", dailyFrequency=1, seconds=7)) == timedelta(seconds=7)
-    assert app.distribution("constant", dailyFrequency=1)  # inherited ones still work
-
-
-def test_the_default_registry_does_not_see_custom_distributions(app):
+def test_an_unknown_distribution_is_refused(engine):
     with pytest.raises(DistributionNotFound):
-        app.distribution("fixed", dailyFrequency=1, seconds=7)
+        engine("does_not_exist", dailyFrequency=1)
 
 
-def test_gen_coerces_what_validation_accepted(app):
-    distribution = app.distribution("constant", dailyFrequency="24")
+@pytest.mark.parametrize("dailyFrequency", [0, -1, -0.5])
+@pytest.mark.parametrize("name", ["constant", "exponential"])
+def test_a_frequency_that_cannot_give_a_positive_interval_is_refused(engine, name, dailyFrequency):
+    with pytest.raises(DistributionValidationError):
+        engine(name, dailyFrequency=dailyFrequency)
 
-    assert app.distribution.gen(distribution).total_seconds() == 3600
+
+# --- drawing ---
+
+def test_gen_coerces_what_validation_accepted(engine):
+    assert engine.gen(engine("constant", dailyFrequency="24")).total_seconds() == 3600
+
+
+def test_gen_refuses_a_distribution_returning_something_else(custom):
+    with pytest.raises(DistributionValidationError, match="not a timedelta"):
+        custom.gen(custom("seconds", dailyFrequency=1))
+
+
+def test_gen_refuses_a_custom_dead_interval(custom):
+    with pytest.raises(DistributionValidationError, match="positive"):
+        custom.gen(custom("stuck", dailyFrequency=1))
+
+
+def test_gen_checks_a_call_that_was_never_checked(engine):
+    with pytest.raises(DistributionValidationError):
+        engine.gen(CallSpec.new("constant", dailyFrequency=0))

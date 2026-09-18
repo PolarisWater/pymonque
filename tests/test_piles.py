@@ -1,559 +1,493 @@
-"""PileEngine: filling a pile, claiming from it atomically, and finishing items."""
+"""The pile engine: filling a pile, claiming from it atomically, tries and giving up, finishing items by
+claim or by uid, releasing, renewing, cancelling, and looking at what is on it."""
 
+import threading
 from datetime import timedelta
 
 import pytest
 from pydantic import BaseModel, ValidationError
+from pymongo import IndexModel
 
-from pymonque import BaseApp, Item, PileEngine, task, pile, utc_now
-
-from conftest import Email, ExampleApp, appWith
-
-
-def fill(app, count: int = 3):
-    return app.outbox.addMany([{"to": f"user{n}@x.y", "subject": str(n)} for n in range(count)])
+from pymonque import CollectionEngine, Document, Item, utc_now
 
 
-# --- declaring piles ---
-
-def test_each_pile_gets_its_own_collection(app):
-    assert app.outbox.itemsCollection.name == "pymonque_pile_outbox"
-    assert app.scraps.itemsCollection.name == "pymonque_pile_scraps"
+class Email(BaseModel):
+    to:         str
+    subject:    str = "(no subject)"
 
 
-def test_piles_are_listed_on_the_app(app):
-    assert set(app.piles) == {"outbox", "scraps"}
-    assert isinstance(app.outbox, PileEngine)
+@pytest.fixture
+def outbox(pileEngine):
+    return pileEngine(Email, name="outbox")
 
 
-def test_class_access_returns_the_declaration():
-    assert isinstance(ExampleApp.outbox, pile)
-    assert ExampleApp.outbox.name == "outbox"
+def fill(pile, count=3):
+    return pile.addMany([{"to": f"user{n}@x.y", "subject": str(n)} for n in range(count)])
 
 
-def test_the_collection_name_can_be_overridden(db):
-    class Q(BaseApp):
-        things = pile(itemsCollection="my_things")
-
-    assert Q(db).things.itemsCollection.name == "my_things"
+def lapse(pile, item):
+    pile.collection.update_one({"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(seconds=1)}})
 
 
-def test_a_subclass_can_override_a_pile(db):
-    class Child(ExampleApp):
-        outbox = pile(Email, itemsCollection="child_outbox")
+def abandoned(pile):
+    """An item a worker claimed, and then stopped renewing."""
 
-    assert Child(db).outbox.itemsCollection.name == "child_outbox"
+    item = pile.claim()
+    lapse(pile, item)
 
-
-def test_two_piles_do_not_share_items(app):
-    app.outbox.add(to="a@b.c")
-    app.scraps.add({"anything": 1})
-
-    assert app.outbox.count() == 1
-    assert app.scraps.count() == 1
-    assert app.outbox.claim().data.to == "a@b.c"
+    return item
 
 
 # --- filling ---
 
-def test_add_accepts_a_model_a_dict_or_kwargs(app):
-    a = app.outbox.add(Email(to="a@b.c", subject="model"))
-    b = app.outbox.add({"to": "d@e.f", "subject": "dict"})
-    c = app.outbox.add(to="g@h.i", subject="kwargs")
+def test_add_takes_a_model_a_dict_or_keyword_arguments(outbox):
+    added = [
+        outbox.add(Email(to="a@b.c", subject="model")),
+        outbox.add({"to": "d@e.f", "subject": "dict"}),
+        outbox.add(to="g@h.i", subject="kwargs"),
+    ]
 
-    assert [i.data.subject for i in (a, b, c)] == ["model", "dict", "kwargs"]
-    assert app.outbox.count(status="pending") == 3
+    assert [item.data.subject for item in added] == ["model", "dict", "kwargs"]
+    assert outbox.count(status="pending") == 3
 
 
-def test_the_payload_is_stored_as_plain_data(app):
-    item = app.outbox.add(to="a@b.c", subject="hi")
-    raw = app.outbox.itemsCollection.find_one({"uid": item.uid})
+def test_the_payload_is_stored_as_plain_data(outbox):
+    item = outbox.add(to="a@b.c", subject="hi")
+    raw = outbox.collection.find_one({"uid": item.uid})
 
     assert raw["data"] == {"to": "a@b.c", "subject": "hi"}
-    assert raw["status"] == "pending"
-    assert raw["attempts"] == 0
+    assert (raw["status"], raw["attempts"], raw["claimId"]) == ("pending", 0, None)
 
 
-def test_a_defaulted_payload_field_is_filled_in(app):
-    assert app.outbox.add(to="a@b.c").data.subject == "(no subject)"
+def test_a_payload_default_is_filled_in(outbox):
+    assert outbox.add(to="a@b.c").data.subject == "(no subject)"
 
 
-def test_an_invalid_payload_is_rejected(app):
+def test_an_invalid_payload_is_refused_and_nothing_is_stored(outbox):
     with pytest.raises(ValidationError):
-        app.outbox.add({"subject": "no recipient"})
+        outbox.add({"subject": "no recipient"})
 
-    assert app.outbox.count() == 0
-
-
-def test_an_untyped_pile_takes_any_dict(app):
-    app.scraps.add({"anything": [1, 2, {"deep": True}]})
-
-    assert app.scraps.claim().data == {"anything": [1, 2, {"deep": True}]}
+    assert outbox.count() == 0
 
 
-def test_addMany_inserts_in_one_go(app):
-    items = fill(app, 5)
+def test_an_untyped_pile_takes_any_dict(pileEngine):
+    scraps = pileEngine(name="scraps")
+    scraps.add({"anything": [1, 2, {"deep": True}]})
 
-    assert len(items) == 5
-    assert app.outbox.count(status="pending") == 5
-
-
-def test_addMany_of_nothing_is_a_no_op(app):
-    assert app.outbox.addMany([]) == []
-    assert app.outbox.count() == 0
+    assert scraps.claim().data == {"anything": [1, 2, {"deep": True}]}
 
 
-def test_addMany_validates_before_inserting_anything(app):
+def test_a_payload_is_a_plain_model_not_a_document(outbox):
+    data = outbox.add(to="a@b.c").data
+
+    assert isinstance(data, Email) and not isinstance(data, Document)
+
+
+def test_addMany_adds_everything_in_one_go(outbox):
+    assert len(fill(outbox, 5)) == 5
+    assert outbox.count(status="pending") == 5
+
+
+def test_addMany_checks_every_payload_before_adding_any(outbox):
     with pytest.raises(ValidationError):
-        app.outbox.addMany([{"to": "a@b.c"}, {"subject": "no recipient"}])
+        outbox.addMany([{"to": "a@b.c"}, {"subject": "no recipient"}])
 
-    assert app.outbox.count() == 0
+    assert outbox.count() == 0
+
+
+def test_addMany_of_nothing_does_nothing(outbox):
+    assert outbox.addMany([]) == []
+    assert outbox.count() == 0
+
+
+def test_two_piles_do_not_share_items(pileEngine):
+    outbox, scraps = pileEngine(Email, name="outbox"), pileEngine(name="scraps")
+    outbox.add(to="a@b.c")
+    scraps.add({"anything": 1})
+
+    assert (outbox.count(), scraps.count()) == (1, 1)
+    assert outbox.claim().data.to == "a@b.c"
 
 
 # --- claiming ---
 
-def test_claim_takes_the_oldest_item(app):
-    fill(app, 3)
+def test_claim_takes_the_item_that_has_waited_longest(outbox):
+    fill(outbox, 3)
 
-    assert [app.outbox.claim().data.to for _ in range(3)] == [
-        "user0@x.y", "user1@x.y", "user2@x.y",
-    ]
+    assert [outbox.claim().data.to for _ in range(3)] == ["user0@x.y", "user1@x.y", "user2@x.y"]
 
 
-def test_claim_marks_the_item_and_counts_the_attempt(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
+def test_a_claim_marks_the_item_running_and_uses_a_try(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
 
-    assert item.status == "claimed"
-    assert item.attempts == 1
-    assert item.claimedAt is not None
-    assert app.outbox.count(status="pending") == 0
-
-
-def test_no_two_claims_return_the_same_item(app):
-    fill(app, 2)
-    first, second = app.outbox.claim(), app.outbox.claim()
-
-    assert first.uid != second.uid
-    assert app.outbox.count(status="claimed") == 2
+    assert (item.status, item.attempts) == ("running", 1)
+    assert item.claimedAt is not None and item.claimId is not None
+    assert outbox.get(item.uid).claimId == item.claimId
 
 
-def test_claim_on_an_empty_pile_returns_none(app):
-    assert app.outbox.claim() is None
+def test_claiming_an_empty_pile_gives_none(outbox):
+    assert outbox.claim() is None
 
 
-def test_a_claimed_item_is_not_offered_again(app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.claim()
+def test_a_claimed_item_is_not_offered_again(outbox):
+    outbox.add(to="a@b.c")
+    outbox.claim()
 
-    assert app.outbox.claim() is None
-
-
-def test_claim_can_filter(app):
-    app.outbox.addMany([
-        {"to": "skip@x.y", "subject": "no"},
-        {"to": "take@x.y", "subject": "yes"},
-    ])
-
-    assert app.outbox.claim({"data.subject": "yes"}).data.to == "take@x.y"
+    assert outbox.claim() is None
 
 
-def test_a_filter_that_matches_nothing_returns_none(app):
-    app.outbox.add(to="a@b.c", subject="hi")
+def test_claim_takes_a_filter(outbox):
+    outbox.addMany([{"to": "skip@x.y", "subject": "no"}, {"to": "take@x.y", "subject": "yes"}])
 
-    assert app.outbox.claim({"data.subject": "nope"}) is None
-    assert app.outbox.count(status="pending") == 1  # nothing was claimed
+    assert outbox.claim({"data.subject": "yes"}).data.to == "take@x.y"
+
+
+def test_a_filter_matching_nothing_claims_nothing(outbox):
+    outbox.add(to="a@b.c", subject="hi")
+
+    assert outbox.claim({"data.subject": "nope"}) is None
+    assert outbox.count(status="pending") == 1
+
+
+def test_no_two_threads_claim_the_same_item(pileEngine):
+    jobs = pileEngine()
+    jobs.addMany([{"n": n} for n in range(30)])
+    claimed, lock = [], threading.Lock()
+
+    def drain():
+        while (item := jobs.claim()) is not None:
+            with lock:
+                claimed.append(item.data["n"])
+
+    threads = [threading.Thread(target=drain) for _ in range(4)]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join(10)
+
+    assert sorted(claimed) == list(range(30))
+
+
+def test_a_live_holder_is_not_taken_over(outbox):
+    outbox.add(to="a@b.c")
+    held = outbox.claim()
+
+    assert outbox.claim() is None
+    assert outbox.get(held.uid).claimId == held.claimId
+
+
+def test_an_item_whose_holder_died_is_claimed_again_while_it_has_tries(pileEngine):
+    jobs = pileEngine(maxAttempts=2)
+    jobs.add({"n": 1})
+    first = abandoned(jobs)
+    again = jobs.claim()
+
+    assert again.uid == first.uid
+    assert again.attempts == 2
+    assert again.claimId != first.claimId
+
+
+def test_out_of_tries_an_item_is_given_up_at_the_next_claim(outbox):
+    outbox.add(to="a@b.c")
+    item = abandoned(outbox)
+
+    assert outbox.claim() is None       # its one try went down with its worker
+
+    given = outbox.get(item.uid)
+
+    assert given.status == "failed"
+    assert "gave up after 1 try" in given.error
+    assert given.claimId is None and given.finishedAt is not None
+
+
+def test_a_given_up_item_does_not_block_the_next_one(outbox):
+    outbox.add(to="dead@b.c")
+    abandoned(outbox)
+    outbox.add(to="live@b.c")
+
+    assert outbox.claim().data.to == "live@b.c"
+    assert outbox.count(status="failed") == 1
+
+
+def test_a_given_up_item_cannot_be_finished_by_its_old_holder(outbox):
+    outbox.add(to="a@b.c")
+    item = abandoned(outbox)
+    outbox.claim()
+
+    assert outbox.done(item) is False
+    assert outbox.get(item.uid).status == "failed"
+
+
+def test_a_pile_takes_its_max_tries_from_its_settings(pileEngine):
+    assert pileEngine(maxAttempts=3).maxAttempts == 3
 
 
 # --- finishing ---
 
-def test_done_records_a_result(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-    app.outbox.done(item, result="delivered")
-    after = app.outbox.find({"uid": item.uid})[0]
+def test_done_records_a_result_and_lets_the_item_go(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
 
-    assert after.status == "done"
-    assert after.result == "delivered"
-    assert after.finishedAt is not None
+    assert outbox.done(item, result="delivered") is True
 
+    finished = outbox.get(item.uid)
 
-def test_fail_records_an_error(app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.fail(app.outbox.claim(), error="bounced")
-    after = app.outbox.find({"status": "failed"})[0]
+    assert (finished.status, finished.result, finished.claimId) == ("done", "delivered", None)
+    assert finished.finishedAt is not None
 
-    assert after.error == "bounced"
 
+def test_fail_records_an_error_and_is_final(pileEngine):
+    jobs = pileEngine(maxAttempts=3)
+    jobs.add({"n": 1})
+    item = jobs.claim()
 
-def test_release_puts_the_item_back(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-    app.outbox.release(item)
-    after = app.outbox.find({"uid": item.uid})[0]
+    assert jobs.fail(item, error="bounced") is True
 
-    assert after.status == "pending"
-    assert after.claimedAt is None
-    assert app.outbox.claim().uid == item.uid  # claimable again
+    failed = jobs.get(item.uid)
 
+    assert (failed.status, failed.error) == ("failed", "bounced")
+    assert jobs.claim() is None         # tries left, and never claimed again
 
-def test_an_item_can_be_finished_by_uid(app):
-    item = app.outbox.add(to="a@b.c")
-    app.outbox.claim()
-    app.outbox.done(item.uid)
 
-    assert app.outbox.count(status="done") == 1
+def test_finishing_reports_whether_it_finished_an_item(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
 
+    assert outbox.done(item) is True
+    assert outbox.fail(item) is False           # one outcome per claim
+    assert outbox.done("no-such-uid") is False
 
-# --- work() ---
 
-def test_work_marks_the_item_done(app):
-    app.outbox.add(to="a@b.c")
+def test_a_stale_holder_cannot_finish_fail_release_or_renew_and_the_current_holder_can(pileEngine):
+    jobs = pileEngine(maxAttempts=3)
+    jobs.add({"n": 1})
+    first = abandoned(jobs)
+    second = jobs.claim()
 
-    with app.outbox.work() as item:
-        assert item.data.to == "a@b.c"
+    assert jobs.done(first, result="stale") is False
+    assert jobs.fail(first, error="stale") is False
+    assert jobs.release(first) is False
+    assert jobs.renewLease(first) is False
+    assert jobs.get(first.uid).claimId == second.claimId
 
-    assert app.outbox.count(status="done") == 1
+    assert jobs.done(second, result="fresh") is True
+    assert jobs.get(first.uid).result == "fresh"
 
 
-def test_work_marks_the_item_failed_and_re_raises(app):
-    app.outbox.add(to="a@b.c")
+def test_an_item_can_be_finished_by_uid_whatever_holds_it(outbox):
+    item = outbox.add(to="a@b.c")
+    outbox.claim()
 
-    with pytest.raises(ValueError):
-        with app.outbox.work():
-            raise ValueError("nope")
+    assert outbox.done(item.uid) is True        # an operator's verdict, not a worker racing for it
+    assert outbox.get(item.uid).status == "done"
 
-    failed = app.outbox.find({"status": "failed"})[0]
-    assert "ValueError: nope" in failed.error
 
+@pytest.mark.parametrize("verdict", ["done", "fail", "release"])
+def test_a_verdict_by_uid_leaves_a_finished_item_as_it_ended(outbox, verdict):
+    ended = {}
 
-def test_work_yields_none_on_an_empty_pile(app):
-    with app.outbox.work() as item:
-        assert item is None
+    for status, finish in (("done", outbox.done), ("failed", outbox.fail)):
+        item = outbox.add(to=f"{status}@x.y")
+        finish(outbox.claim())
+        ended[item.uid] = status
 
+    cancelled = outbox.add(to="canceled@x.y")
+    outbox.cancel(cancelled.uid)
+    ended[cancelled.uid] = "canceled"
 
-def test_work_takes_a_filter(app):
-    app.outbox.addMany([
-        {"to": "skip@x.y", "subject": "no"},
-        {"to": "take@x.y", "subject": "yes"},
-    ])
+    for uid, status in ended.items():
+        assert getattr(outbox, verdict)(uid) is False
+        assert outbox.get(uid).status == status
 
-    with app.outbox.work({"data.subject": "yes"}) as item:
-        assert item.data.to == "take@x.y"
 
+def test_an_item_never_claimed_cannot_be_finished_as_a_claim(outbox):
+    added = outbox.add(to="a@b.c")
 
-def test_a_task_can_drain_the_pile(app, tasks):
-    from pymonque import Task
+    with pytest.raises(ValueError, match="claim"):
+        outbox.done(added)
 
-    app.outbox.add(to="a@b.c")
-    app.task.schedule(ExampleApp.send_one())
-    app.task._work()
-    result = Task.model_validate(tasks.find_one()).result
+    assert outbox.get(added.uid).status == "pending"
+    assert outbox.done(added.uid) is True
 
-    assert result == "sent to a@b.c"
-    assert app.outbox.count(status="done") == 1
 
+# --- releasing ---
 
-def test_a_task_on_an_empty_pile_still_succeeds(app, tasks):
-    from pymonque import Task
+def test_release_puts_the_item_back_in_its_own_place(outbox):
+    fill(outbox, 2)
+    first = outbox.claim()
 
-    app.task.schedule(ExampleApp.send_one())
-    app.task._work()
+    assert outbox.release(first) is True
+    assert outbox.claim().uid == first.uid      # ahead of the item that was added after it
 
-    assert Task.model_validate(tasks.find_one()).result == "empty"
 
-
-# --- inspecting and managing ---
-
-def test_count_and_counts(app):
-    fill(app, 4)
-    app.outbox.done(app.outbox.claim())
-    app.outbox.fail(app.outbox.claim())
-    app.outbox.claim()
-
-    assert app.outbox.count() == 4
-    assert app.outbox.count(status="pending") == 1
-    assert app.outbox.counts() == {"pending": 1, "claimed": 1, "done": 1, "failed": 1}
-
-
-def test_find_returns_typed_items(app):
-    fill(app, 2)
-    items = app.outbox.find()
-
-    assert len(items) == 2
-    assert all(isinstance(i, Item) for i in items)
-    assert items[0].data.to == "user0@x.y"
-
-
-def test_purge_only_removes_the_named_status(app):
-    fill(app, 3)
-    app.outbox.done(app.outbox.claim())
-    app.outbox.fail(app.outbox.claim())
-
-    assert app.outbox.purge("done") == 1
-    assert app.outbox.counts() == {"pending": 1, "claimed": 0, "done": 0, "failed": 1}
-
-
-def test_indexes_back_the_claim_query(app):
-    keys = [tuple(index["key"]) for index in app.outbox.itemsCollection.index_information().values()]
-
-    assert (("status", 1), ("leaseUntil", 1)) in keys
-    assert (("uid", 1),) in keys
-
-
-# --- abandoned items ---
-
-def test_a_live_lease_survives_a_new_instance(db, app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-
-    ExampleApp(db)                     # another process starts up
-    after = app.outbox.find()[0]
-
-    assert after.status == "claimed"     # still held by whoever has it
-    assert after.uid == item.uid
-
-
-def test_a_held_item_lease_can_be_renewed(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-    app.outbox.itemsCollection.update_one(
-        {"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
-    )
-
-    app.outbox.renewLease(item)
-
-    assert app.outbox.find()[0].leaseUntil > utc_now()   # holding on to it again
-    assert app.outbox.claim() is None                    # so nobody else may take it
-
-
-def abandoned(app, to="a@b.c"):
-    """An item whose holder was claimed and then stopped renewing."""
-
-    app.outbox.add(to=to)
-    item = app.outbox.claim()
-    app.outbox.itemsCollection.update_one(
-        {"uid": item.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}}
-    )
-    return item
-
-
-def test_an_abandoned_item_is_given_up_on_at_the_next_claim(app):
-    abandoned(app)
-
-    assert app.outbox.claim() is None      # its one attempt went down with its worker
-
-    after = app.outbox.find()[0]
-    assert after.status == "failed"
-    assert "gave up after 1 attempt(s)" in after.error
-    assert after.claimId is None
-
-
-def test_an_abandoned_item_with_attempts_left_is_claimed_again(db):
-    app = appWith(ExampleApp, db, itemMaxAttempts=2)
-    first = abandoned(app)
-
-    again = app.outbox.claim()
-
-    assert again.uid == first.uid
-    assert again.attempts == 2
-
-
-def test_a_given_up_item_does_not_block_the_next_one(app):
-    abandoned(app, to="dead@b.c")
-    app.outbox.add(to="live@b.c")
-
-    assert app.outbox.claim().data.to == "live@b.c"
-    assert app.outbox.count(status="failed") == 1
-
-
-def test_a_live_holder_is_not_taken_over(app):
-    """A worker that is still renewing must survive another worker's claim."""
-
-    app.outbox.add(to="a@b.c")
-    held = app.outbox.claim()              # lease is live, being renewed
-
-    assert app.outbox.claim() is None
-    assert app.outbox.get(held.uid).status == "claimed"
-
-
-# --- retries: the same rule as tasks ---
-
-def test_a_failure_is_final_by_default(app):
-    app.outbox.add(to="a@b.c")
-
-    with pytest.raises(ValueError):
-        with app.outbox.work():
-            raise ValueError("nope")
-
-    assert app.outbox.count(status="failed") == 1
-    assert app.outbox.claim() is None
-
-
-def test_a_failure_with_attempts_left_goes_back_on_the_pile(db):
-    class Q(BaseApp):
-        jobs = pile(maxAttempts=3, retryDelay=0)
-
-    app = Q(db)
-    app.jobs.add({"n": 1})
-
-    for _ in range(3):
-        with pytest.raises(ValueError):
-            with app.jobs.work():
-                raise ValueError("nope")
-
-    after = app.jobs.find()[0]
-    assert after.status == "failed"
-    assert after.attempts == 3
-    assert "nope" in after.error
-    assert app.jobs.claim() is None
-
-
-def test_a_retry_waits_its_delay(db):
-    class Q(BaseApp):
-        jobs = pile(maxAttempts=2, retryDelay=60)
-
-    app = Q(db)
-    item = app.jobs.add({"n": 1})
-
-    assert app.jobs.fail(app.jobs.claim(), error="nope") is True
-
-    assert app.jobs.get(item.uid).status == "pending"
-    assert app.jobs.claim() is None        # not for another minute
-
-
-def test_a_success_after_a_retry_is_done(db):
-    class Q(BaseApp):
-        jobs = pile(maxAttempts=2, retryDelay=0)
-
-    app = Q(db)
-    item = app.jobs.add({"n": 1})
-    app.jobs.fail(app.jobs.claim(), error="nope")
-
-    with app.jobs.work() as again:
-        pass
-
-    assert again.attempts == 2
-    assert app.jobs.get(item.uid).status == "done"
-
-
-def test_failing_by_uid_is_final(db):
-    class Q(BaseApp):
-        jobs = pile(maxAttempts=3)
-
-    app = Q(db)
-    item = app.jobs.add({"n": 1})
-    app.jobs.claim()
-
-    assert app.jobs.fail(item.uid, error="by hand") is True
-    assert app.jobs.get(item.uid).status == "failed"
-
-
-def test_releasing_does_not_use_up_an_attempt(app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.release(app.outbox.claim())
-
-    again = app.outbox.claim()             # one attempt allowed, and it is still unused
+def test_release_gives_the_try_back(outbox):
+    outbox.add(to="a@b.c")
+    outbox.release(outbox.claim())
+    again = outbox.claim()                      # one try allowed, and it is still unused
 
     assert again is not None
     assert again.attempts == 1
 
 
-def test_only_a_claimed_item_can_be_released(app):
-    item = app.outbox.add(to="a@b.c")
+def test_a_released_item_is_claimed_afresh(outbox):
+    outbox.add(to="a@b.c")
+    first = outbox.claim()
+    outbox.release(first)
+    released = outbox.get(first.uid)
 
-    assert app.outbox.release(item.uid) is False
-    assert app.outbox.get(item.uid).attempts == 0
-
-
-def test_a_pile_can_override_the_app_limits(db):
-    class Q(BaseApp):
-        itemMaxAttempts = 5
-        itemRetryDelay = 30
-        strict = pile(maxAttempts=1, retryDelay=0)
-        lenient = pile()
-
-    app = Q(db)
-
-    assert (app.strict.maxAttempts, app.strict.retryDelay) == (1, 0)
-    assert (app.lenient.maxAttempts, app.lenient.retryDelay) == (5, 30)
+    assert (released.status, released.claimId, released.claimedAt) == ("pending", None, None)
+    assert outbox.claim().claimId != first.claimId
 
 
-@pytest.mark.parametrize("limits", [{"maxAttempts": 0}, {"retryDelay": -1}])
-def test_invalid_item_limits_are_rejected_where_they_are_written(limits):
-    with pytest.raises(ValidationError, match=next(iter(limits))):
-        class Q(BaseApp):
-            jobs = pile(**limits)
+def test_only_a_held_item_can_be_released(outbox):
+    item = outbox.add(to="a@b.c")
+
+    assert outbox.release(item.uid) is False
+    assert outbox.get(item.uid).attempts == 0
+    assert outbox.release("no-such-uid") is False
 
 
-def test_finished_items_survive_a_restart(db, app):
-    app.outbox.add(to="a@b.c")
-    app.outbox.done(app.outbox.claim())
+# --- renewing ---
 
-    ExampleApp(db).init()
+def test_a_held_items_lease_can_be_renewed(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
+    lapse(outbox, item)
 
-    assert app.outbox.count(status="done") == 1
-
-
-# --- the api hands back its own values, not the driver's ---
-
-def test_finishing_an_item_reports_whether_it_changed_one(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-
-    assert app.outbox.done(item) is True
-    assert app.outbox.done("no-such-uid") is False
+    assert outbox.renewLease(item) is True
+    assert outbox.get(item.uid).leaseUntil > utc_now()
+    assert outbox.claim() is None
 
 
-def test_failing_and_releasing_report_the_same_way(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
+def test_renewing_reports_whether_there_was_a_claim_to_renew(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
+    outbox.done(item)
 
-    assert app.outbox.fail(item, error="nope") is True
-    assert app.outbox.release("no-such-uid") is False
-
-
-def test_renewing_a_lease_reports_whether_there_was_one(app):
-    app.outbox.add(to="a@b.c")
-    item = app.outbox.claim()
-
-    assert app.outbox.renewLease(item) is True
-    assert app.outbox.renewLease("no-such-uid") is False
+    assert outbox.renewLease(item) is False
+    assert outbox.renewLease("no-such-uid") is False
 
 
-def test_sys_exit_inside_work_fails_the_item(app):
-    import sys
+# --- cancelling ---
 
-    item = app.outbox.add(to="a@b.c")
+def test_an_item_nobody_is_working_can_be_cancelled(outbox):
+    item = outbox.add(to="a@b.c")
 
-    with pytest.raises(SystemExit):
-        with app.outbox.work():
-            sys.exit(2)
+    assert outbox.cancel(item.uid) is True
 
-    assert app.outbox.get(item.uid).status == "failed"
+    cancelled = outbox.get(item.uid)
 
-
-def test_done_after_a_retry_clears_the_earlier_error(db):
-    class Q(BaseApp):
-        jobs = pile(maxAttempts=2, retryDelay=0)
-
-    app = Q(db)
-    item = app.jobs.add({"n": 1})
-    app.jobs.fail(app.jobs.claim(), error="first try failed")
-
-    with app.jobs.work():
-        pass
-
-    assert app.jobs.get(item.uid).error is None
+    assert cancelled.status == "canceled"
+    assert cancelled.claimedAt is None and cancelled.finishedAt is not None
 
 
-def test_a_pile_can_declare_extra_indexes(db):
-    from pymongo import ASCENDING, IndexModel
+def test_a_cancelled_item_is_never_claimed(outbox):
+    outbox.cancel(outbox.add(to="a@b.c").uid)
 
-    class Q(BaseApp):
-        jobs = pile(Email, extraIndexes=[IndexModel([("data.to", ASCENDING)], name="to_idx")])
+    assert outbox.claim() is None
 
-    names = set(Q(db).jobs.collection.index_information())
 
-    assert "to_idx" in names
-    assert "status_1_leaseUntil_1" in names      # alongside the claim index, not instead of it
+def test_an_item_being_worked_cannot_be_cancelled(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
+
+    assert outbox.cancel(item.uid) is False
+    assert outbox.get(item.uid).status == "running"
+
+
+def test_an_item_whose_holder_died_can_be_cancelled_and_the_holder_cannot_finish_it(outbox):
+    outbox.add(to="a@b.c")
+    item = abandoned(outbox)
+
+    assert outbox.cancel(item.uid) is True
+    assert outbox.done(item) is False
+    assert outbox.get(item.uid).status == "canceled"
+
+
+def test_a_finished_item_cannot_be_cancelled(outbox):
+    outbox.add(to="a@b.c")
+    item = outbox.claim()
+    outbox.done(item)
+
+    assert outbox.cancel(item.uid) is False
+    assert outbox.cancel("no-such-uid") is False
+
+
+def test_cancelMany_takes_a_filter_and_leaves_items_being_worked_alone(outbox):
+    outbox.addMany([{"to": "a@x.y"}, {"to": "a@x.y"}, {"to": "b@x.y"}])
+    held = outbox.claim({"data.to": "a@x.y"})
+
+    assert outbox.cancelMany({"data.to": "a@x.y"}) == 1
+    assert outbox.get(held.uid).status == "running"
+    assert outbox.count(status="pending") == 1
+
+
+# --- looking at the pile ---
+
+def test_count_by_status_and_counts(outbox):
+    fill(outbox, 5)
+    outbox.done(outbox.claim())
+    outbox.fail(outbox.claim())
+    outbox.claim()
+    outbox.cancel(outbox.find({"status": "pending"})[0].uid)
+
+    assert outbox.count() == 5
+    assert outbox.count(status="pending") == 1
+    assert outbox.counts() == {"pending": 1, "running": 1, "done": 1, "failed": 1, "canceled": 1}
+
+
+def test_find_gives_typed_items(outbox):
+    fill(outbox, 2)
+    items = outbox.find(sort=[("createdAt", 1)])
+
+    assert all(isinstance(item, Item) for item in items)
+    assert items[0].data == Email(to="user0@x.y", subject="0")
+
+
+def test_purge_removes_only_the_status_named(outbox):
+    fill(outbox, 3)
+    outbox.done(outbox.claim())
+    outbox.fail(outbox.claim())
+
+    assert outbox.purge("done") == 1
+    assert outbox.counts() == {"pending": 1, "running": 0, "done": 0, "failed": 1, "canceled": 0}
+
+
+def test_an_item_records_when_it_was_created_claimed_and_finished(outbox):
+    added = outbox.add(to="a@b.c")
+
+    assert (added.claimedAt, added.finishedAt) == (None, None)
+
+    outbox.done(outbox.claim())
+    finished = outbox.get(added.uid)
+
+    assert finished.createdAt <= finished.claimedAt <= finished.finishedAt
+
+
+def test_finished_and_held_items_are_untouched_by_another_engine_starting(outbox, pileEngine):
+    fill(outbox, 2)
+    outbox.done(outbox.claim())
+    held = outbox.claim()
+    before = sorted(outbox.collection.find({}, {"_id": 0}), key=lambda raw: raw["uid"])
+
+    pileEngine(Email, name="outbox")            # another process, on the same collection
+
+    assert sorted(outbox.collection.find({}, {"_id": 0}), key=lambda raw: raw["uid"]) == before
+    assert outbox.get(held.uid).claimId == held.claimId
+
+
+def test_a_pile_engine_is_a_collection_engine(outbox):
+    item = outbox.add(to="a@b.c")
+
+    assert isinstance(outbox, CollectionEngine)
+    assert outbox.findOne({"data.to": "a@b.c"}).uid == item.uid
+
+
+def test_indexes_back_the_claim_query_beside_extra_ones(pileEngine):
+    jobs = pileEngine(Email, extraIndexes=[IndexModel([("data.to", 1)], name="byRecipient")])
+    names = set(jobs.collection.index_information())
+
+    assert {"status_1_leaseUntil_1", "uid_1", "byRecipient"} <= names

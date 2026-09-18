@@ -6,8 +6,8 @@ from datetime import timedelta
 
 import pytest
 
-from pymonque_next import CallSpec, utc_now
-from pymonque_next.exceptions import TaskNotFound
+from pymonque import CallSpec, utc_now
+from pymonque.exceptions import TaskNotFound
 
 
 def greet(name: str) -> str:

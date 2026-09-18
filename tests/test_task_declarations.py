@@ -3,8 +3,8 @@ and through an instance."""
 
 import pytest
 
-from pymonque_next import AppDefaults, CallSpec, FuncSpec, Task, TaskLimits, task
-from pymonque_next.declarations import declaredOn
+from pymonque import AppDefaults, CallSpec, FuncSpec, Task, TaskLimits, task
+from pymonque.declarations import declaredOn
 
 
 class App:

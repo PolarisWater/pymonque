@@ -7,10 +7,10 @@ from datetime import timedelta
 import pytest
 from pydantic import BaseModel
 
-from pymonque_next import BaseApp, pile, schedulers, task, tasks, upgradeFrom2, utc_now
-from pymonque_next.exceptions import VersionMismatch
-from pymonque_next.schedulers import schedulerUid
-from pymonque_next.tasks import WORKER_DIED
+from pymonque import BaseApp, pile, schedulers, task, tasks, upgradeFrom2, utc_now
+from pymonque.exceptions import VersionMismatch
+from pymonque.schedulers import schedulerUid
+from pymonque.tasks import WORKER_DIED
 
 
 class Email(BaseModel):

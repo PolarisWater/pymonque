@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("pymonque")
 
-# 2.0's words for what the rebuild calls done and running
+# 2.0's words for what this version calls done and running
 TASK_STATUSES = {"success": "done", "processing": "running"}
 ITEM_STATUSES = {"claimed": "running"}
 

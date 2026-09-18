@@ -1,4 +1,4 @@
-"""Helpers the rebuilt package's tests share."""
+"""Helpers the tests share."""
 
 import time
 

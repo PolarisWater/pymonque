@@ -9,9 +9,9 @@ from datetime import timedelta
 
 import pytest
 
-from pymonque_next import CallSpec, utc_now
+from pymonque import CallSpec, utc_now
 
-from tests_next.helpers import waitFor
+from tests.helpers import waitFor
 
 
 def ping() -> str:

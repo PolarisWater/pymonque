@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 
-from pymonque_next import AppDefaults, CallSpec, task, utc_now
+from pymonque import AppDefaults, CallSpec, task, utc_now
 
 
 ran: list[str] = []

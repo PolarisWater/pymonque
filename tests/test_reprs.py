@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from pymonque_next import (
+from pymonque import (
     CallSpec, CollectionEngine, Document, Item, Scheduler, Task, TaskFactory,
     collection, pile, schedulers, task, tasks, utc_now,
 )

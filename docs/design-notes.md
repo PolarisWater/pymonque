@@ -275,6 +275,25 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   migration that renames `pymonque_tasks` / `pymonque_schedulers` and the old statuses and fields;
   then replacing the old package.
 
+### Layer 5: docs, the 2.0 upgrade, and replacing the old package
+
+- **Decided with the user:** the upgrade is an explicit, idempotent `upgradeFrom2(app)`, refused
+  while any worker process is live; replacing means moving the rebuild into `src/pymonque` and
+  `tests`, deleting 2.0's code and tests, and version 3.0.0; everything is committed on `rebuild`,
+  not merged or pushed.
+- **`upgradeFrom2()` also renames each declared scheduler engine's 2.0 default,**
+  `pymonque_schedulers_<name>`, to `pymonque_scheduler_<name>`; an engine declared with a collection
+  of its own keeps it. Found writing the upgrade section: the decided rename covered only the
+  defaults, which would have left declared engines empty after an upgrade.
+- **Tasks 2.0 held back for a retry run once more** after the upgrade — they are `pending` — rather
+  than being failed: 2.0 had promised them another run. A `processing` task becomes `running`, and
+  the next claim writes it off.
+- **`app.taskWorkers()` ignores a 2.0 heartbeat,** which reports one number rather than a count per
+  engine.
+- **The README and reference are written from the new shape;** their examples were run against the
+  code before the old package was replaced. `reference.md` keeps a pointer to 2.0's "Upgrading from
+  0.x" in the repository history.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen

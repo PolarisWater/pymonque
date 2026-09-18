@@ -15,28 +15,25 @@ threads), **scheduler engines** (recurring schedules that emit tasks), **piles**
 tasks), **distributions** (interval functions for schedulers).
 
 - Python ≥ 3.13, pydantic 2, pymongo 4. Tests use mongomock.
-- Package version 2.0.0; the current library lives in `src/pymonque/core.py` (~2,750 lines). The
-  rebuild grows beside it in `src/pymonque_next/`, tested in `tests_next/`.
-- Run tests with `uv run pytest` (both suites; `uv run pytest tests_next` for the rebuild alone) —
-  there is no `python` on PATH; use `uv run python`.
+- Package version 3.0.0, in `src/pymonque/` — one module per responsibility (rebuild.md §4) — tested
+  in `tests/`. 2.0's single `core.py` and its tests are in git history (before `rebuild` replaced
+  them).
+- Run tests with `uv run pytest` — there is no `python` on PATH; use `uv run python`.
 
 ## Where things stand
 
-- **The library is being rebuilt, not refactored.** Too many fixes were fitted onto a shape that grew
-  one kind at a time. The rebuild is designed in full.
-- **Layers 1–4 are built:** settings, declarations, documents, calls, distributions, and the
-  `Task`, `Scheduler` and `Item` models; claims, lease renewal and the task engine; the scheduler
-  engine, the pile engine and the `work()` block; then `BaseApp`, the fingerprint and worker
-  registry, worker loops, shutdown and signals, the backlog warning per engine, and timeouts that
-  stop or abandon a call and can retire the process — 676 tests in `tests_next/`. Every checklist
+- **The rebuild is done.** 2.0 was rebuilt rather than refactored, in five layers: settings,
+  declarations, documents and calls; claims and task engines; scheduler engines and piles; the app,
+  versions, workers, shutdown and timeouts; then the README, the reference with an upgrade section,
+  `upgradeFrom2()` for 2.0 databases, and replacing the old package — 692 tests. Every checklist
   item has a test except those marked **Dropped**. The small decisions made along the way are in
   `design-notes.md` under "Decided while building".
-  **Next: layer 5**, the README and reference from the new shape, with an upgrade section and the
-  2.0 migration, then replacing the old package.
-- **Branches:** `main` holds the current library and all docs. `rebuild` was branched from it and
-  holds the checklist, this file and the rebuild code. Neither is pushed — `main` is ahead of
-  `github/main` by the doc commits since `fe85e6b`.
-- The old package passes all 540 of its tests and stays untouched until the new one replaces it.
+- **Next:** your review of `rebuild`, merging it into `main`, and pushing — none done yet. The demo
+  apps (`MakerNetV2`, `Gauth`) still use 2.0's API; they are read-only here, so moving them to 3.0
+  is theirs.
+- **Branches:** `main` holds 2.0 and the design docs. `rebuild` was branched from it and holds 3.0,
+  the checklist and this file. Neither is pushed — `main` is ahead of `github/main` by the doc
+  commits since `fe85e6b`.
 
 ## Working rules
 
@@ -125,9 +122,9 @@ with app.outbox.work() as w:
 **Still on hold** (not part of the first build): waiting on items, finishing a task by hand,
 recording how long an item was held, a child process per task.
 
-## How to build
+## How it was built
 
-Follow `rebuild.md` §6:
+By `rebuild.md` §6 (the paths are those used while building):
 
 1. Build bottom-up in `src/pymonque_next/`, beside the old package, one layer per session:
    1. settings, declarations, documents, calls — plus the `Task`, `Scheduler` and `Item` models

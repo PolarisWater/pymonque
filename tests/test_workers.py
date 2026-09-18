@@ -10,10 +10,10 @@ from datetime import timedelta
 import pytest
 from pydantic import BaseModel
 
-from pymonque_next import BaseApp, pile, schedulers, task, tasks, utc_now
-from pymonque_next.claims import WorkerLoop
+from pymonque import BaseApp, pile, schedulers, task, tasks, utc_now
+from pymonque.claims import WorkerLoop
 
-from tests_next.helpers import waitFor
+from tests.helpers import waitFor
 
 
 POLL = 0.02

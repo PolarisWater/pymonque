@@ -8,8 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pymongo import ASCENDING, IndexModel
 from pymongo.errors import DuplicateKeyError
 
-from pymonque_next import CollectionEngine, Document, utc_now
-from pymonque_next.exceptions import UnboundDocument
+from pymonque import CollectionEngine, Document, utc_now
+from pymonque.exceptions import UnboundDocument
 
 
 class Group(Document):

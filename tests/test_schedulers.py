@@ -1,578 +1,805 @@
-"""SchedulerEngine: emitting on a rhythm, advancing deadlines, and falling behind."""
+"""The scheduler engine: adding schedulers, firing them on their rhythm, missed beats, emitting a beat
+exactly once, keeping a declared scheduler in step with ensure(), changing stored schedulers, and
+schedulers whose fields reach the tasks they emit."""
 
 import logging
+import threading
 from datetime import timedelta
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
+from pymongo import IndexModel
 
-from pymonque import BaseApp, CallSpec, Scheduler, Task, task, utc_now
-from pymonque.exceptions import TaskNotFound, DistributionNotFound
-
-from conftest import ExampleApp, appWith
-
-
-HOURLY = {"functionName": "constant", "kwargs": {"dailyFrequency": 24}}
-
-
-def addScheduler(app, *, name="Ada", dailyFrequency=24) -> Scheduler:
-    app.scheduler.add(
-        ExampleApp.greet(name=name),
-        app.distribution("constant", dailyFrequency=dailyFrequency),
-    )
-    return Scheduler.model_validate(
-        app.scheduler.schedulersCollection.find_one({"work.kwargs.name": name})
-    )
+from pymonque import (
+    BaseDistributions, CallSpec, CollectionEngine, DistributionEngine, Scheduler, Task, TaskLimits, utc_now,
+)
+from pymonque.exceptions import DistributionNotFound, DistributionValidationError, TaskNotFound, TaskValidationError
+from pymonque.schedulers import schedulerUid
 
 
-def reload(app, scheduler: Scheduler) -> Scheduler:
-    return Scheduler.model_validate(
-        app.scheduler.schedulersCollection.find_one({"uid": scheduler.uid})
-    )
+def greet(name: str = "Ada") -> str:
+    return f"Hello, {name}!"
 
 
-def setDeadline(app, scheduler: Scheduler, deadline, engine=None):
-    engine = engine or app.scheduler
-    # a scheduler that is not being worked is claimable exactly at its deadline
-    engine.schedulersCollection.update_one(
-        {"uid": scheduler.uid}, {"$set": {"deadline": deadline, "leaseUntil": deadline}}
-    )
+def sync(accountId: int, full: bool = False) -> str:
+    return f"synced {accountId} full={full}"
+
+
+FUNCTIONS = {"greet": greet, "sync": sync}
+
+
+@pytest.fixture
+def tasks(taskEngine):
+    return taskEngine(FUNCTIONS)
+
+
+@pytest.fixture
+def engine(schedulerEngine, tasks):
+    return schedulerEngine(tasks=tasks)
+
+
+def hourly(engine) -> CallSpec:
+    return engine.distributions("constant", dailyFrequency=24)
+
+
+def due(engine, scheduler, at=None):
+    """Move a scheduler's beat into the past, as waiting for it would."""
+
+    at = at or utc_now() - timedelta(minutes=1)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"deadline": at, "leaseUntil": at}})
+
+    return engine.get(scheduler.uid)
+
+
+def added(engine, name="Ada", dailyFrequency=24):
+    return engine.add(CallSpec.new("greet", name=name), engine.distributions("constant", dailyFrequency=dailyFrequency))
 
 
 # --- adding ---
 
-def test_add_stores_an_enabled_scheduler(app):
-    scheduler = addScheduler(app)
+def test_add_stores_an_enabled_scheduler_one_interval_out(engine):
+    before = utc_now()
+    scheduler = engine.get(added(engine).uid)
 
     assert scheduler.status == "enabled"
-    assert scheduler.work.functionName == "greet"
-    assert scheduler.distribution.kwargs == {"dailyFrequency": 24}
-
-
-def test_the_first_deadline_is_one_interval_out(app):
-    before = utc_now()
-    scheduler = addScheduler(app, dailyFrequency=24)
-
+    assert (scheduler.work, scheduler.distribution.kwargs) == (CallSpec.new("greet", name="Ada"), {"dailyFrequency": 24})
     assert timedelta(minutes=59) < scheduler.deadline - before < timedelta(minutes=61)
 
 
-def test_add_rejects_an_unknown_task(app, schedulers):
-    with pytest.raises(TaskNotFound):
-        app.scheduler.add(CallSpec.new("does_not_exist"), app.distribution("constant", dailyFrequency=1))
+@pytest.mark.parametrize("work, distribution, error", [
+    (CallSpec.new("nope"), CallSpec.new("constant", dailyFrequency=1), TaskNotFound),
+    (CallSpec.new("greet", nope=1), CallSpec.new("constant", dailyFrequency=1), TaskValidationError),
+    (CallSpec.new("greet"), CallSpec.new("nope"), DistributionNotFound),
+])
+def test_add_refuses_what_would_not_run_and_stores_nothing(engine, work, distribution, error):
+    with pytest.raises(error):
+        engine.add(work, distribution)
 
-    assert schedulers.count_documents({}) == 0
+    assert engine.count() == 0
 
 
-def test_add_rejects_an_unknown_distribution(app, schedulers):
-    with pytest.raises(DistributionNotFound):
-        app.scheduler.add(ExampleApp.greet(name="Ada"), CallSpec.new("does_not_exist"))
+def test_a_scheduler_cannot_be_built_on_a_dead_interval(taskEngine, schedulerEngine):
+    class Stuck(BaseDistributions):
+        @staticmethod
+        def stuck(dailyFrequency: float) -> timedelta:
+            return timedelta(0)
 
-    assert schedulers.count_documents({}) == 0
+    engine = schedulerEngine(tasks=taskEngine(FUNCTIONS, distributions=DistributionEngine(Stuck)))
+
+    with pytest.raises(DistributionValidationError):
+        engine.add(CallSpec.new("greet"), CallSpec.new("stuck", dailyFrequency=1))
+
+    assert engine.count() == 0
+
+
+def test_the_engine_refuses_a_model_that_is_not_a_scheduler(schedulerEngine, tasks):
+    with pytest.raises(TypeError, match="Scheduler"):
+        schedulerEngine(Task, tasks=tasks)
+
+
+def test_the_engine_draws_from_its_task_engines_distributions(engine, tasks):
+    assert engine.distributions is tasks.distributions
 
 
 # --- firing ---
 
-def test_a_due_scheduler_emits_a_task(app, tasks):
-    scheduler = addScheduler(app)
-    setDeadline(app, scheduler, utc_now() - timedelta(minutes=1))
-    app.scheduler._work()
-    emitted = Task.model_validate(tasks.find_one())
+def test_a_due_scheduler_emits_its_work_as_a_task_pointing_back_at_it(engine, tasks):
+    scheduler = due(engine, added(engine))
 
-    assert emitted.work == scheduler.work
-    assert emitted.status == "pending"
-    assert emitted.factory.uid == scheduler.uid  # the task points back at its scheduler
+    assert engine.work().uid == scheduler.uid
 
+    emitted = tasks.find()[0]
 
-def test_a_future_scheduler_stays_put(app, tasks):
-    scheduler = addScheduler(app)
-    app.scheduler._work()
-
-    assert tasks.count_documents({}) == 0
-    assert reload(app, scheduler).deadline == scheduler.deadline
+    assert (emitted.status, emitted.work) == ("pending", scheduler.work)
+    assert (emitted.factory.uid, emitted.factory.name) == (scheduler.uid, "Scheduler")
+    assert emitted.deadline == scheduler.deadline
 
 
-def test_firing_advances_the_deadline_by_one_interval(app):
-    scheduler = addScheduler(app, dailyFrequency=24)
-    due = utc_now() - timedelta(minutes=1)
-    setDeadline(app, scheduler, due)
-    app.scheduler._work()
+def test_an_emitted_task_runs(engine, tasks):
+    due(engine, added(engine))
+    engine.work()
 
-    # measured from the old deadline, not from now, so the rhythm does not drift
-    assert abs(reload(app, scheduler).deadline - (due + timedelta(hours=1))) < timedelta(milliseconds=100)
+    assert tasks.work().result == "Hello, Ada!"
 
 
-def test_the_scheduler_returns_to_enabled(app):
-    scheduler = addScheduler(app)
-    setDeadline(app, scheduler, utc_now() - timedelta(minutes=1))
-    app.scheduler._work()
+def test_a_future_scheduler_stays_put(engine, tasks):
+    scheduler = added(engine)
 
-    assert reload(app, scheduler).status == "enabled"
-
-
-def test_a_disabled_scheduler_advances_without_emitting(app, tasks):
-    scheduler = addScheduler(app)
-    due = utc_now() - timedelta(minutes=1)
-    app.scheduler.schedulersCollection.update_one(
-        {"uid": scheduler.uid},
-        {"$set": {"status": "disabled", "deadline": due, "leaseUntil": due}},
-    )
-    app.scheduler._work()
-    after = reload(app, scheduler)
-
-    assert tasks.count_documents({}) == 0
-    assert after.status == "disabled"
-    assert after.deadline > utc_now()
+    assert engine.work() is None
+    assert tasks.count() == 0
+    assert engine.get(scheduler.uid).deadline == engine.get(scheduler.uid).leaseUntil
 
 
-def test_a_scheduler_is_never_claimed_twice(app, tasks):
-    scheduler = addScheduler(app)
-    setDeadline(app, scheduler, utc_now() - timedelta(minutes=1))
-
-    app.scheduler._work()
-    app.scheduler._work()  # the deadline has moved past now
-
-    assert tasks.count_documents({}) == 1
+def test_working_an_empty_engine_does_nothing(engine):
+    assert engine.work() is None
 
 
-def test_working_an_empty_collection_is_a_no_op(app):
-    assert app.scheduler._work() is None
-
-
-def test_the_earliest_deadline_fires_first(app, tasks):
+def test_the_most_overdue_scheduler_fires_first(engine, tasks):
     now = utc_now()
-    first = addScheduler(app, name="first")
-    second = addScheduler(app, name="second")
-    setDeadline(app, first, now - timedelta(hours=1))
-    setDeadline(app, second, now - timedelta(minutes=1))
-    app.scheduler._work()
+    due(engine, added(engine, name="second"), now - timedelta(minutes=1))
+    due(engine, added(engine, name="first"), now - timedelta(minutes=30))
+    engine.work()
 
-    assert tasks.find_one()["work"]["kwargs"]["name"] == "first"
+    assert tasks.find()[0].work.kwargs == {"name": "first"}
 
 
-def test_a_scheduler_that_missed_a_beat_warns(app, caplog):
-    scheduler = addScheduler(app, dailyFrequency=86400)  # one second apart
-    setDeadline(app, scheduler, utc_now() - timedelta(days=1))
+def test_firing_moves_the_deadline_one_interval_on_from_the_beat(engine):
+    scheduler = due(engine, added(engine))
+    engine.work()
+
+    # measured from the beat, not from now, so the rhythm does not drift
+    assert engine.get(scheduler.uid).deadline == scheduler.deadline + timedelta(hours=1)
+
+
+def test_a_fired_scheduler_stays_enabled_is_let_go_and_is_not_claimed_twice(engine, tasks):
+    scheduler = due(engine, added(engine))
+    engine.work()
+    fired = engine.get(scheduler.uid)
+
+    assert (fired.status, fired.claimId) == ("enabled", None)
+    assert fired.leaseUntil == fired.deadline
+    assert engine.work() is None
+    assert tasks.count() == 1
+
+
+def test_a_scheduler_is_held_under_a_claim_of_its_own_while_it_emits(engine, tasks, monkeypatch):
+    scheduler = due(engine, added(engine))
+    seen = []
+    insert = tasks.insert
+
+    def emitting(task):
+        seen.append(engine.collection.find_one({"uid": scheduler.uid})["claimId"])
+
+        return insert(task)
+
+    monkeypatch.setattr(tasks, "insert", emitting)
+    engine.work()
+
+    assert seen and seen[0] is not None
+    assert engine.get(scheduler.uid).claimId is None
+
+
+def test_a_disabled_scheduler_walks_its_deadline_without_emitting_or_warning(engine, tasks, caplog):
+    scheduler = added(engine)
+    engine.update(scheduler.uid, enabled=False)
+    due(engine, scheduler, utc_now() - timedelta(hours=3))
 
     with caplog.at_level(logging.WARNING, logger="pymonque"):
-        app.scheduler._work()
+        engine.work()
 
-    assert "missed a beat" in caplog.text
+    walked = engine.get(scheduler.uid)
 
-
-def test_a_disabled_scheduler_walks_its_deadline_without_warning(app, tasks, caplog):
-    """It keeps its distribution's shape for when it is enabled again, but owes nothing."""
-
-    scheduler = addScheduler(app)                    # hourly
-    setDeadline(app, scheduler, utc_now() - timedelta(hours=3))
-    app.scheduler.collection.update_one({"uid": scheduler.uid}, {"$set": {"status": "disabled"}})
-
-    with caplog.at_level(logging.WARNING, logger="pymonque"):
-        app.scheduler._work()
-
+    assert tasks.count() == 0
+    assert walked.status == "disabled" and walked.deadline > utc_now()
     assert caplog.text == ""
-    assert tasks.count_documents({}) == 0
-    assert app.scheduler.get(scheduler.uid).deadline > utc_now()
 
 
-def test_a_scheduler_that_is_merely_due_does_not_warn(app, caplog):
-    scheduler = addScheduler(app)                    # hourly
-    setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
+def test_a_scheduler_whose_task_is_gone_skips_the_beat_and_stays_enabled(engine, taskEngine, schedulerEngine, caplog):
+    scheduler = due(engine, added(engine))
+    smaller = schedulerEngine(tasks=taskEngine({"sync": sync}))     # the same collections, without greet
 
     with caplog.at_level(logging.WARNING, logger="pymonque"):
-        app.scheduler._work()
+        smaller.work()
 
-    assert caplog.text == ""
+    skipped = engine.get(scheduler.uid)
 
-
-def test_an_emitted_task_is_runnable(app, tasks):
-    scheduler = addScheduler(app)
-    setDeadline(app, scheduler, utc_now() - timedelta(minutes=1))
-    app.scheduler._work()
-    app.task._work()
-
-    assert Task.model_validate(tasks.find_one()).result == "Hello, Ada!"
+    assert skipped.status == "enabled"
+    assert skipped.deadline > scheduler.deadline
+    assert smaller.tasks.count() == 0
+    assert "beat was skipped" in caplog.text
 
 
-# --- indexes ---
+def test_a_scheduler_whose_beat_needs_a_field_it_does_not_give_skips_the_beat_and_walks_on(engine, taskEngine, schedulerEngine, caplog):
+    scheduler = due(engine, added(engine))                                          # stored against a plain Task
+    redeployed = schedulerEngine(tasks=taskEngine(FUNCTIONS, AccountTask))         # the task model now needs accountId
 
-def test_indexes_back_the_claim_query(app, schedulers):
-    keys = [tuple(index["key"]) for index in schedulers.index_information().values()]
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        assert redeployed.work() is not None
 
-    assert (("status", 1), ("leaseUntil", 1)) in keys
-    assert (("uid", 1),) in keys
+    after = engine.get(scheduler.uid)
 
-
-# --- missed beats, applied every time a scheduler is claimed ---
-
-def test_an_abandoned_scheduler_is_reclaimed_when_its_lease_lapses(db, app, tasks):
-    scheduler = addScheduler(app)
-    # a worker claimed it and died: its lease is long expired
-    app.scheduler.schedulersCollection.update_one(
-        {"uid": scheduler.uid},
-        {"$set": {"leaseUntil": utc_now() - timedelta(hours=1)}},
-    )
-
-    assert app.scheduler._work() is not None      # picked up without any restart
-    assert tasks.count_documents({}) == 1
+    assert (after.status, after.claimId) == ("enabled", None)
+    assert after.deadline > scheduler.deadline
+    assert redeployed.tasks.count() == 0
+    assert "beat was skipped" in caplog.text and "accountId" in caplog.text
 
 
-def test_a_scheduler_with_a_live_lease_is_left_alone(db, app):
-    scheduler = addScheduler(app)
-    held = utc_now() + timedelta(minutes=5)
-    app.scheduler.schedulersCollection.update_one(
-        {"uid": scheduler.uid},
-        {"$set": {"deadline": utc_now() - timedelta(hours=1), "leaseUntil": held}},
-    )
+def test_a_scheduler_giving_a_field_the_task_no_longer_has_skips_the_beat_and_walks_on(accountOps, taskEngine, schedulerEngine, caplog):
+    scheduler = due(accountOps, accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7))
+    redeployed = schedulerEngine(AccountScheduler, name="accountOps", tasks=taskEngine(FUNCTIONS, name="accountTasks"))
 
-    assert app.scheduler._work() is None          # overdue, but somebody else holds it
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        assert redeployed.work() is not None
 
-    ExampleApp(db)                            # and constructing a app does not touch it
-    assert abs(reload(app, scheduler).leaseUntil - held) < timedelta(milliseconds=100)
+    after = accountOps.get(scheduler.uid)
 
-
-def behindByADay(db, missed):
-    """An hourly scheduler that has not been served for a day: 24 beats missed."""
-
-    app = appWith(ExampleApp, db, schedulerMissed=missed)
-    scheduler = addScheduler(app, dailyFrequency=24)
-    setDeadline(app, scheduler, utc_now() - timedelta(days=1))
-
-    return app, scheduler
+    assert (after.status, after.claimId) == ("enabled", None)
+    assert after.deadline > scheduler.deadline
+    assert "beat was skipped" in caplog.text and "accountId" in caplog.text
 
 
-def test_execute_reconstructed_replays_the_backlog_beat_by_beat(db, tasks):
-    app, scheduler = behindByADay(db, "replay")
-    before = reload(app, scheduler).deadline
+def test_a_lapsed_lease_is_claimable_and_a_live_one_is_left_alone(engine, tasks):
+    scheduler = added(engine)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"leaseUntil": utc_now() + timedelta(minutes=5), "deadline": utc_now() - timedelta(hours=2)}})
 
-    app.scheduler._work()
-    after = reload(app, scheduler)
+    assert engine.work() is None        # overdue, but somebody holds it
 
-    assert tasks.count_documents({}) == 1                    # one missed run, replayed
-    assert abs((after.deadline - before) - timedelta(hours=1)) < timedelta(seconds=1)
-    assert after.deadline < utc_now()                        # still owed 23 more
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"leaseUntil": utc_now() - timedelta(seconds=1)}})
 
-
-def test_execute_once_emits_one_run_and_resumes_from_now(db, tasks):
-    app, scheduler = behindByADay(db, "once")
-
-    app.scheduler._work()
-    after = reload(app, scheduler)
-
-    assert tasks.count_documents({}) == 1                    # the backlog collapses to one
-    assert timedelta(minutes=59) < after.deadline - utc_now() < timedelta(minutes=61)
+    assert engine.work() is not None    # its holder stopped: picked up with no restart
+    assert tasks.count() == 1
 
 
-def test_skip_emits_nothing_and_resumes_from_now(db, tasks):
-    app, scheduler = behindByADay(db, "skip")
+def test_indexes_back_the_claim_query_beside_extra_ones(schedulerEngine, tasks):
+    engine = schedulerEngine(tasks=tasks, extraIndexes=[IndexModel([("name", 1)], name="byName")])
 
-    app.scheduler._work()
-    after = reload(app, scheduler)
+    assert {"leaseUntil_1", "uid_1", "byName"} <= set(engine.collection.index_information())
 
-    assert tasks.count_documents({}) == 0                    # nothing owed is run
-    assert timedelta(minutes=59) < after.deadline - utc_now() < timedelta(minutes=61)
+
+def test_an_emitted_task_goes_stale_by_its_tasks_limit(schedulerEngine, taskEngine):
+    tasks = taskEngine(FUNCTIONS, limits={"greet": TaskLimits(skipAfter=60), "sync": TaskLimits()})
+    engine = schedulerEngine(tasks=tasks, missed="once")
+    due(engine, added(engine), utc_now() - timedelta(seconds=300))
+    engine.work()
+
+    assert tasks.work().status == "outdated"
+
+
+# --- missed beats ---
+
+def behindByADay(schedulerEngine, tasks, missed):
+    """An hourly scheduler nobody has served for a day: 24 beats missed."""
+
+    engine = schedulerEngine(tasks=tasks, missed=missed)
+
+    return engine, due(engine, added(engine), utc_now() - timedelta(days=1))
+
+
+def test_replay_walks_the_backlog_beat_by_beat(schedulerEngine, tasks):
+    engine, scheduler = behindByADay(schedulerEngine, tasks, "replay")
+    engine.work()
+    after = engine.get(scheduler.uid)
+
+    assert tasks.count() == 1
+    assert after.deadline == scheduler.deadline + timedelta(hours=1)
+    assert after.deadline < utc_now()       # 23 more still owed
+
+
+def test_once_emits_one_run_and_resumes_from_now(schedulerEngine, tasks):
+    engine, scheduler = behindByADay(schedulerEngine, tasks, "once")
+    engine.work()
+
+    assert tasks.count() == 1
+    assert timedelta(minutes=59) < engine.get(scheduler.uid).deadline - utc_now() < timedelta(minutes=61)
+
+
+def test_skip_emits_nothing_and_resumes_from_now(schedulerEngine, tasks):
+    engine, scheduler = behindByADay(schedulerEngine, tasks, "skip")
+    engine.work()
+
+    assert tasks.count() == 0
+    assert timedelta(minutes=59) < engine.get(scheduler.uid).deadline - utc_now() < timedelta(minutes=61)
 
 
 @pytest.mark.parametrize("missed", ["replay", "once", "skip"])
-def test_a_scheduler_that_is_merely_due_emits_whatever_missed_says(db, tasks, missed):
-    app = appWith(ExampleApp, db, schedulerMissed=missed)
-    scheduler = addScheduler(app, dailyFrequency=24)
-    setDeadline(app, scheduler, utc_now() - timedelta(seconds=1))
+def test_a_scheduler_merely_due_emits_whatever_missed_says(schedulerEngine, tasks, missed):
+    engine = schedulerEngine(tasks=tasks, missed=missed)
+    scheduler = due(engine, added(engine), utc_now() - timedelta(seconds=1))
+    engine.work()
 
-    app.scheduler._work()
-
-    assert tasks.count_documents({}) == 1
-    assert timedelta(minutes=59) < reload(app, scheduler).deadline - utc_now() < timedelta(minutes=61)
+    assert tasks.count() == 1
+    assert engine.get(scheduler.uid).deadline == scheduler.deadline + timedelta(hours=1)
 
 
-def test_a_scheduler_set_faster_than_it_can_be_served_stops_accumulating(db, tasks):
-    """The bug missed beats exist for: a 1s scheduler down for an hour used to emit
-    an unbounded burst trying to catch up."""
-
-    app = appWith(ExampleApp, db, schedulerMissed="once")
-    scheduler = addScheduler(app, dailyFrequency=86400)      # one second apart
-    setDeadline(app, scheduler, utc_now() - timedelta(hours=1))
-
-    for _ in range(20):
-        app.scheduler._work()
-
-    assert tasks.count_documents({}) == 1                    # not 20, and not 3600
-    assert reload(app, scheduler).deadline > utc_now()       # caught up on the first claim
-
-
-def test_missed_still_applies_after_startup(db, tasks):
-    """init() has no say over missed beats, so a scheduler that falls behind while
-    the app is up is treated the same as one that fell behind while it was down."""
-
-    app = appWith(ExampleApp, db, schedulerMissed="skip")
-    app.init()
-
-    scheduler = addScheduler(app, dailyFrequency=24)
-    setDeadline(app, scheduler, utc_now() - timedelta(days=1))   # fell behind since
-
-    app.scheduler._work()
-
-    assert tasks.count_documents({}) == 0
-
-
-def test_a_scheduler_whose_task_vanished_skips_its_beats_but_stays_enabled(db, app, tasks, caplog):
-    """Disabling is the operator's word: it would outlast the task coming back."""
-
-    scheduler = addScheduler(app)
-    due = utc_now() - timedelta(seconds=1)
-    setDeadline(app, scheduler, due)
-
-    class Smaller(BaseApp):
-        @task
-        @staticmethod
-        def other():
-            return None
-
-    smaller = Smaller(db)
-    smaller.init()
+def test_a_missed_beat_warns_and_a_merely_due_one_does_not(engine, caplog):
+    behind = due(engine, added(engine, name="behind"), utc_now() - timedelta(days=1))
 
     with caplog.at_level(logging.WARNING, logger="pymonque"):
-        smaller.scheduler._work()
+        engine.work()
 
-    after = reload(app, scheduler)
-    assert after.status == "enabled"
-    assert after.deadline > due             # still keeps its rhythm
-    assert tasks.count_documents({}) == 0
-    assert "no task for" in caplog.text
+    assert "missed a beat" in caplog.text
+
+    caplog.clear()
+    engine.delete(behind.uid)
+    due(engine, added(engine, name="due"), utc_now() - timedelta(seconds=1))
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        engine.work()
+
+    assert caplog.text == ""
 
 
-# --- ensure(): declaring a scheduler that should always exist ---
+def test_a_scheduler_faster_than_it_can_be_served_stops_accumulating(schedulerEngine, tasks):
+    engine = schedulerEngine(tasks=tasks, missed="once")
+    scheduler = due(engine, added(engine, dailyFrequency=86400), utc_now() - timedelta(hours=1))      # a second apart
 
-def declare(app, *, name="nightly", to="Ada", dailyFrequency=1, enabled=None):
-    return app.scheduler.ensure(
-        name,
-        ExampleApp.greet(name=to),
-        app.distribution("constant", dailyFrequency=dailyFrequency),
-        enabled=enabled,
+    for _ in range(20):
+        engine.work()
+
+    assert tasks.count() == 1       # not 20, and not 3600
+    assert engine.get(scheduler.uid).deadline > utc_now()
+
+
+# --- a beat, exactly once ---
+
+def test_a_beat_reclaimed_after_a_crash_is_not_emitted_twice(engine, tasks):
+    scheduler = due(engine, added(engine))
+    engine.work()
+    due(engine, scheduler, scheduler.deadline)      # the worker died after emitting, before moving the deadline on
+    engine.work()
+
+    assert tasks.count() == 1
+
+
+def test_a_rhythm_restarted_mid_claim_is_not_overwritten(engine, tasks, monkeypatch):
+    declared = engine.ensure("nightly", CallSpec.new("greet"), hourly(engine))
+    due(engine, declared)
+    insert = tasks.insert
+
+    def redeclaredWhileClaimed(task):
+        stored = insert(task)
+        engine.ensure("nightly", CallSpec.new("greet"), engine.distributions("constant", dailyFrequency=1))
+
+        return stored
+
+    monkeypatch.setattr(tasks, "insert", redeclaredWhileClaimed)
+    engine.work()
+
+    assert engine.get(declared.uid).deadline - utc_now() > timedelta(hours=23)
+
+
+def test_moving_the_deadline_by_hand_moves_the_lease(engine):
+    later = (utc_now() + timedelta(days=30)).replace(microsecond=0)
+    saved = engine.get(added(engine, name="saved").uid)
+    saved.deadline = later
+    saved.save()
+    updated = engine.update(added(engine, name="updated").uid, deadline=later)
+
+    assert engine.get(saved.uid).leaseUntil == later
+    assert (updated.deadline, updated.leaseUntil) == (later, later)
+
+
+def test_moving_a_held_schedulers_deadline_by_hand_releases_its_claim(engine):
+    def held(scheduler):
+        engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker"}})
+
+    updated = added(engine, name="updated")
+    held(updated)
+
+    assert engine.update(updated.uid, deadline=utc_now() + timedelta(days=1)).claimId is None
+
+    declared = engine.ensure("nightly", CallSpec.new("greet"), engine.distributions("constant", dailyFrequency=1))
+    held(declared)
+
+    assert engine.ensure("nightly", CallSpec.new("greet", name="Grace"), engine.distributions("constant", dailyFrequency=1)).claimId == "a-worker"
+    assert engine.ensure("nightly", CallSpec.new("greet"), hourly(engine)).claimId is None       # a new rhythm moved it
+
+
+def test_saving_a_held_scheduler_with_its_deadline_unchanged_keeps_the_claim_and_lease(engine):
+    scheduler = added(engine)
+    held = utc_now() + timedelta(minutes=5)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker", "leaseUntil": held}})
+
+    loaded = engine.get(scheduler.uid)
+    loaded.claimId = None       # as a copy read before the claim would carry it
+    loaded.name = "renamed"
+    engine.upsert(loaded)
+
+    stored = engine.collection.find_one({"uid": scheduler.uid})
+    assert (stored["name"], stored["claimId"]) == ("renamed", "a-worker")
+    assert abs(stored["leaseUntil"] - held) < timedelta(milliseconds=1)
+
+
+def test_saving_a_held_scheduler_with_a_moved_deadline_releases_the_claim(engine):
+    scheduler = added(engine)
+    engine.collection.update_one({"uid": scheduler.uid}, {"$set": {"claimId": "a-worker"}})
+
+    loaded = engine.get(scheduler.uid)
+    loaded.deadline = utc_now() + timedelta(days=1)
+    loaded.save()
+
+    stored = engine.get(scheduler.uid)
+    assert stored.claimId is None
+    assert stored.leaseUntil == stored.deadline
+
+
+def test_a_claim_carried_by_a_saved_scheduler_is_not_stored(engine):
+    scheduler = engine.build(CallSpec.new("greet"), hourly(engine))
+    scheduler.claimId = "made-up"
+    engine.upsert(scheduler)
+
+    stored = engine.get(scheduler.uid)
+    assert stored.claimId is None
+    assert stored.leaseUntil == stored.deadline
+
+
+# --- ensure ---
+
+def declare(engine, name="nightly", to="Ada", dailyFrequency=1, enabled=None, **fields):
+    return engine.ensure(
+        name, CallSpec.new("greet", name=to), engine.distributions("constant", dailyFrequency=dailyFrequency),
+        enabled=enabled, **fields,
     )
 
 
-def test_ensure_creates_the_scheduler(app, schedulers):
-    scheduler = declare(app)
+def test_ensure_creates_a_scheduler_under_a_uid_from_its_name(engine):
+    scheduler = declare(engine)
 
-    assert schedulers.count_documents({}) == 1
-    assert scheduler.name == "nightly"
-    assert scheduler.status == "enabled"
+    assert engine.count() == 1
+    assert (scheduler.uid, scheduler.name, scheduler.status) == (schedulerUid("nightly"), "nightly", "enabled")
     assert scheduler.work.kwargs == {"name": "Ada"}
 
 
-def test_ensure_is_idempotent_across_restarts(db, schedulers):
+def test_ensure_is_idempotent_across_restarts(schedulerEngine, taskEngine):
     for _ in range(5):
-        declare(ExampleApp(db))
+        declare(schedulerEngine(tasks=taskEngine(FUNCTIONS)))
 
-    assert schedulers.count_documents({}) == 1
-
-
-def test_the_uid_is_derived_from_the_name(db):
-    first = declare(ExampleApp(db))
-    second = declare(ExampleApp(db.client["elsewhere"]))
-
-    assert first.uid == second.uid  # same name, same scheduler, any database
+    assert schedulerEngine(tasks=taskEngine(FUNCTIONS)).count() == 1
 
 
-def test_different_names_are_different_schedulers(app, schedulers):
-    declare(app, name="nightly")
-    declare(app, name="hourly")
-
-    assert schedulers.count_documents({}) == 2
+def test_the_same_name_gives_the_same_uid_anywhere():
+    assert schedulerUid("nightly") == schedulerUid("nightly") != schedulerUid("hourly")
 
 
-def test_ensure_does_not_reset_the_deadline(db):
-    first = declare(ExampleApp(db))
-    again = declare(ExampleApp(db))
+def test_different_names_are_different_schedulers(engine):
+    declare(engine, name="nightly")
+    declare(engine, name="hourly")
 
-    assert abs(again.deadline - first.deadline) < timedelta(milliseconds=100)
-
-
-def test_ensure_updates_changed_work(db):
-    declare(ExampleApp(db), to="Ada")
-    updated = declare(ExampleApp(db), to="Grace")
-
-    assert updated.work.kwargs == {"name": "Grace"}
+    assert engine.count() == 2
 
 
-def test_changing_the_work_keeps_the_rhythm(db):
-    first = declare(ExampleApp(db), to="Ada")
-    updated = declare(ExampleApp(db), to="Grace")
+def test_ensure_keeps_the_deadline_and_updates_changed_work(engine):
+    first = declare(engine, to="Ada")
+    again = declare(engine, to="Grace")
 
-    assert abs(updated.deadline - first.deadline) < timedelta(milliseconds=100)
+    assert again.work.kwargs == {"name": "Grace"}
+    assert again.deadline == first.deadline
 
 
-def test_changing_the_distribution_restarts_the_rhythm(db):
-    declare(ExampleApp(db), dailyFrequency=1)          # daily
-    updated = declare(ExampleApp(db), dailyFrequency=24)  # hourly
+def test_a_new_distribution_restarts_the_rhythm(engine):
+    declare(engine, dailyFrequency=1)
+    updated = declare(engine, dailyFrequency=24)
 
     assert updated.distribution.kwargs == {"dailyFrequency": 24}
     assert timedelta(minutes=59) < updated.deadline - utc_now() < timedelta(minutes=61)
 
 
-def test_ensure_leaves_a_disabled_scheduler_disabled(db, app):
-    scheduler = declare(app)
-    app.scheduler.schedulersCollection.update_one(
-        {"uid": scheduler.uid}, {"$set": {"status": "disabled"}}
-    )
+def test_ensure_leaves_a_disabled_scheduler_disabled_unless_told(engine):
+    scheduler = declare(engine)
+    engine.update(scheduler.uid, enabled=False)
 
-    assert declare(ExampleApp(db)).status == "disabled"
-
-
-def test_ensure_can_force_the_state(db, app):
-    declare(app)
-
-    assert declare(ExampleApp(db), enabled=False).status == "disabled"
-    assert declare(ExampleApp(db), enabled=True).status == "enabled"
+    assert declare(engine).status == "disabled"
+    assert declare(engine, enabled=True).status == "enabled"
+    assert declare(engine, enabled=False).status == "disabled"
 
 
-def test_ensure_can_create_a_disabled_scheduler(app):
-    assert declare(app, enabled=False).status == "disabled"
+def test_ensure_can_create_a_disabled_scheduler(engine):
+    assert declare(engine, enabled=False).status == "disabled"
 
 
-def test_ensure_validates_before_storing(app, schedulers):
+def test_ensure_checks_before_storing(engine):
     with pytest.raises(TaskNotFound):
-        app.scheduler.ensure("bad", CallSpec.new("does_not_exist"), app.distribution("constant", dailyFrequency=1))
+        engine.ensure("bad", CallSpec.new("nope"), hourly(engine))
 
-    assert schedulers.count_documents({}) == 0
-
-
-def test_a_declared_scheduler_fires_like_any_other(app, tasks):
-    scheduler = declare(app)
-    setDeadline(app, scheduler, utc_now() - timedelta(minutes=1))
-    app.scheduler._work()
-
-    assert tasks.count_documents({}) == 1
-    assert Task.model_validate(tasks.find_one()).factory.name == "nightly"
+    assert engine.count() == 0
 
 
-def test_add_and_ensure_coexist(app, schedulers):
-    addScheduler(app)
-    declare(app)
+def test_a_declared_scheduler_fires_like_any_other(engine, tasks):
+    due(engine, declare(engine))
+    engine.work()
 
-    assert schedulers.count_documents({}) == 2
-
-
-def test_unnamed_schedulers_do_not_collide(app, schedulers):
-    addScheduler(app, name="a")
-    addScheduler(app, name="b")
-
-    assert schedulers.count_documents({"name": "Scheduler"}) == 2  # the unique uid index allows this
+    assert tasks.find()[0].factory.name == "nightly"
 
 
-def test_get_finds_a_declared_scheduler(app):
-    declare(app)
+def test_concurrent_declarations_create_one_scheduler(schedulerEngine, taskEngine):
+    engines = [schedulerEngine(tasks=taskEngine(FUNCTIONS)) for _ in range(8)]
+    barrier = threading.Barrier(len(engines))
 
-    assert app.scheduler.byName("nightly").name == "nightly"
-    assert app.scheduler.byName("never-declared") is None
-
-
-def test_remove_deletes_it(app, schedulers):
-    declare(app)
-
-    assert app.scheduler.removeNamed("nightly") is True
-    assert app.scheduler.removeNamed("nightly") is False
-    assert schedulers.count_documents({}) == 0
-
-
-def test_a_removed_scheduler_can_be_declared_again(db, schedulers):
-    declare(ExampleApp(db))
-    ExampleApp(db).scheduler.removeNamed("nightly")
-    declare(ExampleApp(db))
-
-    assert schedulers.count_documents({}) == 1
-
-
-def test_concurrent_declarations_create_one_scheduler(db, schedulers):
-    import threading
-
-    apps = [ExampleApp(db) for _ in range(8)]
-    barrier = threading.Barrier(len(apps))
-
-    def declareFrom(app):
+    def declareFrom(engine):
         barrier.wait()
-        declare(app)
+        declare(engine)
 
-    threads = [threading.Thread(target=declareFrom, args=(app,)) for app in apps]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    threads = [threading.Thread(target=declareFrom, args=(engine,)) for engine in engines]
 
-    assert schedulers.count_documents({}) == 1
+    for thread in threads:
+        thread.start()
 
+    for thread in threads:
+        thread.join(10)
 
-def test_a_scheduler_field_can_be_cleared(db):
-    from pymonque import Scheduler, schedulers
-
-    class Noted(Scheduler):
-        note: str | None = None
-
-    class App(BaseApp):
-        scheduler = schedulers(Noted)
-
-        @task
-        @staticmethod
-        def greet(name: str = "x") -> str: return name
-
-    app = App(db)
-    stored = app.scheduler.add(
-        App.greet(), app.distribution("constant", dailyFrequency=1), note="hello"
-    )
-
-    assert app.scheduler.update(stored.uid, note=None).note is None
+    assert engines[0].count() == 1
 
 
-# --- emitting a beat exactly once ---
+def test_a_declared_scheduler_is_found_and_removed_by_name_and_can_be_declared_again(engine):
+    declare(engine)
 
-def test_a_beat_reclaimed_after_a_crash_is_not_emitted_twice(app):
-    scheduler = addScheduler(app)
-    due = utc_now() - timedelta(seconds=1)
-    setDeadline(app, scheduler, due)
+    assert engine.byName("nightly").name == "nightly"
+    assert engine.byName("never-declared") is None
+    assert engine.removeNamed("nightly") is True
+    assert engine.removeNamed("nightly") is False
 
-    app.scheduler._work()
-    # the worker died after emitting, before moving the deadline on
-    setDeadline(app, scheduler, due)
-    app.scheduler._work()
+    declare(engine)
 
-    assert app.task.tasksCollection.count_documents({"work.functionName": "greet"}) == 1
+    assert engine.count() == 1
 
 
-def test_a_new_deadline_moves_the_lease_with_it(app):
-    scheduler = addScheduler(app)
-    later = (utc_now() + timedelta(days=30)).replace(microsecond=0)
+def test_added_and_declared_schedulers_coexist_and_unnamed_ones_do_not_collide(engine):
+    added(engine, name="a")
+    added(engine, name="b")
+    declare(engine)
 
-    updated = app.scheduler.update(scheduler.uid, deadline=later)
-
-    assert updated.deadline == later
-    assert updated.leaseUntil == later
-
-
-def test_a_rhythm_restarted_mid_claim_is_not_overwritten(db):
-    class App(BaseApp):
-        @task
-        @staticmethod
-        def ping():
-            return None
-
-    app = App(db)
-    declared = app.scheduler.ensure("n", App.ping(), app.distribution("constant", dailyFrequency=24))
-    setDeadline(app, declared, utc_now() - timedelta(seconds=1))
-    insert = app.task.insert
-
-    def redeclareWhileClaimed(emitted):
-        stored = insert(emitted)
-        app.scheduler.ensure("n", App.ping(), app.distribution("constant", dailyFrequency=1))
-        return stored
-
-    app.task.insert = redeclareWhileClaimed
-    app.scheduler._work()
-
-    assert app.scheduler.get(declared.uid).deadline - utc_now() > timedelta(hours=23)
+    assert engine.count() == 3
+    assert engine.count({"name": "Scheduler"}) == 2
 
 
-def test_saving_a_moved_deadline_moves_the_lease(app):
-    scheduler = app.scheduler.get(addScheduler(app).uid)
-    scheduler.deadline = (utc_now() + timedelta(days=30)).replace(microsecond=0)
-    scheduler.save()
+@pytest.mark.parametrize("field, message", [
+    ("uid", "the engine keeps it"),
+    ("claimId", "the engine keeps it"),
+    ("leaseUntil", "the engine keeps it"),
+    ("status", "enabled="),
+])
+def test_a_field_the_engine_keeps_is_refused_wherever_fields_are_given(engine, field, message):
+    stored = added(engine)
+    calls = {
+        "build":    lambda: engine.build(CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "add":      lambda: engine.add(CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "ensure":   lambda: engine.ensure("nightly", CallSpec.new("greet"), hourly(engine), **{field: "x"}),
+        "update":   lambda: engine.update(stored.uid, **{field: "x"}),
+    }
 
-    assert app.scheduler.get(scheduler.uid).leaseUntil == scheduler.deadline
+    for verb, call in calls.items():
+        with pytest.raises(TypeError, match=message):
+            call()
+
+    assert engine.count() == 1
+    assert engine.get(stored.uid).status == "enabled"
+
+
+def test_a_field_the_scheduler_does_not_have_is_refused(engine):
+    with pytest.raises(TypeError, match="Scheduler has no field accountId"):
+        engine.add(CallSpec.new("greet"), hourly(engine), accountId=7)
+
+    assert engine.count() == 0
+
+
+def test_a_scheduler_is_still_named_and_its_deadline_moved_by_hand(engine):
+    later = (utc_now() + timedelta(days=2)).replace(microsecond=0)
+    scheduler = engine.add(CallSpec.new("greet"), hourly(engine), name="greeter")
+    updated = engine.update(scheduler.uid, name="renamed", deadline=later)
+
+    assert (scheduler.name, updated.name, updated.deadline) == ("greeter", "renamed", later)
+
+
+# --- changing stored schedulers ---
+
+def test_upsert_creates_then_replaces_and_checks_first(engine):
+    scheduler = engine.build(CallSpec.new("greet"), hourly(engine))
+    engine.upsert(scheduler)
+    engine.upsert(scheduler)
+
+    assert engine.count() == 1
+
+    with pytest.raises(TaskValidationError):
+        engine.upsert(engine.build(CallSpec.new("greet", nope=1), hourly(engine)))
+
+    assert engine.count() == 1
+
+
+def test_update_changes_the_work_and_keeps_the_rhythm(engine):
+    scheduler = added(engine)
+    updated = engine.update(scheduler.uid, work=CallSpec.new("greet", name="Grace"))
+
+    assert updated.work.kwargs == {"name": "Grace"}
+    assert updated.deadline == engine.collection.find_one({"uid": scheduler.uid})["deadline"]
+    assert abs(updated.deadline - scheduler.deadline) < timedelta(milliseconds=1)
+
+
+def test_update_with_a_new_distribution_restarts_the_rhythm(engine):
+    scheduler = engine.add(CallSpec.new("greet"), engine.distributions("constant", dailyFrequency=1))
+    updated = engine.update(scheduler.uid, distribution=hourly(engine))
+
+    assert timedelta(minutes=59) < updated.deadline - utc_now() < timedelta(minutes=61)
+
+
+def test_update_toggles_enabled(engine):
+    scheduler = added(engine)
+
+    assert engine.update(scheduler.uid, enabled=False).status == "disabled"
+    assert engine.update(scheduler.uid, enabled=True).status == "enabled"
+
+
+def test_update_checks_the_merged_scheduler_and_writes_nothing_if_it_would_not_run(engine):
+    scheduler = added(engine)
+
+    with pytest.raises(TaskValidationError):
+        engine.update(scheduler.uid, work=CallSpec.new("greet", nope=1))
+
+    assert engine.get(scheduler.uid).work.kwargs == {"name": "Ada"}
+
+
+def test_update_of_a_missing_uid_gives_none(engine):
+    assert engine.update("nope", enabled=False) is None
+
+
+def test_a_scheduler_is_a_collection_engine_document(engine):
+    a = added(engine, name="a")
+    added(engine, name="b")
+
+    assert isinstance(engine, CollectionEngine)
+    assert engine.count({"work.kwargs.name": "a"}) == 1
+    assert engine.get("nope") is None
+    assert engine.delete(a.uid) is True and engine.deleteMany({}) == 1
+
+
+# --- schedulers whose fields reach the tasks they emit ---
+
+class AccountScheduler(Scheduler):
+    accountId: int
+    note: str | None = None
+
+    def taskFields(self) -> dict[str, Any]:
+        return {"accountId": self.accountId}
+
+
+class AccountTask(Task):
+    accountId: int
+
+    def runWork(self) -> CallSpec:
+        return self.work.bind(accountId=self.accountId)
+
+
+@pytest.fixture
+def accountTasks(taskEngine):
+    return taskEngine(FUNCTIONS, AccountTask, name="accountTasks")
+
+
+@pytest.fixture
+def accountOps(schedulerEngine, accountTasks):
+    return schedulerEngine(AccountScheduler, name="accountOps", tasks=accountTasks, extraIndexes=[
+        IndexModel([("accountId", 1)], name="byAccount"),
+    ])
+
+
+def test_a_schedulers_fields_reach_the_task_it_emits_and_the_task_runs(accountOps, accountTasks):
+    scheduler = due(accountOps, accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7))
+    accountOps.work()
+    emitted = accountTasks.find()[0]
+
+    assert isinstance(emitted, AccountTask) and emitted.accountId == 7
+    assert emitted.work.kwargs == {}                                    # stamped by the task, not stored
+    assert accountOps.get(scheduler.uid).work.kwargs == {}              # nor on the scheduler
+    assert accountTasks.work().result == "synced 7 full=False"
+
+
+def test_a_scheduler_is_checked_as_its_task_will_run(accountOps):
+    # sync requires accountId, which only the emitted task supplies
+    assert accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7).accountId == 7
+
+
+def test_the_same_work_is_refused_where_nothing_supplies_the_context(engine):
+    with pytest.raises(TaskValidationError):
+        engine.add(CallSpec.new("sync"), hourly(engine))
+
+
+def test_a_scheduler_with_context_is_refused_by_a_task_engine_that_cannot_store_it(schedulerEngine, tasks):
+    plainTasks = schedulerEngine(AccountScheduler, name="accountsIntoPlain", tasks=tasks)
+
+    with pytest.raises(TypeError, match="Task has no field accountId"):
+        plainTasks.add(CallSpec.new("sync"), hourly(plainTasks), accountId=7)
+
+
+def test_a_task_engine_needing_context_refuses_a_scheduler_that_gives_none(schedulerEngine, accountTasks):
+    plainOps = schedulerEngine(name="plainIntoAccounts", tasks=accountTasks)
+
+    with pytest.raises(ValidationError, match="accountId"):
+        plainOps.add(CallSpec.new("greet"), hourly(plainOps))
+
+
+@pytest.mark.parametrize("fields", [{}, {"accountId": "not a number"}])
+def test_a_missing_or_invalid_scheduler_field_is_refused(accountOps, fields):
+    with pytest.raises(ValidationError):
+        accountOps.add(CallSpec.new("sync"), hourly(accountOps), **fields)
+
+    assert accountOps.count() == 0
+
+
+def test_each_engine_reads_its_own_model_and_the_fields_survive_a_fire(accountOps, engine):
+    scheduler = due(accountOps, accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7))
+    added(engine)
+    accountOps.work()
+
+    assert isinstance(accountOps.get(scheduler.uid), AccountScheduler)
+    assert accountOps.get(scheduler.uid).accountId == 7
+    assert type(engine.find()[0]) is Scheduler
+
+
+def test_ensure_takes_fields_and_can_change_them(accountOps):
+    first = accountOps.ensure("sync-7", CallSpec.new("sync"), hourly(accountOps), accountId=7)
+    again = accountOps.ensure("sync-7", CallSpec.new("sync"), hourly(accountOps), accountId=9)
+
+    assert (first.accountId, again.accountId, again.uid) == (7, 9, schedulerUid("sync-7"))
+    assert accountOps.count() == 1
+
+
+def test_update_changes_fields_and_writes_nothing_invalid(accountOps):
+    scheduler = accountOps.add(CallSpec.new("sync"), hourly(accountOps), accountId=7, note="hello")
+
+    assert accountOps.update(scheduler.uid, accountId=9).accountId == 9
+    assert accountOps.update(scheduler.uid, note=None).note is None
+
+    with pytest.raises(ValidationError):
+        accountOps.update(scheduler.uid, accountId="not a number")
+
+    assert accountOps.collection.find_one({"uid": scheduler.uid})["accountId"] == 9
+
+
+def test_extra_indexes_are_created(accountOps):
+    assert "byAccount" in accountOps.collection.index_information()
+
+
+def test_a_scheduler_engine_emits_into_the_task_engine_it_is_given(schedulerEngine, taskEngine):
+    light, heavy = taskEngine(FUNCTIONS, name="light"), taskEngine(FUNCTIONS, name="heavy")
+    nightly = schedulerEngine(name="nightly", tasks=heavy)
+    due(nightly, added(nightly))
+    nightly.work()
+
+    assert (light.count(), heavy.count()) == (0, 1)
+
+
+def test_ensure_with_fields_stays_idempotent_and_is_checked_through_the_task_it_emits(accountOps, engine):
+    for _ in range(3):
+        accountOps.ensure("sync-7", CallSpec.new("sync"), hourly(accountOps), accountId=7)
+
+    assert accountOps.count() == 1
+
+    with pytest.raises(TaskValidationError):
+        engine.ensure("sync-nobody", CallSpec.new("sync"), hourly(engine))     # nothing supplies accountId
+
+    assert engine.count() == 0
+
+
+# --- the whole loop ---
+
+def test_a_scheduler_fires_a_task_that_drains_a_pile(schedulerEngine, taskEngine, pileEngine):
+    outbox = pileEngine(name="outbox")
+
+    def sendOne() -> str:
+        with outbox.work() as w:
+            if w is None:
+                return "empty"
+
+            return f"sent to {w.data['to']}"
+
+    tasks = taskEngine({"sendOne": sendOne})
+    engine = schedulerEngine(tasks=tasks)
+    outbox.addMany([{"to": "a@b.c"}, {"to": "d@e.f"}])
+    scheduler = engine.add(CallSpec.new("sendOne"), hourly(engine))
+
+    for beat in range(2):
+        due(engine, scheduler, utc_now() - timedelta(minutes=beat + 1))
+        engine.work()
+        tasks.work()
+
+    assert sorted(task.result for task in tasks.find()) == ["sent to a@b.c", "sent to d@e.f"]
+    assert outbox.counts() == {"pending": 0, "running": 0, "done": 2, "failed": 0, "canceled": 0}

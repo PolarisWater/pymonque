@@ -9,8 +9,8 @@ import pytest
 from pydantic import BaseModel, ValidationError
 from pymongo import IndexModel
 
-from pymonque_next import CallSpec, CollectionEngine, Task, TaskFactory, TaskLimits, utc_now
-from pymonque_next.exceptions import DistributionNotFound, TaskNotFound, TaskValidationError
+from pymonque import CallSpec, CollectionEngine, Task, TaskFactory, TaskLimits, utc_now
+from pymonque.exceptions import DistributionNotFound, TaskNotFound, TaskValidationError
 
 
 class Email(BaseModel):

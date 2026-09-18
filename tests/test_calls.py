@@ -6,11 +6,11 @@ from typing import Annotated
 import pytest
 from pydantic import BaseModel, Field
 
-from pymonque_next import CallSpec, Functions, task
-from pymonque_next.calls import nearestAttributes
-from pymonque_next.declarations import declaredOn
-from pymonque_next.documents import uuid4str
-from pymonque_next.exceptions import TaskNotFound, TaskValidationError
+from pymonque import CallSpec, Functions, task
+from pymonque.calls import nearestAttributes
+from pymonque.declarations import declaredOn
+from pymonque.documents import uuid4str
+from pymonque.exceptions import TaskNotFound, TaskValidationError
 
 
 # --- CallSpec ---

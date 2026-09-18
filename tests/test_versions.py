@@ -8,11 +8,11 @@ from datetime import timedelta
 import pytest
 from pydantic import BaseModel
 
-from pymonque_next import BaseApp, BaseDistributions, Document, Scheduler, Task, collection, pile, schedulers, task, tasks, utc_now
-from pymonque_next.exceptions import VersionMismatch
-from pymonque_next.tasks import WORKER_DIED
+from pymonque import BaseApp, BaseDistributions, Document, Scheduler, Task, collection, pile, schedulers, task, tasks, utc_now
+from pymonque.exceptions import VersionMismatch
+from pymonque.tasks import WORKER_DIED
 
-from tests_next.helpers import waitFor
+from tests.helpers import waitFor
 
 
 class V1(BaseApp):

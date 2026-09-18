@@ -9,7 +9,7 @@ import time
 import pytest
 from pydantic import BaseModel
 
-from pymonque_next import CallSpec, utc_now
+from pymonque import CallSpec, utc_now
 
 
 class Email(BaseModel):

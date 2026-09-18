@@ -1,74 +1,39 @@
 """Shared fixtures.
 
-Every test gets a fresh in-memory MongoDB, so nothing leaks between tests.
+Every test gets a fresh in-memory MongoDB, so nothing leaks between tests. The engine fixtures build
+each engine the way an app will, from what the app resolves for it.
 """
 
-import time
+import threading
 
 import pytest
 from mongomock import MongoClient
-from pydantic import BaseModel
+from mongomock.collection import Collection
 
-from pymonque import BaseApp, task, pile
-
-
-WORKER_POLL_INTERVAL = 0.02
-
-
-def wait_for(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
-    """Poll until `predicate` holds, instead of sleeping a fixed amount."""
-
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-
-    return bool(predicate())
+from pymonque import PileEngine, Scheduler, SchedulerEngine, Task, TaskEngine, TaskLimits
+from pymonque.settings import PileSettings, SchedulerEngineSettings, TaskEngineSettings
+from pymonque.tasks import taskFunctions
 
 
-def appWith(base, db, **attributes):
-    """Defaults live on the class, so varying one for a test means a subclass."""
-
-    return type("Configured", (base,), attributes)(db, **attributes.pop("_kwargs", {}))
+_findAndModify = threading.Lock()
 
 
-class Email(BaseModel):
-    to:         str
-    subject:    str = "(no subject)"
+@pytest.fixture(autouse=True)
+def atomicFindAndModify(monkeypatch):
+    """Make mongomock's find_one_and_update atomic, as MongoDB's is.
 
+    mongomock finds the document, then updates it by _id alone, so two threads can both take the same
+    one. A claim is built on MongoDB's guarantee; without this, a test of claims across threads would
+    test mongomock instead.
+    """
 
-class ExampleApp(BaseApp):
-    outbox = pile(Email)
-    scraps = pile()
+    original = Collection._find_and_modify
 
-    @task
-    @staticmethod
-    def greet(name: str, greeting: str = "Hello") -> str:
-        return f"{greeting}, {name}!"
+    def atomic(self, *args, **kwargs):
+        with _findAndModify:
+            return original(self, *args, **kwargs)
 
-    @task
-    @staticmethod
-    def boom():
-        raise ValueError("nope")
-
-    @task
-    @staticmethod
-    def unserializable():
-        return object()  # not encodable by the driver
-
-    @task
-    def whoami(self) -> str:
-        return type(self).__name__
-
-    @task
-    def send_one(self) -> str:
-        with self.outbox.work() as item:
-            if item is None:
-                return "empty"
-
-            return f"sent to {item.data.to}"
+    monkeypatch.setattr(Collection, "_find_and_modify", atomic)
 
 
 @pytest.fixture
@@ -77,15 +42,71 @@ def db():
 
 
 @pytest.fixture
-def app(db):
-    return ExampleApp(db)
+def taskEngine(db):
+    """Build a task engine from its tasks, every task's limits — none, unless given — and its lease."""
+
+    def build(functions=None, model=Task, *, name="task", collection=None, leaseSeconds=300, limits=None, **kwargs):
+        functions = functions or {}
+
+        return TaskEngine(
+            db[collection or f"pymonque_task_{name}"],
+            model,
+            name=name,
+            functions=taskFunctions(functions),
+            settings=TaskEngineSettings(leaseSeconds=leaseSeconds),
+            limits=limits if limits is not None else {task: TaskLimits() for task in functions},
+            **kwargs,
+        )
+
+    return build
 
 
 @pytest.fixture
-def tasks(app):
-    return app.task.tasksCollection
+def pileEngine(db):
+    """Build a pile engine from its payload model — none takes any dict — and its settings."""
+
+    def build(model=None, *, name="jobs", collection=None, maxAttempts=1, leaseSeconds=300, **kwargs):
+        return PileEngine(
+            db[collection or f"pymonque_pile_{name}"],
+            model,
+            name=name,
+            settings=PileSettings(maxAttempts=maxAttempts, leaseSeconds=leaseSeconds),
+            **kwargs,
+        )
+
+    return build
 
 
 @pytest.fixture
-def schedulers(app):
-    return app.scheduler.schedulersCollection
+def schedulerEngine(db):
+    """Build a scheduler engine from its model and settings, emitting into the task engine it is given."""
+
+    def build(model=Scheduler, *, tasks, name="scheduler", collection=None, missed="once", leaseSeconds=300, **kwargs):
+        return SchedulerEngine(
+            db[collection or f"pymonque_scheduler_{name}"],
+            model,
+            name=name,
+            tasks=tasks,
+            settings=SchedulerEngineSettings(missed=missed, leaseSeconds=leaseSeconds),
+            **kwargs,
+        )
+
+    return build
+
+
+@pytest.fixture
+def stopAfter():
+    """Stop every app a test started, so its threads do not go on logging into later tests."""
+
+    started = []
+
+    def register(app):
+        started.append(app)
+
+        return app
+
+    yield register
+
+    for app in started:
+        app.stopWorkers(timeout=5)
+        app.restoreSignals()
