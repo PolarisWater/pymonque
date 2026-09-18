@@ -294,6 +294,18 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   code before the old package was replaced. `reference.md` keeps a pointer to 2.0's "Upgrading from
   0.x" in the repository history.
 
+### After the full review of 3.0.0
+
+- **`run()` refuses to start no workers.** With both counts 0 — the defaults, or a dict of zeros — it
+  used to start nothing, find nothing to wait for, and return `True` at once: a worker process that
+  exits without saying why. It now raises `ValueError` before installing signal handlers or
+  registering. `startWorkers()` still accepts no workers.
+- **A timeout's stop cannot reach another thread.** The stop is raised by thread id, and an ended
+  thread's id can be reused at once. The call's thread now marks itself finished under a lock, and
+  the stop — dropping the thread's holds, then raising `TaskStopped` — is sent under that lock only
+  while it is not (`tasks._StoppableCall`). A stop that lands as the call ends is swallowed in the
+  thread rather than escaping as an unhandled exception.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen

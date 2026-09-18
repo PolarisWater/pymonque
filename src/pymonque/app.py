@@ -584,8 +584,18 @@ class BaseApp:
                 sys.exit(3 if app.retired else 0 if drained else 1)
 
         `app.retired` says the process stopped itself for having too many abandoned threads, so its
-        supervisor can restart it.
+        supervisor can restart it. A run that would start no worker at all is refused, rather than
+        returning at once.
         """
+
+        taskCounts = self._counts("taskWorkers", taskWorkers, self.taskEngines)
+        schedulerCounts = self._counts("schedulerWorkers", schedulerWorkers, self.schedulerEngines)
+
+        if not any(taskCounts.values()) and not any(schedulerCounts.values()):
+            raise ValueError(
+                "run() starts no workers: give taskWorkers and/or schedulerWorkers, e.g. "
+                "app.run(taskWorkers=4, schedulerWorkers=1). A process that only enqueues needs no run()."
+            )
 
         self.handleSignals()
         self.startWorkers(taskWorkers, schedulerWorkers)

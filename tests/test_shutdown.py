@@ -278,3 +278,15 @@ def test_run_blocks_until_a_signal_then_drains(slow):
     assert not slow.running and not slow.retired
     assert slow.task.get(quick.uid).status == "done"
     assert signal.getsignal(signal.SIGTERM) is before      # handled only while it ran
+
+
+@pytest.mark.parametrize("counts", [{}, {"taskWorkers": 0, "schedulerWorkers": 0}, {"taskWorkers": {"task": 0, "heavy": 0}}])
+def test_a_run_that_would_start_no_worker_is_refused(slow, counts):
+    before = signal.getsignal(signal.SIGTERM)
+
+    with pytest.raises(ValueError, match="starts no workers"):
+        slow.run(**counts)
+
+    assert not slow.running
+    assert slow.liveWorkers() == []                         # nothing registered
+    assert signal.getsignal(signal.SIGTERM) is before       # nothing installed

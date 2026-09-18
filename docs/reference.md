@@ -137,7 +137,8 @@ if __name__ == "__main__":
     sys.exit(3 if app.retired else 0 if drained else 1)
 ```
 
-That is the whole of a worker process. For finer control:
+That is the whole of a worker process. `run()` refuses to start with no workers at all — a process
+that only enqueues needs no `run()`. For finer control:
 
 | | |
 |---|---|

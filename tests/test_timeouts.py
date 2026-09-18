@@ -323,3 +323,41 @@ def test_without_retire_after_a_process_keeps_working(timed):
 
     assert waitFor(lambda: timed.task.get(later.uid).status == "done")
     assert not timed.retired
+
+
+# --- stopping only the call's own thread ---
+
+def test_a_call_that_already_finished_is_not_sent_a_stop():
+    from pymonque.tasks import _StoppableCall
+
+    call = _StoppableCall(lambda: None, name="finished")
+    call.thread.start()
+    call.thread.join(1)
+
+    # its thread id may already belong to another thread, so nothing is raised by it
+    assert call.stop() is False
+
+
+def test_a_stopped_call_ends_its_thread_without_an_unhandled_exception(monkeypatch):
+    from pymonque.tasks import _StoppableCall
+
+    unhandled = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: unhandled.append(args.exc_type))
+
+    ending = threading.Event()
+    proceed = threading.Event()
+
+    def target():
+        ending.set()
+        proceed.wait(1)                 # the stop lands once this returns
+
+    call = _StoppableCall(target, name="ending")
+    call.thread.start()
+    assert ending.wait(1)
+
+    assert call.stop() is True          # still running: the stop is sent
+    proceed.set()
+    call.thread.join(2)
+
+    assert not call.thread.is_alive()
+    assert unhandled == []              # TaskStopped did not escape the thread

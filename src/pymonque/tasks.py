@@ -117,14 +117,48 @@ def stackOf(thread: threading.Thread) -> str:
     return "".join(traceback.format_stack(frame)) if frame is not None else "(the thread has ended)\n"
 
 
-def stopThread(thread: threading.Thread) -> bool:
-    """Raise TaskStopped inside a thread, at the next line of Python it runs. False if it has ended.
+class _StoppableCall:
+    """A call run in a thread of its own, which a timeout can ask to stop.
 
-    Python cannot kill a thread; this is the most it can do. A thread blocked in C, I/O or a sleep
-    only sees the exception once that call returns.
+    Stopping raises TaskStopped by thread id, and an ended thread's id can be reused at once by a new
+    one. So the call's thread marks itself finished under a lock, and a stop is only sent under that
+    lock while it is not: until the thread has marked itself, it has not ended, and its id is its own.
     """
 
-    return ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread.ident), ctypes.py_object(TaskStopped)) == 1
+    def __init__(self, target: Callable[[], None], *, name: str):
+        self._target = target
+        self._guard = threading.Lock()
+        self._finished = False
+        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    def _run(self):
+        try:
+            try:
+                self._target()
+            finally:
+                with self._guard:
+                    self._finished = True
+        except TaskStopped:
+            pass    # a stop that arrived as the call was ending; the task was written off already
+
+    def stop(self) -> bool:
+        """Stop renewing what the call's thread holds, and raise TaskStopped in it at the next line of
+        Python it runs. False if it had already finished.
+
+        Python cannot kill a thread; this is the most it can do. A thread blocked in C, I/O or a sleep
+        only sees the exception once that call returns.
+        """
+
+        with self._guard:
+            if self._finished:
+                return False
+
+            # nobody waits for it now, so a pile item it holds is left to lapse — a spent try
+            abandonHolds(self.thread.ident)
+
+            return ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(self.thread.ident), ctypes.py_object(TaskStopped)
+            ) == 1
 
 
 @dataclass(frozen=True)
@@ -404,7 +438,8 @@ class TaskEngine(CollectionEngine[T]):
                 outcome["error"] = e
 
         started = time.monotonic()
-        thread = threading.Thread(target=call, name=f"pymonque-task-{task.work.functionName}", daemon=True)
+        stoppable = _StoppableCall(call, name=f"pymonque-task-{task.work.functionName}")
+        thread = stoppable.thread
         thread.start()
         thread.join(timeout)
 
@@ -416,8 +451,7 @@ class TaskEngine(CollectionEngine[T]):
 
         where = stackOf(thread)
 
-        abandonHolds(thread.ident)
-        stopThread(thread)
+        stoppable.stop()
 
         logger.warning(
             "%r (%s) timed out after %gs: written off, its worker freed, and the call stopped. Where it was:\n%s",
