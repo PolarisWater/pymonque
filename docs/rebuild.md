@@ -311,7 +311,8 @@ Also settled with these:
    history.
 7. **Upgrading a 2.0 database — Decided:** an explicit, idempotent `upgradeFrom2(app)`, run once by an
    operator with every 2.0 process stopped, and refused while a live worker is registered. It
-   renames `pymonque_tasks` / `pymonque_schedulers` to the default engines' collections (refusing if
+   renames `pymonque_tasks` / `pymonque_schedulers` to the default engines' collections, and a declared
+   scheduler engine's `pymonque_schedulers_<name>` to its new name (refusing if
    a target already holds documents), maps statuses (`success` → `done`, `processing` → `running`,
    an item's `claimed` → `running`), drops the tasks' 2.0 `attempts`, and returns what it changed.
    Not automatic: renaming collections as a side effect of starting workers would pull them from

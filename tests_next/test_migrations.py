@@ -7,7 +7,7 @@ from datetime import timedelta
 import pytest
 from pydantic import BaseModel
 
-from pymonque_next import BaseApp, pile, task, tasks, upgradeFrom2, utc_now
+from pymonque_next import BaseApp, pile, schedulers, task, tasks, upgradeFrom2, utc_now
 from pymonque_next.exceptions import VersionMismatch
 from pymonque_next.schedulers import schedulerUid
 from pymonque_next.tasks import WORKER_DIED
@@ -148,6 +148,20 @@ def test_the_engines_indexes_are_made_on_the_renamed_collections(old):
     upgradeFrom2(app)
 
     assert any(index["key"] == [("leaseUntil", 1)] for index in app.scheduler.collection.index_information().values())
+
+
+def test_a_declared_scheduler_engines_2_0_collection_is_renamed(db):
+    class Planned(Mail):
+        nightly = schedulers()
+        kept = schedulers(collection="kept_schedulers")
+
+    db["pymonque_schedulers_nightly"].insert_one(oldScheduler())
+    db["pymonque_schedulers_kept"].insert_one(oldScheduler())
+    app = Planned(db)
+
+    assert upgradeFrom2(app)["schedulers renamed"] == 1
+    assert app.nightly.byName("nightly") is not None
+    assert "pymonque_schedulers_kept" in db.list_collection_names()     # it was told to use another
 
 
 def test_every_task_engine_is_upgraded(db):
