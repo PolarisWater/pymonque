@@ -3,8 +3,9 @@
 Decisions that are made but not built, work that is on hold, and asymmetries that are deliberate.
 Finding ids (B1, P3, N2…) refer to the engine anatomy review of `c3e75e2`.
 
-The library is to be rebuilt rather than refactored further; `docs/rebuild.md` gathers everything
-here, plus the invariants the rebuild must keep and the decisions to make before building.
+3.0.0 is the rebuild these notes led to. Its design document (`docs/rebuild.md`, cited below as
+"rebuild §n"), the behaviour checklist and the handoff were removed once it shipped; they are in
+the history at `2797a57`.
 
 ## Decided while building
 
