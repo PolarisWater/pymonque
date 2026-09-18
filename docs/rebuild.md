@@ -305,4 +305,14 @@ Also settled with these:
      `release` all end it, and what the block does for you (lease renewal, claim checks, done at
      the end, fail on an exception, a lost claim), with the bare `except:` caveat beside it — see
      `docs/design-notes.md`.
-6. **Replace the old package** once the checklist is covered.
+6. **Replace the old package** once the checklist is covered — **Decided:** `pymonque_next` becomes
+   `src/pymonque` and `tests_next` becomes `tests`; `core.py` and the old tests are deleted (git keeps
+   them); the version goes to 3.0.0. This document, the checklist and the design notes stay, as
+   history.
+7. **Upgrading a 2.0 database — Decided:** an explicit, idempotent `upgradeFrom2(app)`, run once by an
+   operator with every 2.0 process stopped, and refused while a live worker is registered. It
+   renames `pymonque_tasks` / `pymonque_schedulers` to the default engines' collections (refusing if
+   a target already holds documents), maps statuses (`success` → `done`, `processing` → `running`,
+   an item's `claimed` → `running`), drops the tasks' 2.0 `attempts`, and returns what it changed.
+   Not automatic: renaming collections as a side effect of starting workers would pull them from
+   under a 2.0 process that only enqueues and never registered.

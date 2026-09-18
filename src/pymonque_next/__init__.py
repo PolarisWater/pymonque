@@ -9,6 +9,7 @@ from .calls import CallSpec, FuncSpec, Functions
 from .declarations import collection, pile, schedulers, task, tasks
 from .distributions import BaseDistributions, DistributionEngine
 from .documents import CollectionEngine, Document, utc_now
+from .migrations import upgradeFrom2
 from .piles import Item, PileEngine, Work
 from .schedulers import Scheduler, SchedulerEngine
 from .settings import AppDefaults, TaskLimits
@@ -39,5 +40,6 @@ __all__ = [
     "schedulers",
     "task",
     "tasks",
+    "upgradeFrom2",
     "utc_now",
 ]

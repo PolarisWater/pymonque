@@ -295,8 +295,12 @@ class BaseApp:
         counts = dict.fromkeys(self.taskEngines, 0)
 
         for worker in self.liveWorkers():
-            for name, count in (worker.get("taskWorkers") or {}).items():
-                counts[name] = counts.get(name, 0) + count
+            byEngine = worker.get("taskWorkers")
+
+            # a 2.0 process reports one number, for an engine this version cannot name
+            if isinstance(byEngine, dict):
+                for name, count in byEngine.items():
+                    counts[name] = counts.get(name, 0) + count
 
         return counts
 
