@@ -10,11 +10,14 @@ the worker that took the document over.
 from __future__ import annotations
 
 import logging
+import random
 import threading
+import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from pymongo import ReturnDocument
 from pymongo.collection import Collection
@@ -121,12 +124,31 @@ def cancelled() -> dict[str, Any]:
     return {"$set": {"status": "canceled", "finishedAt": utc_now(), "claimId": None}}
 
 
+# every Leases of the process, so a timed-out call's holds can be dropped wherever they were taken
+_everyLeases: weakref.WeakSet[Leases] = weakref.WeakSet()
+_everyLeasesLock = threading.Lock()
+
+
+def abandonHolds(threadId: int) -> int:
+    """Stop renewing every claim the thread `threadId` holds, in any collection. Returns how many.
+
+    For a call that outlived its timeout: it may still be running, but nobody waits for it any more,
+    so a pile item it holds is left to lapse — a spent try — and another worker can take it.
+    """
+
+    with _everyLeasesLock:
+        everyLeases = list(_everyLeases)
+
+    return sum(leases._dropThread(threadId) for leases in everyLeases)
+
+
 class Leases:
     """The claims this process holds in one collection, and the thread that keeps them held.
 
     A claim is held for exactly as long as its work runs, so its lease is renewed through a shutdown
     that waits for the work to finish, and stops being renewed when the work ends — whoever ends it.
-    The renewing thread starts with the first claim held and ends with the last one let go.
+    The renewing thread starts with the first claim held and ends with the last one let go. Each hold
+    remembers the thread that took it, so a call abandoned at its timeout stops holding anything.
     """
 
     def __init__(self, collection: Collection, leaseSeconds: float, *, name: str):
@@ -134,10 +156,13 @@ class Leases:
         self.leaseSeconds = leaseSeconds
         self.name = name
 
-        self._held: dict[str, str] = {}     # claimId -> uid
+        self._held: dict[str, tuple[str, int]] = {}     # claimId -> (uid, the holding thread)
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._renewer: threading.Thread | None = None
+
+        with _everyLeasesLock:
+            _everyLeases.add(self)
 
     @property
     def interval(self) -> float:
@@ -155,7 +180,7 @@ class Leases:
 
     def hold(self, uid: str, claimId: str):
         with self._lock:
-            self._held[claimId] = uid
+            self._held[claimId] = (uid, threading.get_ident())
 
             if self._renewer is None:
                 self._renewer = threading.Thread(target=self._renewLoop, name=f"pymonque-{self.name}-lease", daemon=True)
@@ -167,6 +192,21 @@ class Leases:
 
             if not self._held:
                 self._changed.notify_all()      # so the renewer ends now, not an interval from now
+
+    def _dropThread(self, threadId: int) -> int:
+        with self._lock:
+            dropped = [claimId for claimId, (_, holder) in self._held.items() if holder == threadId]
+
+            for claimId in dropped:
+                del self._held[claimId]
+
+            if dropped and not self._held:
+                self._changed.notify_all()
+
+        for claimId in dropped:
+            logger.warning("%s: stopped renewing claim %s, held by a call abandoned at its timeout", self.name, claimId)
+
+        return len(dropped)
 
     @contextmanager
     def holding(self, uid: str, claimId: str) -> Iterator[None]:
@@ -189,7 +229,7 @@ class Leases:
         return self.collection.update_many(
             # the uid for the index; the claimId so a document another worker has taken since, or
             # whose outcome is written, is left alone
-            {"uid": {"$in": sorted(set(held.values()))}, "claimId": {"$in": list(held)}},
+            {"uid": {"$in": sorted({uid for uid, _ in held.values()})}, "claimId": {"$in": list(held)}},
             {"$set": {"leaseUntil": utc_now() + timedelta(seconds=self.leaseSeconds)}}
         ).matched_count
 
@@ -212,3 +252,112 @@ class Leases:
 
     def __repr__(self) -> str:
         return f"Leases {self.name} ({len(self)} held)"
+
+
+class WorkerLoop:
+    """Worker threads that call one engine's `work()` until asked to stop.
+
+    A worker checks for a stop request between pieces of work, never inside one, so a shutdown always
+    finishes what was already claimed. It sleeps only when there was nothing to do, so a backlog
+    drains without waiting between tasks, and a stop request wakes it at once.
+    """
+
+    def __init__(self, work: Callable[[], Any], *, name: str, pollInterval: float = 1.0):
+        self.work = work
+        self.name = name
+        self.pollInterval = pollInterval
+
+        self.count: int = 0     # threads started since the last full stop
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._busy = 0
+        self._busyLock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return any(t.is_alive() for t in self._threads)
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def busy(self) -> int:
+        """Workers in the middle of a piece of work."""
+
+        with self._busyLock:
+            return self._busy
+
+    @property
+    def threads(self) -> list[threading.Thread]:
+        return list(self._threads)
+
+    def _idle(self):
+        # jittered, so workers started together do not poll in lockstep; a wait on the stop event, so a
+        # shutdown does not sit through a whole interval
+        self._stop.wait(self.pollInterval * (0.9 + random.random() * 0.2))
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._busyLock:
+                self._busy += 1
+
+            try:
+                worked = self.work()
+            except Exception:
+                # a failing iteration — the database away, a stored document that no longer fits its
+                # model — is logged, and the worker carries on
+                logger.exception("%s worker iteration failed", self.name)
+                worked = None
+            finally:
+                with self._busyLock:
+                    self._busy -= 1
+
+            if worked is None:
+                self._idle()
+
+    def start(self, count: int):
+        if count <= 0:
+            return
+
+        self._stop.clear()
+        self._threads = [t for t in self._threads if t.is_alive()]
+
+        threads = [
+            threading.Thread(target=self._loop, name=f"pymonque-{self.name}-{self.count + n}", daemon=True)
+            for n in range(count)
+        ]
+
+        self.count += count
+        self._threads.extend(threads)
+
+        for thread in threads:
+            thread.start()
+
+    def requestStop(self):
+        """Stop claiming, without waiting for the work in flight."""
+
+        self._stop.set()
+
+    def stop(self, timeout: float | None = None) -> bool:
+        """Stop claiming and wait for the work in flight. False if any worker was still busy when
+        `timeout` ran out."""
+
+        self._stop.set()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        for thread in self._threads:
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+        self._threads = [t for t in self._threads if t.is_alive()]
+
+        if not self._threads:
+            self.count = 0
+
+        return not self._threads
+
+    def __repr__(self) -> str:
+        state = "stopping" if self.stopping else "running" if self.running else "idle"
+
+        return f"WorkerLoop {self.name} ({self.count} workers, {state})"

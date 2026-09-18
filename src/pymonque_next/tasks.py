@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import sys
+import threading
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Literal, Mapping, Self, Sequence, TypeVar
 
@@ -14,10 +18,10 @@ from pymongo import IndexModel
 from pymongo.collection import Collection
 
 from .calls import CallSpec, Functions
-from .claims import Leases, cancelled, claimNext, notStarted, writeClaimed
+from .claims import Leases, WorkerLoop, abandonHolds, cancelled, claimNext, notStarted, writeClaimed
 from .distributions import DistributionEngine
 from .documents import CollectionEngine, Document, Duration, UtcDatetime, WorkStatus, utc_now
-from .exceptions import TaskNotFound, TaskValidationError
+from .exceptions import TaskNotFound, TaskStopped, TaskTimeout, TaskValidationError
 from .settings import TaskEngineSettings, TaskLimits
 
 
@@ -105,6 +109,43 @@ WORKER_DIED = (
 )
 
 
+def stackOf(thread: threading.Thread) -> str:
+    """Where a thread is right now, as a traceback reads."""
+
+    frame = sys._current_frames().get(thread.ident)
+
+    return "".join(traceback.format_stack(frame)) if frame is not None else "(the thread has ended)\n"
+
+
+def stopThread(thread: threading.Thread) -> bool:
+    """Raise TaskStopped inside a thread, at the next line of Python it runs. False if it has ended.
+
+    Python cannot kill a thread; this is the most it can do. A thread blocked in C, I/O or a sleep
+    only sees the exception once that call returns.
+    """
+
+    return ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread.ident), ctypes.py_object(TaskStopped)) == 1
+
+
+@dataclass(frozen=True)
+class Abandoned:
+    """A call that outlived its timeout and would not stop: its task is written off, its thread lives on."""
+
+    task:       Task
+    thread:     threading.Thread
+    since:      float       # time.monotonic() when the task started
+
+    @property
+    def runningFor(self) -> float:
+        return time.monotonic() - self.since
+
+    def where(self) -> str:
+        return stackOf(self.thread)
+
+    def __repr__(self) -> str:
+        return f"Abandoned {self.task!r} ({self.task.uid}, running {self.runningFor:.0f}s)"
+
+
 def taskFunctions(functions: Mapping[str, Callable]) -> Functions:
     """An app's tasks, as every task engine of the app runs them."""
 
@@ -130,7 +171,8 @@ class TaskEngine(CollectionEngine[T]):
             limits:         Mapping[str, TaskLimits],
             distributions:  DistributionEngine | None = None,
             factory:        TaskFactory | None = None,
-            extraIndexes:   Sequence[IndexModel] | None = None
+            extraIndexes:   Sequence[IndexModel] | None = None,
+            pollInterval:   float = 1.0
         ):
 
         if not (isinstance(model, type) and issubclass(model, Task)):
@@ -156,6 +198,15 @@ class TaskEngine(CollectionEngine[T]):
         super().__init__(collection, model, name=name, extraIndexes=extraIndexes)
 
         self.leases = Leases(self.collection, settings.leaseSeconds, name=f"task-{name}")
+        self.workers = WorkerLoop(self.work, name=f"task-{name}", pollInterval=pollInterval)
+
+        # calls that outlived their timeout and would not stop, by thread; `onAbandoned` is told of each
+        self._abandoned: dict[int, Abandoned] = {}
+        self._abandonedLock = threading.Lock()
+        self.onAbandoned: Callable[[TaskEngine], None] | None = None
+
+    # how long a stopped call gets to stop before its thread is counted abandoned: per process, pacing
+    stopGrace: float = 3.0
 
     def createIndexes(self):
         super().createIndexes()
@@ -304,7 +355,7 @@ class TaskEngine(CollectionEngine[T]):
             return self._outdate(task, now)
 
         # held until the outcome is written, not only until the call returns, so the lease cannot lapse
-        # in between. No time limit is enforced yet: timeouts arrive with the workers, in layer 4.
+        # in between
         with self.leases.holding(task.uid, task.claimId):
             self._run(task)
             self._record(task)
@@ -312,15 +363,20 @@ class TaskEngine(CollectionEngine[T]):
         return task
 
     def _run(self, task: T):
+        timeout = self.limitsFor(task).timeout
         start = time.perf_counter()
 
         try:
-            task.result = self.functions.call(task.runWork())
+            task.result = self.functions.call(task.runWork()) if timeout is None else self._callWithin(task, timeout)
 
             # a result the driver cannot store is found here, not by a write that fails with the task still claimed
             bson.encode(task.model_dump(include={"result"}))
 
             task.status = "done"
+        except TaskTimeout as e:
+            task.status = "timeout"
+            task.result = None
+            task.error = str(e)
         except (Exception, SystemExit):     # sys.exit() in a task would otherwise end the worker's thread
             task.status = "failed"
             task.result = None
@@ -328,6 +384,88 @@ class TaskEngine(CollectionEngine[T]):
         finally:
             task.executionTime = timedelta(seconds=time.perf_counter() - start)
             task.finishedAt = utc_now()
+
+    def _callWithin(self, task: T, timeout: float) -> Any:
+        """Run the call in a thread of its own, and stop waiting for it after `timeout` seconds.
+
+        What a timeout guarantees is what every other process sees: the worker is freed and the task is
+        written off. On top of that the call is asked to stop, and a pile item it holds stops being
+        renewed; whether it did stop is logged a few seconds later.
+        """
+
+        outcome: dict[str, Any] = {}
+
+        def call():
+            try:
+                outcome["result"] = self.functions.call(task.runWork())
+            except TaskStopped:
+                pass    # stopped at its timeout; the task was written off already
+            except BaseException as e:      # carried back to the worker, which records it
+                outcome["error"] = e
+
+        started = time.monotonic()
+        thread = threading.Thread(target=call, name=f"pymonque-task-{task.work.functionName}", daemon=True)
+        thread.start()
+        thread.join(timeout)
+
+        if not thread.is_alive():
+            if "error" in outcome:
+                raise outcome["error"]
+
+            return outcome.get("result")
+
+        where = stackOf(thread)
+
+        abandonHolds(thread.ident)
+        stopThread(thread)
+
+        logger.warning(
+            "%r (%s) timed out after %gs: written off, its worker freed, and the call stopped. Where it was:\n%s",
+            task, task.uid, timeout, where
+        )
+
+        threading.Thread(
+            target=self._watchStopped, args=(task, thread, started),
+            name=f"pymonque-task-{self.name}-stopping", daemon=True,
+        ).start()
+
+        raise TaskTimeout(
+            f"{task.work.functionName} did not finish within {timeout:g}s, so it was written off and "
+            f"stopped. Where it was:\n{where}"
+        )
+
+    def _watchStopped(self, task: T, thread: threading.Thread, started: float):
+        """Say whether a call stopped at its timeout, and count it abandoned if it did not."""
+
+        thread.join(self.stopGrace)
+
+        if not thread.is_alive():
+            logger.warning("%r (%s) stopped after its timeout", task, task.uid)
+
+            return
+
+        abandoned = Abandoned(task, thread, started)
+
+        with self._abandonedLock:
+            self._abandoned[thread.ident] = abandoned
+
+        logger.error(
+            "%r (%s) is still running after being stopped — blocked outside Python — so its thread is "
+            "abandoned. Where it is:\n%s", task, task.uid, abandoned.where()
+        )
+
+        if self.onAbandoned is not None:
+            self.onAbandoned(self)
+
+    def abandoned(self) -> list[Abandoned]:
+        """Calls that outlived their timeout and have not stopped yet, oldest first."""
+
+        with self._abandonedLock:
+            for threadId, each in list(self._abandoned.items()):
+                if not each.thread.is_alive():
+                    del self._abandoned[threadId]
+
+            return sorted(self._abandoned.values(), key=lambda each: each.since)
 
     def _record(self, task: T, fields: frozenset[str] = OUTCOME_FIELDS) -> bool:
         """Write a task's outcome, if the claim that ran it still holds it."""
@@ -422,6 +560,29 @@ class TaskEngine(CollectionEngine[T]):
                 raise TimeoutError(f"{current!r} is still {current.status} after {timeout}s")
 
             time.sleep(interval if remaining is None else min(interval, remaining))
+
+    def backlog(self) -> tuple[int, float]:
+        """Tasks due that nobody has picked up, and how long the oldest has waited, in seconds.
+
+        A free worker claims within one poll interval, so anything waiting much longer than that means
+        every worker is busy. A task held by a worker whose lease lapsed counts: nobody is running it.
+        """
+
+        now = utc_now()
+        due = {
+            "status": {"$in": ["pending", "running"]},
+            "leaseUntil": {"$lte": now},
+            "work.functionName": {"$in": list(self.functions)},
+        }
+
+        count = self.collection.count_documents(due)
+
+        if not count:
+            return 0, 0.0
+
+        oldest = self.collection.find_one(due, sort=[("leaseUntil", 1)])
+
+        return count, (now - oldest["leaseUntil"]).total_seconds()
 
     def flagIncompatible(self) -> int:
         """Mark waiting tasks whose function this engine does not have as incompatible. Returns how many.

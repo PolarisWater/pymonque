@@ -92,3 +92,21 @@ def schedulerEngine(db):
         )
 
     return build
+
+
+@pytest.fixture
+def stopAfter():
+    """Stop every app a test started, so its threads do not go on logging into later tests."""
+
+    started = []
+
+    def register(app):
+        started.append(app)
+
+        return app
+
+    yield register
+
+    for app in started:
+        app.stopWorkers(timeout=5)
+        app.restoreSignals()

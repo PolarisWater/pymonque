@@ -215,6 +215,66 @@ decisions made along the way:
     fails again after every lease, as a removed distribution does. Layer 4's worker loop logs it;
     documents in any collection break the same way after a schema change, and a migration is the fix.
 
+### Layer 4: app, versions, workers, shutdown, timeouts
+
+`app.py` (`BaseApp`), `versions.py` (fingerprint, worker registry), the worker loop in `claims.py`,
+and timeouts in `tasks.py`. Small decisions made along the way:
+
+- **`BaseApp` declares the default engines itself:** `task = tasks()` and `scheduler = schedulers()`
+  are class attributes of `BaseApp`, so replacing one is replacing a declaration by name like any
+  other. The reserved-name check lets `task` and `scheduler` be replaced only by a declaration of
+  the same kind, and refuses every other declaration or `@task` under a name `BaseApp` has or
+  `__init__` sets. The defaults (`taskTimeout`, …) are class attributes of `BaseApp` with their
+  values, and are checked by `AppDefaults.of()` at class definition.
+- **`emitsInto` follows the name** (as decided in layer 1): the app builds each scheduler engine
+  against whatever task engine the class resolves that name to. A subclass that replaces it with
+  something that is not a task engine is refused at class definition.
+- **Each engine that runs workers has a `workers: WorkerLoop`** (`app.task.workers.running`,
+  `.count`, `.busy`, `.stop()`), so an engine reports its own state. Its poll interval is the
+  declaration's `pollInterval`, or the constructor's `taskPollInterval` / `schedulerPollInterval`.
+  A failing iteration is logged naming the engine (`scheduler-nightly worker iteration failed`) and
+  the worker carries on — which is how a stored scheduler that no longer fits its model shows up.
+- **Worker counts** are checked: a dict naming an engine the app lacks raises `ValueError` listing
+  the engines it has; a count that is not a non-negative int is refused.
+- **The fingerprint is computed once, at construction,** and stored as `app.fingerprint`. It hashes
+  each task's signature (defaults included, addresses stripped) with its resolved limits; each
+  distribution's signature; and for each task engine, scheduler engine, pile and collection its
+  name, collection name, resolved settings (`emitsInto` for scheduler engines, the key for
+  collections) and model schema. A model's schema is its JSON schema; a model with a field that has
+  none falls back to its fields' annotations and defaults. Only the collection's name is hashed,
+  not its database.
+- **The heartbeat reports counts by engine name:** `taskWorkers` and `schedulerWorkers` are dicts,
+  and `abandonedThreads` is a number. `app.taskWorkers()` sums the first across live processes.
+- **`init()` does its work on task engines only:** indexes are made at construction, so scheduler
+  engines, piles and collections have no housekeeping. It logs what it flagged or wrote off.
+- **Backlog:** `TaskEngine.backlog()` gives `(due, oldest wait)`; `app.backlog()` gives it for each
+  engine, and `_checkBacklog()` warns once per engine behind.
+- **Timeouts.** A task with a timeout runs its call in a thread of its own; one without runs in the
+  worker. At the timeout:
+  1. the call's stack is taken;
+  2. every claim its thread holds, in any collection, stops being renewed (`abandonHolds()`, over
+     every `Leases` in the process, since each hold now records its thread);
+  3. `TaskStopped` is injected into the thread;
+  4. a warning is logged, naming the task, its uid, the limit and the stack;
+  5. the task is recorded as `timeout`, with the stack in its `error`.
+
+  After `TaskEngine.stopGrace` seconds (3 by default; a per-process attribute), a watcher logs that
+  the call stopped, or logs an error with the stack again and counts the thread abandoned.
+  `engine.abandoned()` and `app.abandoned()` list abandoned calls whose threads are still alive.
+- **`TaskStopped` derives from `BaseException`,** so `except Exception:` in a task does not swallow it.
+  In a pile `work()` block it passes through without writing anything: the held item's lease lapses,
+  which spends a try, as §2 says. If an abandoned call later finishes, its outcome still lands if
+  nobody has claimed the item since, because the claim check still holds. Accepted.
+- **Retiring:** `retireAfter=N` on the constructor (per process; None, the default, never retires).
+  When the Nth thread is abandoned, the app logs every abandoned call with how long it has run and
+  where it is stuck, then "no longer claiming, draining N", and calls `requestStop()`. It also sets
+  `app.retired`. `run()` returns once the workers have drained, logs that it is exiting for the
+  supervisor to restart it, and still returns whether it drained. The exit code is the caller's:
+  `sys.exit(3 if app.retired else 0 if drained else 1)`, shown in `run()`'s docstring.
+- **Left for layer 5:** the README and reference from the new shape, with an upgrade section; the
+  migration that renames `pymonque_tasks` / `pymonque_schedulers` and the old statuses and fields;
+  then replacing the old package.
+
 ## Decided, not built yet
 
 ### No task retries; piles hold work that has to happen

@@ -27,3 +27,11 @@ class VersionMismatch(Exception):
 
 class UnboundDocument(Exception):
     """A document asked to save, delete or reload itself has never been stored or fetched."""
+
+
+class TaskStopped(BaseException):
+    """Raised inside a task's call when its timeout ran out, to stop it.
+
+    A BaseException, so `except Exception:` in the task does not swallow it. It stops Python code only:
+    a call blocked in C, I/O or a sleep goes on until it returns, and is then abandoned.
+    """

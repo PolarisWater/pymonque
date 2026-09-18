@@ -4,6 +4,7 @@ Built beside the current package until it replaces it; see docs/rebuild.md.
 """
 
 from . import exceptions
+from .app import BaseApp
 from .calls import CallSpec, FuncSpec, Functions
 from .declarations import collection, pile, schedulers, task, tasks
 from .distributions import BaseDistributions, DistributionEngine
@@ -15,6 +16,7 @@ from .tasks import Task, TaskEngine, TaskFactory
 
 __all__ = [
     "AppDefaults",
+    "BaseApp",
     "BaseDistributions",
     "CallSpec",
     "CollectionEngine",

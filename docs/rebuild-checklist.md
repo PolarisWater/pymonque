@@ -14,8 +14,8 @@ nothing; **New** — no old test, decided since.
 - [x] A fresh task carries a lease equal to its deadline; claiming pushes it out [leases]
 - [x] A long task is not taken over while its lease is renewed; renewal stops when the work does [leases, tasks]
 - [x] A lapsed lease is claimable by the next worker; a live one is left alone — tasks, schedulers, items [tasks, schedulers, piles, leases]
-- [ ] A new app instance does not disturb work in flight or live leases [leases, piles]
-- [ ] Leases keep renewing while a shutdown drains [leases]
+- [x] A new app instance does not disturb work in flight or live leases [leases, piles]
+- [x] Leases keep renewing while a shutdown drains [leases]
 - [x] Indexes back the claim query — tasks, schedulers, piles [tasks, schedulers, piles]
 - [x] **Changed:** every claim gets its own `claimId` — tasks, items and held schedulers, one mechanism (B6) [claims]
 - [x] A stale holder cannot finish, fail, release or renew; the current holder can [claims]
@@ -30,20 +30,20 @@ nothing; **New** — no old test, decided since.
 - [x] A raising task is marked failed with the traceback [tasks]
 - [x] `sys.exit()` in a task or a `work()` block is a failure, not a dead worker thread [tasks, piles]
 - [x] A result the driver cannot encode is a failure and does not leave the task claimed [tasks]
-- [ ] A task whose function vanished is flagged incompatible at `init()`; a finished one is not [tasks]
+- [x] A task whose function vanished is flagged incompatible at `init()`; a finished one is not [tasks]
 - [x] **Changed:** a task whose worker died is `failed`, never rerun, with an error saying so [retries]
 - [ ] **Dropped:** task retries — retried until the last attempt, retry delay, success clears the old error, app default for retries, emitted tasks retry, crash below the limit recovered, outdated retry not run, `wait` treats a retry as unfinished [retries, wait, timestamps]
-- [ ] **New:** no `maxAttempts` / `retryDelay` on `@task` or the app; declaring them is refused
+- [x] **New:** no `maxAttempts` / `retryDelay` on `@task` or the app; declaring them is refused
 
 ### Timeouts
 
-- [ ] No time limit by default; `@task(timeout=…)` declares one, looser or tighter than `taskTimeout` [timeouts]
-- [ ] An emitted task times out by its task's limit [timeouts]
-- [ ] A timed-out task records why and warns; a raise inside a timed task is still a failure [timeouts]
-- [ ] A timeout frees the worker for the next task, and is never rerun [timeouts, retries]
-- [ ] **New:** a pile item held by a timed-out call stops being renewed, so its lease lapses
-- [ ] **New (§5.10):** a timed-out thread gets an exception injected; the log says whether it stopped, with its stack
-- [ ] **New (§5.10):** opt-in retiring: past N abandoned threads a worker stops claiming, drains, and exits, logging which tasks and where they were stuck
+- [x] No time limit by default; `@task(timeout=…)` declares one, looser or tighter than `taskTimeout` [timeouts]
+- [x] An emitted task times out by its task's limit [timeouts]
+- [x] A timed-out task records why and warns; a raise inside a timed task is still a failure [timeouts]
+- [x] A timeout frees the worker for the next task, and is never rerun [timeouts, retries]
+- [x] **New:** a pile item held by a timed-out call stops being renewed, so its lease lapses
+- [x] **New (§5.10):** a timed-out thread gets an exception injected; the log says whether it stopped, with its stack
+- [x] **New (§5.10):** opt-in retiring: past N abandoned threads a worker stops claiming, drains, and exits, logging which tasks and where they were stuck
 
 ### skipAfter
 
@@ -54,8 +54,8 @@ nothing; **New** — no old test, decided since.
 
 ## Piles
 
-- [ ] Each pile gets its own collection; piles are listed on the app; class access gives the declaration [piles]
-- [ ] The collection name can be overridden, or given as a collection object; a subclass can override a pile [piles, engines]
+- [x] Each pile gets its own collection; piles are listed on the app; class access gives the declaration [piles]
+- [x] The collection name can be overridden, or given as a collection object; a subclass can override a pile [piles, engines]
 - [x] Two piles do not share items [piles]
 - [x] `add` takes a model, a dict or kwargs; the payload is stored as plain data, defaults filled in, invalid refused [piles]
 - [x] An untyped pile takes any dict; a payload is a plain model, not a document [piles, guards]
@@ -66,7 +66,7 @@ nothing; **New** — no old test, decided since.
 - [x] An item can be finished by uid, as an operator's verdict, whatever the claim [piles, claims]
 - [x] An item never claimed cannot be finished as a claim [claims]
 - [x] `count`, `counts`, typed `find`, `purge` of one status only [piles]
-- [ ] Finished items survive a restart [piles]
+- [x] Finished items survive a restart [piles]
 - [x] A held item's lease can be renewed and reports whether there was one [piles]
 - [x] A live holder is not taken over [piles]
 - [x] An abandoned item with tries left is claimed again; out of tries it is given up at the next claim, without blocking the next item [piles]
@@ -97,7 +97,7 @@ nothing; **New** — no old test, decided since.
 - [x] An emitted task is runnable and points back at its scheduler [schedulers, models]
 - [x] Missed beats: `replay` beat by beat, `once` one run then from now, `skip` nothing then from now [schedulers]
 - [x] A missed beat warns; merely due does not, and emits whatever `missed` says [schedulers]
-- [ ] A scheduler faster than it can be served stops accumulating; `missed` applies after startup too [schedulers]
+- [x] A scheduler faster than it can be served stops accumulating; `missed` applies after startup too [schedulers]
 - [x] A scheduler whose task vanished skips its beats and stays enabled [schedulers]
 - [x] A beat reclaimed after a crash is not emitted twice [schedulers]
 - [x] A rhythm restarted mid-claim is not overwritten [schedulers]
@@ -111,10 +111,10 @@ nothing; **New** — no old test, decided since.
 
 ### Scheduler engines and subclasses
 
-- [ ] Engines are collected, each with its own collection; class access gives the declaration [engines]
-- [ ] A declaration named `scheduler` replaces the default; a subclass can override an engine [engines, app]
-- [ ] **New:** a declaration named `task` replaces the default task engine; a declaration used as a decorator raises a clear error
-- [ ] Per-engine `missed` and poll interval; extra indexes created; `init()` and workers cover every engine [engines]
+- [x] Engines are collected, each with its own collection; class access gives the declaration [engines]
+- [x] A declaration named `scheduler` replaces the default; a subclass can override an engine [engines, app]
+- [x] **New:** a declaration named `task` replaces the default task engine; a declaration used as a decorator raises a clear error
+- [x] Per-engine `missed` and poll interval; extra indexes created; `init()` and workers cover every engine [engines]
 - [x] A scheduler emits its stored work unchanged [engines]
 - [x] **Changed:** a scheduler's context reaches the emitted task as task fields via `taskFields()`, and the task's `runWork()` stamps it; the task runs; the stored work stays uncontextualised [engines]
 - [ ] **Dropped:** a scheduler subclass stamping context via `emitWork()` [engines]
@@ -125,7 +125,7 @@ nothing; **New** — no old test, decided since.
 - [x] `update` changes work or context, keeps or restarts the rhythm, toggles enabled, validates the merge, writes nothing if invalid, `None` if missing [engines]
 - [x] **Changed:** `ensure` takes context fields, stays idempotent, can change context, validates through `taskFields()` and the target task's `runWork()` [engines]
 - [x] `delete` and `deleteMany` [engines]
-- [ ] **Changed:** schedulers share the default task engine unless `emitsInto=<declaration>` names another [engines]
+- [x] **Changed:** schedulers share the default task engine unless `emitsInto=<declaration>` names another [engines]
 - [x] **New:** `emitsInto` must reference a declaration above it on the same app class
 
 ## Task engines
@@ -133,65 +133,65 @@ nothing; **New** — no old test, decided since.
 - [x] `schedule` stores a pending task, validates first, defaults to now, stamps the default or a named factory [tasks]
 - [x] `scheduleFromDistribution` pushes the deadline out and validates the distribution [tasks]
 - [x] `work` returns the task it ran; a queue drains by looping on it [tasks]
-- [ ] An instance task runs with its app; a classmethod can be a task; a subclass's plain method unregisters it [tasks]
+- [x] An instance task runs with its app; a classmethod can be a task; a subclass's plain method unregisters it [tasks]
 - [x] A task gets models and coerced values, not stored data [tasks]
 - [x] `update` validates before writing [tasks]
 - [x] A task can be given a model [collections]
 - [x] Cancel: a waiting or abandoned task can be; running or finished cannot; unknown uid reports nothing; `cancelMany` filters and leaves running work alone; a cancelled task never runs [cancel]
 - [x] `wait` returns the finished task, takes a uid, works from another process, counts a failure as finished, times out, errors on an unknown task [wait]
-- [ ] **New:** several task engines, each with its own collection; any engine runs any task
+- [x] **New:** several task engines, each with its own collection; any engine runs any task
 - [x] **New:** a `Task` subclass on a declaration adds fields given to `schedule(…)`; `Scheduler.taskFields()` supplies them
 - [x] **New:** `Task.runWork()` is the only place context is stamped; `schedule()` validates it; a plain `Task` runs `work` unchanged
 
 ## Processes and versions
 
-- [ ] Engines are built, share the app's database and collections; default collection names [app]
-- [ ] Two apps on one database share state; separate databases stay separate [app]
-- [ ] An app with no tasks or piles starts; `startWorkers` defaults to none [app]
-- [ ] Task workers drain tasks and never run one twice; a scheduler worker keeps emitting [app]
-- [ ] A worker survives and logs a failing iteration [app]
-- [ ] A backlog drains without waiting per task; an idle worker waits; work reports whether it did anything [version]
-- [ ] Poll intervals and defaults reach the engines [app]
-- [ ] **Changed:** worker counts — an int is that many threads on every engine of the kind, a dict sets engines by name [app]
-- [ ] **Changed:** the distribution registry is a class attribute, and reaches the engines [app]
+- [x] Engines are built, share the app's database and collections; default collection names [app]
+- [x] Two apps on one database share state; separate databases stay separate [app]
+- [x] An app with no tasks or piles starts; `startWorkers` defaults to none [app]
+- [x] Task workers drain tasks and never run one twice; a scheduler worker keeps emitting [app]
+- [x] A worker survives and logs a failing iteration [app]
+- [x] A backlog drains without waiting per task; an idle worker waits; work reports whether it did anything [version]
+- [x] Poll intervals and defaults reach the engines [app]
+- [x] **Changed:** worker counts — an int is that many threads on every engine of the kind, a dict sets engines by name [app]
+- [x] **Changed:** the distribution registry is a class attribute, and reaches the engines [app]
 
 ### Fingerprint and registry
 
-- [ ] Stable; changes with a signature, an added task, a distribution registry, a declared limit, an app default, an item max tries, `missed` [version, limits]
-- [ ] A body change alone does not change it; a default a task overrides does not matter; an address in a repr does not split it [version, limits]
-- [ ] Two apps of one class agree; a default is not a constructor argument [version]
-- [ ] **New:** changes with lease length, each declared model's schema, collection name and key (P1, P4)
-- [ ] A matching worker may join; a mismatched one is refused, naming both versions [version]
-- [ ] Constructing an app is never refused; a stale worker does not block a deploy; enforcement can be turned off [version]
-- [ ] A registered worker reports itself; the heartbeat keeps it live [version]
-- [ ] `init()` is refused beside a different live version, cannot flag its tasks, allowed alone or beside the same version, skipped when enforcement is off [version]
+- [x] Stable; changes with a signature, an added task, a distribution registry, a declared limit, an app default, an item max tries, `missed` [version, limits]
+- [x] A body change alone does not change it; a default a task overrides does not matter; an address in a repr does not split it [version, limits]
+- [x] Two apps of one class agree; a default is not a constructor argument [version]
+- [x] **New:** changes with lease length, each declared model's schema, collection name and key (P1, P4)
+- [x] A matching worker may join; a mismatched one is refused, naming both versions [version]
+- [x] Constructing an app is never refused; a stale worker does not block a deploy; enforcement can be turned off [version]
+- [x] A registered worker reports itself; the heartbeat keeps it live [version]
+- [x] `init()` is refused beside a different live version, cannot flag its tasks, allowed alone or beside the same version, skipped when enforcement is off [version]
 
 ### Backlog
 
-- [ ] Empty queue no backlog; backlog is due and unclaimed, not held, not future [backlog]
-- [ ] No warning while young; warns when no one runs task workers or all are busy; silent once drained [backlog]
-- [ ] The count spans processes; warnings can be turned off [backlog]
-- [ ] **New:** backlog spans every task engine
+- [x] Empty queue no backlog; backlog is due and unclaimed, not held, not future [backlog]
+- [x] No warning while young; warns when no one runs task workers or all are busy; silent once drained [backlog]
+- [x] The count spans processes; warnings can be turned off [backlog]
+- [x] **New:** backlog spans every task engine
 
 ### Shutdown and lifecycle
 
-- [ ] `stopWorkers` stops the loops, not delayed by the poll interval [shutdown]
-- [ ] Work in flight is finished; nothing new is claimed once stopping; a timeout reports what it could not wait for [shutdown]
-- [ ] `requestStop` does not block; workers can start again after a stop [shutdown, lifecycle]
-- [ ] A clean stop frees the version slot; a stopped process does not block the next version [shutdown, lifecycle]
-- [ ] Starting twice leaves one heartbeat; stopping takes the monitor threads with it [lifecycle]
-- [ ] SIGTERM starts a graceful shutdown; a second signal exits; opt-in; previous handlers restored [shutdown]
-- [ ] `run` blocks until a signal, then drains; an engine reports its own state [shutdown]
+- [x] `stopWorkers` stops the loops, not delayed by the poll interval [shutdown]
+- [x] Work in flight is finished; nothing new is claimed once stopping; a timeout reports what it could not wait for [shutdown]
+- [x] `requestStop` does not block; workers can start again after a stop [shutdown, lifecycle]
+- [x] A clean stop frees the version slot; a stopped process does not block the next version [shutdown, lifecycle]
+- [x] Starting twice leaves one heartbeat; stopping takes the monitor threads with it [lifecycle]
+- [x] SIGTERM starts a graceful shutdown; a second signal exits; opt-in; previous handlers restored [shutdown]
+- [x] `run` blocks until a signal, then drains; an engine reports its own state [shutdown]
 
 ## Declarations
 
-- [ ] A bad setting fails where it is written and names itself; a bad app default fails at class definition [declarations, limits]
+- [x] A bad setting fails where it is written and names itself; a bad app default fails at class definition [declarations, limits]
 - [x] Settings coerce like pydantic fields [declarations]
 - [x] Left-out settings take the app's defaults; given ones win; `None` only means no limit [declarations, limits]
 - [x] An existing collection object is accepted [declarations]
 - [x] A bare task takes the defaults; a declared limit wins, the rest default; both decorator forms work [limits]
 - [x] A task runs under its function's limits; declared once; calls, stored tasks and schedulers carry no limits [limits]
-- [ ] A declaration or task cannot shadow the app; the reserved names cover every attribute `__init__` sets [app]
+- [x] A declaration or task cannot shadow the app; the reserved names cover every attribute `__init__` sets [app]
 - [x] **Changed:** one declaration shape, `kind(Model, collection=, extraIndexes=, …)` (N1)
 - [x] **Changed:** declarations `tasks` / `schedulers` / `pile` / `collection` / `@task`; defaults `task*`, `pile*`, `scheduler*` (N3)
 - [x] **Changed:** collections `pymonque_task_<name>`, `pymonque_scheduler_<name>`, `pymonque_pile_<name>`; defaults `pymonque_task` and `pymonque_scheduler`, taken over by a declaration of that name (N2)
@@ -222,7 +222,7 @@ nothing; **New** — no old test, decided since.
 
 - [x] Collections are collected, default to their attribute name, can name an existing collection; class access gives the declaration; a subclass overrides [collections]
 - [x] The key is indexed uniquely; a custom key is used throughout; a duplicate is refused [collections]
-- [ ] A task can reach a collection [collections]
+- [x] A task can reach a collection [collections]
 - [x] `create`, `insert`, `insertMany` (nothing is a no-op), `save` replaces or creates, `update` merges without reading [collections]
 - [x] `delete`, `deleteMany`, `get` misses cleanly, `findOne`, `find` filters/sorts/limits, `count` and `exists` [collections]
 - [x] Documents come back typed; a field can be set back to `None`; a saved document stores its `None`s [collections]
@@ -244,5 +244,5 @@ nothing; **New** — no old test, decided since.
 
 ## Reprs
 
-- [ ] CallSpec, FuncSpec, task, factory, scheduler, item, pile engine and pile declaration stay readable [repr]
-- [ ] **Changed:** one repr pattern on every collection engine; the default task engine named after its attribute (N7)
+- [x] CallSpec, FuncSpec, task, factory, scheduler, item, pile engine and pile declaration stay readable [repr]
+- [x] **Changed:** one repr pattern on every collection engine; the default task engine named after its attribute (N7)

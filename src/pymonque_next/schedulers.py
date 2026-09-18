@@ -14,7 +14,7 @@ from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError
 
 from .calls import CallSpec
-from .claims import claimNext, writeClaimed
+from .claims import WorkerLoop, claimNext, writeClaimed
 from .documents import CollectionEngine, UtcDatetime, utc_now
 from .settings import Missed, SchedulerEngineSettings
 from .tasks import Task, TaskEngine, TaskFactory
@@ -112,7 +112,8 @@ class SchedulerEngine(CollectionEngine[S]):
             name:           str,
             settings:       SchedulerEngineSettings,
             tasks:          TaskEngine,
-            extraIndexes:   Sequence[IndexModel] | None = None
+            extraIndexes:   Sequence[IndexModel] | None = None,
+            pollInterval:   float = 1.0
         ):
 
         if not (isinstance(model, type) and issubclass(model, Scheduler)):
@@ -123,6 +124,8 @@ class SchedulerEngine(CollectionEngine[S]):
         self.distributions = tasks.distributions    # the app has one registry, which its task engines carry
 
         super().__init__(collection, model, name=name, extraIndexes=extraIndexes)
+
+        self.workers = WorkerLoop(self.work, name=f"scheduler-{name}", pollInterval=pollInterval)
 
     @property
     def missed(self) -> Missed:
