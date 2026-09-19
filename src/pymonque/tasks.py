@@ -10,7 +10,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Literal, Mapping, Self, Sequence, TypeVar
+from typing import Any, Callable, ClassVar, Literal, Mapping, Self, Sequence, TypeVar
 
 import bson
 from pydantic import Field, model_validator
@@ -48,6 +48,11 @@ class Task(Document):
     Subclass it to store fields of your own on every task of an engine — context to query and index
     by, such as an account. The fields are data only; `runWork()` is where they reach the call.
     """
+
+    # the task's identity, state, claim and outcome are the engine's to write
+    _kept: ClassVar[frozenset[str]] = frozenset({
+        "uid", "status", "claimId", "leaseUntil", "claimedAt", "finishedAt", "executionTime", "result", "error",
+    })
 
     status:         TaskStatus          = "pending"
     work:           CallSpec
@@ -278,7 +283,13 @@ class TaskEngine(CollectionEngine[T]):
 
         return document
 
+    _keptHints: ClassVar[dict[str, str]] = {
+        "status": "status is not set by hand; a task's status changes by running it, or with cancel()",
+    }
+
     def _refuseFields(self, fields: Mapping[str, Any]):
+        self._refuseKept(fields)
+
         own = {
             label
             for name, field in self.model.model_fields.items() if name not in Task.model_fields

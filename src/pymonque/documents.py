@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Generic, Iterable, Literal, Mapping, Self, Sequence, TypeVar
+from typing import Annotated, Any, ClassVar, Generic, Iterable, Literal, Mapping, Self, Sequence, TypeVar
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, PrivateAttr
 from pymongo import IndexModel
@@ -130,6 +130,11 @@ class Document(BaseModel):
     """
 
     model_config = MONGO_CONFIG
+
+    # the fields the engine storing this keeps for itself: never given, updated or saved through the
+    # default API, only written by the engine's own work. None for a plain document; a task, a
+    # scheduler and a pile item name theirs, and a subclass inherits them
+    _kept: ClassVar[frozenset[str]] = frozenset()
 
     uid: str = Field(default_factory=uuid4str)
 
@@ -259,6 +264,45 @@ class CollectionEngine(Generic[M]):
     def exists(self, key: Any) -> bool:
         return self.collection.count_documents({self.keyField: key}, limit=1) > 0
 
+    # --- the fields the engine keeps ---
+
+    # why a kept field is refused, where a better word than "the engine keeps it" helps
+    _keptHints: ClassVar[dict[str, str]] = {}
+
+    def _refuseKept(self, fields: Mapping[str, Any]):
+        """Refuse a field the model says the engine keeps, by its name or its alias."""
+
+        labels = {
+            label: name
+            for name in self.model._kept
+            for label in (name, getattr(self.model.model_fields.get(name), "alias", None)) if label
+        }
+
+        for given in fields:
+            name = labels.get(given)
+
+            if name is not None:
+                raise TypeError(self._keptHints.get(name, f"{name} is not set through {self.name}'s API; the engine keeps it"))
+
+    def _keepStored(self, document: M, stored: M) -> M:
+        """Put the stored values of the kept fields back on a document about to be saved over them."""
+
+        for name in self.model._kept:
+            setattr(document, name, getattr(stored, name))
+
+        return document
+
+    def _keepFresh(self, document: M) -> M:
+        """Give a document saved for the first time the kept fields a new one starts with — its key
+        aside — whatever this copy carries, as if it had been built with none of them."""
+
+        fresh = self.model.model_validate(document.model_dump(exclude=self.model._kept - {self.key}))
+
+        for name in self.model._kept - {self.key}:
+            setattr(document, name, getattr(fresh, name))
+
+        return document
+
     # --- writing ---
 
     def _prepare(self, document: M) -> M:
@@ -275,12 +319,17 @@ class CollectionEngine(Generic[M]):
         return getattr(document, self.key)
 
     def build(self, **fields: Any) -> M:
-        """A document of this engine's model, bound to it but not stored."""
+        """A document of this engine's model, bound to it but not stored. The fields the engine keeps
+        are refused."""
+
+        self._refuseKept(fields)
 
         return self.model(**fields)._bind(self, stored=False)
 
     def create(self, **fields: Any) -> M:
-        """Build a document, store it, and hand it back bound."""
+        """Build a document, store it, and hand it back bound. The fields the engine keeps are refused."""
+
+        self._refuseKept(fields)
 
         return self.insert(self.model(**fields))
 
@@ -301,8 +350,18 @@ class CollectionEngine(Generic[M]):
         """Store the document as it is now, creating it if it is not there yet.
 
         A document that came from here is written over the row it came from, so changing its key
-        renames it rather than leaving a copy behind.
+        renames it rather than leaving a copy behind. Over a stored document, the fields the engine
+        keeps stay as stored, whatever this copy carries: a copy read before a worker finished cannot
+        put the work back, or wipe the claim holding it.
         """
+
+        if self.model._kept:
+            stored = self.collection.find_one({self.keyField: self._rowKey(document)})
+
+            if stored is not None:
+                self._keepStored(document, self._load(stored))
+            else:
+                self._keepFresh(document)
 
         self.collection.replace_one(
             {self.keyField: self._rowKey(document)},
@@ -325,9 +384,10 @@ class CollectionEngine(Generic[M]):
 
         The fields are validated against the model first, so nothing invalid is written, and only
         what changed is written: the fields given, and anything kept in step with them. Changing the
-        key renames the document.
+        key renames the document. The fields the engine keeps are refused.
         """
 
+        self._refuseKept(fields)
         document = self.get(key)
 
         if document is None:

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Literal, Mapping, Self, Sequence, TypeVar
+from typing import Any, ClassVar, Literal, Mapping, Self, Sequence, TypeVar
 
 from pydantic import model_validator
 from pymongo import IndexModel
@@ -54,6 +54,9 @@ class Scheduler(TaskFactory):
     your own on every scheduler of an engine; `taskFields()` hands them to the tasks it emits.
     """
 
+    # its identity and claim are the engine's; whether it emits is set with enabled=
+    _kept: ClassVar[frozenset[str]] = frozenset({"uid", "status", "claimId", "leaseUntil"})
+
     name:           str                 = "Scheduler"
     status:         SchedulerStatus     = "enabled"
     work:           CallSpec            # emitted unchanged
@@ -91,10 +94,6 @@ class Scheduler(TaskFactory):
 
 
 S = TypeVar("S", bound=Scheduler)
-
-# what the engine keeps for itself, refused by name where a scheduler's fields are given
-KEPT = frozenset({"uid", "claimId", "leaseUntil", "status"})
-
 
 class SchedulerEngine(CollectionEngine[S]):
     """Recurring schedulers in one collection, each emitting a task into one task engine on its rhythm.
@@ -148,24 +147,22 @@ class SchedulerEngine(CollectionEngine[S]):
 
         return document
 
-    def save(self, document: S) -> S:
-        """Store a whole scheduler, creating or replacing it.
+    _keptHints: ClassVar[dict[str, str]] = {
+        "status": "status is not given to a scheduler; enable or disable it with enabled=",
+    }
 
-        The claim is the engine's, whatever the document carries: a stored scheduler whose deadline is
-        unchanged keeps the claim and lease holding it, so its holder's deadline write still lands; a
-        moved deadline releases the claim, as update() and ensure() do.
-        """
+    def _keepStored(self, document: S, stored: S) -> S:
+        """A saved scheduler keeps its stored claim and lease — so its holder's deadline write still lands
+        — unless its deadline moved: that releases the claim, as update() and ensure() do, and the lease
+        follows the new deadline."""
 
-        stored = self.collection.find_one(
-            {self.keyField: self._rowKey(document)}, {"_id": 0, "deadline": 1, "claimId": 1, "leaseUntil": 1}
-        )
+        deadline = document.deadline
+        super()._keepStored(document, stored)
 
-        if stored is not None and stored.get("claimId") is not None and _sameMoment(stored["deadline"], document.deadline):
-            document.claimId, document.leaseUntil = stored["claimId"], stored["leaseUntil"]
-        else:
+        if not _sameMoment(stored.deadline, deadline):
             document.claimId = None
 
-        return super().save(document)
+        return document
 
     # --- checking ---
 
@@ -191,6 +188,8 @@ class SchedulerEngine(CollectionEngine[S]):
     # --- adding ---
 
     def _refuseFields(self, fields: Mapping[str, Any]):
+        self._refuseKept(fields)
+
         known = {
             label
             for name, field in self.model.model_fields.items()
@@ -198,12 +197,6 @@ class SchedulerEngine(CollectionEngine[S]):
         }
 
         for name in fields:
-            if name == "status":
-                raise TypeError("status is not given to a scheduler; enable or disable it with enabled=")
-
-            if name in KEPT:
-                raise TypeError(f"{name} is not given to a scheduler; the engine keeps it")
-
             if name not in known:
                 raise TypeError(f"{self.model.__name__} has no field {name}")
 

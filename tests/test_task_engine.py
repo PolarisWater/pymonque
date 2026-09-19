@@ -131,7 +131,7 @@ def test_a_call_carries_no_limits(engine, limit):
 
 @pytest.mark.parametrize("field", ["uid", "status", "claimId", "result"])
 def test_schedule_refuses_a_field_the_engine_keeps(engine, field):
-    with pytest.raises(TypeError, match="the engine keeps it"):
+    with pytest.raises(TypeError, match="the engine keeps it|not set by hand"):
         engine.schedule(engine("greet", name="Ada"), **{field: "x"})
 
 
@@ -310,11 +310,12 @@ def test_the_engine_refuses_a_model_that_is_not_a_task(taskEngine):
 
 def test_update_validates_before_writing(engine):
     task = engine.schedule(engine("greet", name="Ada"))
+    before = engine.collection.find_one({"uid": task.uid})
 
     with pytest.raises(ValidationError):
-        engine.update(task.uid, status="banana")
+        engine.update(task.uid, deadline="banana")
 
-    assert engine.collection.find_one({"uid": task.uid})["status"] == "pending"
+    assert engine.collection.find_one({"uid": task.uid}) == before
 
 
 def test_moving_a_waiting_tasks_deadline_moves_its_lease(engine):

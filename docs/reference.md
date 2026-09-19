@@ -234,6 +234,29 @@ A bound document remembers the key it was stored under, so **changing the key re
 than leaving a copy behind; `delete()` and `reload()` use that key too, whatever the field now holds
 in memory. `storedKey` is the key it was last written under, `None` until it is stored.
 
+### Fields the engine keeps
+
+A task, a scheduler and a pile item carry fields their engine writes and nobody else should: their
+identity, state, claim and outcome. Each model names them in `_kept`, and a subclass inherits them:
+
+| Model | Kept by the engine |
+|---|---|
+| `Task` | `uid` `status` `claimId` `leaseUntil` `claimedAt` `finishedAt` `executionTime` `result` `error` |
+| `Item` | `uid` `status` `claimId` `leaseUntil` `claimedAt` `finishedAt` `attempts` `result` `error` |
+| `Scheduler` | `uid` `status` `claimId` `leaseUntil` |
+| `Document` | none: a plain collection's fields are all yours, its key included |
+
+The default API never writes them. `update()`, `build()` and `create()` refuse them by name — so do
+`schedule()` and a scheduler's `add()`, `ensure()` and `update()` — saying what changes them instead:
+`cancel()` for a task, `done()` / `fail()` / `release()` / `cancel()` for an item, `enabled=` for a
+scheduler. `save()` leaves them as stored, whatever the copy in hand carries, so **a copy read before
+a worker finished cannot put the work back**, rerun a task, or wipe the claim of the worker holding it;
+the rest of the document is written as given. A document saved for the first time starts with the
+kept fields a new one would have, its key aside.
+
+Moving a deadline is yours: on a waiting task or a scheduler it moves the lease with it, and on a held
+scheduler it releases the claim.
+
 ## Tasks
 
 ```python

@@ -7,7 +7,7 @@ import logging
 import traceback
 from contextlib import contextmanager
 from datetime import timedelta
-from typing import Annotated, Any, Generic, Iterable, Iterator, Mapping, NoReturn, Self, Sequence, TypeVar
+from typing import Annotated, Any, ClassVar, Generic, Iterable, Iterator, Mapping, NoReturn, Self, Sequence, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 from pymongo import IndexModel
@@ -29,6 +29,11 @@ class Item(Document, Generic[P]):
     Items have tries because the task holding one can die before it reports back: a claim uses a
     try, and a released item gets its try back.
     """
+
+    # the item's identity, state, claim, tries and outcome are the engine's to write
+    _kept: ClassVar[frozenset[str]] = frozenset({
+        "uid", "status", "claimId", "leaseUntil", "claimedAt", "finishedAt", "attempts", "result", "error",
+    })
 
     status:         WorkStatus          = "pending"
     data:           P
@@ -203,6 +208,11 @@ class PileEngine(CollectionEngine[Item]):
         )
 
         self.leases = Leases(self.collection, settings.leaseSeconds, name=f"pile-{name}")
+
+    _keptHints: ClassVar[dict[str, str]] = {
+        "status": "status is not set by hand; an item's status changes with done(), fail(), release() or cancel()",
+        "attempts": "attempts is not set by hand; a claim uses a try, and release() gives it back",
+    }
 
     @property
     def maxAttempts(self) -> int:

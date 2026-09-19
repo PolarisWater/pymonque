@@ -329,6 +329,14 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   key closes it. Piles only: a task that loses its claim is written off, never run twice. No cheap
   `w.held` flag from the renewal thread — it would lag by up to lease/3 just when a frozen process
   thaws, and `confirm()` covers what it would.
+- **Kept fields, one rule for every kind.** Each stored model names the fields its engine keeps
+  (`_kept`: identity, state, claim, outcome); `CollectionEngine` refuses them in `update()`, `build()`
+  and `create()`, and `save()` leaves them as stored — or, for a document saved the first time, as a
+  new one starts. Found as a bug: `save()` of a stale task or item copy put finished work back (a task
+  ran twice, an item was claimed again) and `update(status=…)` was accepted. It replaces the
+  scheduler's own `KEPT` set and `save()` override (now `_keepStored()`, releasing the claim when the
+  deadline moved) and the task's refusal of its own fields. The engines write kept fields through
+  their own paths — claims, outcome writes, cancels — which never go through `save()` or `update()`.
 - **Documented, not changed:** a frozen holder is indistinguishable from a dead one, so a pile item
   can be worked twice (use its `uid` as an idempotency key); a task whose worker died shows `running`
   until a worker of its engine claims next.
