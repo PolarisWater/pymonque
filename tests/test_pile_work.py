@@ -320,3 +320,59 @@ def test_a_task_can_drain_the_pile_and_succeeds_on_an_empty_one(outbox, taskEngi
 
     assert sorted(results) == [("done", "empty"), ("done", "sent to a@b.c")]
     assert outbox.count(status="done") == 1
+
+
+# --- w.confirm(): still holding it, just before a side effect ---
+
+def test_confirm_goes_on_while_the_claim_holds_the_item_and_renews_its_lease(outbox):
+    item = outbox.add(to="a@b.c")
+    ran = []
+
+    with outbox.work() as w:
+        outbox.collection.update_one({"uid": item.uid}, {"$set": {"leaseUntil": utc_now() + timedelta(seconds=1)}})
+        w.confirm()
+        ran.append(outbox.get(item.uid).leaseUntil)
+
+    assert ran and ran[0] > utc_now() + timedelta(seconds=60)     # a whole lease again
+    assert outbox.get(item.uid).status == "done"
+
+
+@pytest.mark.parametrize("lost", ["taken over", "cancelled"])
+def test_confirm_ends_the_block_and_writes_nothing_once_the_claim_is_lost(outbox, lost, caplog):
+    item = outbox.add(to="a@b.c")
+    ran = []
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        with outbox.work() as w:
+            # meanwhile, while this holder was frozen:
+            if lost == "taken over":
+                outbox.collection.update_one({"uid": item.uid}, {"$set": {"claimId": "another-worker"}})
+            else:
+                outbox.collection.update_one({"uid": item.uid}, {"$set": {"status": "canceled", "claimId": None}})
+
+            w.confirm()
+            ran.append("the side effect")
+
+        ran.append("after the block")
+
+    stored = outbox.get(item.uid)
+
+    assert ran == ["after the block"]
+    assert (stored.status, stored.claimId) == (("running", "another-worker") if lost == "taken over" else ("canceled", None))
+    assert any("w.confirm() found its claim lost" in r.getMessage() for r in caplog.records)
+
+
+def test_a_swallowed_confirm_writes_nothing_more(outbox, caplog):
+    item = outbox.add(to="a@b.c")
+
+    with caplog.at_level(logging.WARNING, logger="pymonque"):
+        with outbox.work() as w:
+            outbox.collection.update_one({"uid": item.uid}, {"$set": {"claimId": "another-worker"}})
+
+            try:
+                w.confirm()
+            except BaseException:       # the caveat: swallows the end of the block
+                pass
+
+    assert outbox.get(item.uid).claimId == "another-worker"
+    assert any("kept running after w.confirm()" in r.getMessage() for r in caplog.records)

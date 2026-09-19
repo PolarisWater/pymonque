@@ -625,6 +625,7 @@ for as long as the block runs. It yields a `Work` (`w.data`, `w.uid`, `w.attempt
 | `w.fail(error=None)` | `failed` — final — and the block ends there |
 | `w.release(delay=None)` | back on the pile with its try returned — claimable at once, or after `delay` — and the block ends there |
 | the claim was lost meanwhile | nothing is written, and it is logged |
+| `w.confirm()` finds the claim lost | nothing is written, it is logged, and the block ends there |
 
 **What the block does for you:** the lease is renewed in the background for as long as it runs;
 every outcome is written only while this claim still holds the item, so a holder whose lease lapsed
@@ -636,6 +637,25 @@ spent — nobody said its work did not happen.
 `w.done()`, `w.fail()` and `w.release()` **write the outcome first**, then leave the block by raising a
 private exception derived from `BaseException`, which `work()` catches, so the code after the `with`
 carries on and nothing outside sees an exception. `except Exception:` in the block does not catch it.
+
+**`w.confirm()` — still mine?** A holder frozen for longer than its lease — a paused VM, a suspended
+laptop, the database out of reach — cannot tell that another worker has taken its item over. Call
+`w.confirm()` just before a side effect that must not happen twice: it asks the database now, and if
+the claim still holds the item it renews the lease and the block goes on; if not — taken over,
+cancelled, given up — the block ends there and nothing is written.
+
+```python
+with self.outbox.work() as w:
+    if w is None:
+        return
+    body = render(w.data)           # slow, safe to redo
+    w.confirm()                     # still mine? if not, the block ends here
+    send(w.data.to, body, idempotencyKey=w.uid)
+```
+
+It narrows the window to the moment between the call and the side effect; a freeze in exactly that
+moment still does it twice. Only the receiving system can close it, by refusing a duplicate — `w.uid`
+is the key to give it.
 
 > **Caveat.** Something that swallows `BaseException` inside the block — a bare `except:`, `except
 > BaseException:`, `contextlib.suppress(BaseException)`, or `return` / `break` / `continue` in a
@@ -948,7 +968,8 @@ Deliberate trade-offs and edges not handled, so none comes as a surprise:
   long GC pause — for longer than its lease can have its work taken over while its own run carries
   on.** A lease cannot tell a frozen holder from a dead one. Only the current claim's outcome is
   recorded, and the other is logged. For a task that means it is written off as `failed` while it
-  still runs; for a pile item, that it is **worked twice**. Keep such work idempotent: an item's
+  still runs; for a pile item, that it is **worked twice**. `w.confirm()` just before the side effect
+  narrows this to the moment between the two; to close it, keep such work idempotent — an item's
   `uid` is a natural idempotency key to give the system it writes to.
 - **A task whose worker died stays `running` until a worker of its engine claims next.** Only a claim
   writes it off, so with no workers on that engine, or all of them busy, it shows `running` long after

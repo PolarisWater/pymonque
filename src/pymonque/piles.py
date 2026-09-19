@@ -130,6 +130,36 @@ class Work:
 
         self._end("release", delay=delay)
 
+    def confirm(self):
+        """Make sure this block still holds its item, just before a side effect that must not happen twice.
+
+        A holder that was frozen — a paused VM, a suspended laptop, the database out of reach — for
+        longer than its lease cannot tell, and another worker may have taken the item meanwhile. This
+        asks the database now: if the claim still holds the item, its lease is renewed and the block
+        goes on; if not — taken over, cancelled, given up — the block ends here, nothing is written,
+        and it is logged.
+
+            with app.outbox.work() as w:
+                body = render(w.data)       # slow, safe to redo
+                w.confirm()                 # still mine? if not, the block ends here
+                send(w.data.to, body)       # the side effect
+
+        It narrows the window to the moment between this call and the side effect; only the receiving
+        system can close it, by refusing a duplicate — give it `w.uid` as an idempotency key.
+        """
+
+        if self.pile.renewLease(self.item):
+            return
+
+        logger.warning(
+            "%r: w.confirm() found its claim lost — taken over when its lease lapsed, cancelled, or given "
+            "up on; the block ends here and nothing is written", self.item
+        )
+
+        self.ended = "confirm"
+
+        raise _Ended(self.item.claimId)
+
     def _end(self, outcome: str, **fields: Any) -> NoReturn:
         # written first, then the block is left: an outcome recorded is one nothing can take back
         if not getattr(self.pile, outcome)(self.item, **fields):
@@ -371,7 +401,7 @@ class PileEngine(CollectionEngine[Item]):
 
         if working.ended is not None:
             # a bare `except:`, or a return in a finally, swallowed the end of the block; the outcome
-            # stands, and what ran after it is past undoing
+            # stands (or, after w.confirm(), belongs to another claim), and what ran after it is past undoing
             logger.warning(
                 "%r kept running after w.%s(); its outcome stands and nothing more was written",
                 working.item, working.ended

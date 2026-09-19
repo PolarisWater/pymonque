@@ -322,6 +322,13 @@ and timeouts in `tasks.py`. Small decisions made along the way:
   taken and handed back by every claim. The try is still returned. No delay keeps the old behaviour.
   No pile-wide default delay: that would need a setting, an app default and a fingerprint entry, for
   what one call-site argument already covers.
+- **`w.confirm()`:** checks, just before a side effect, that the block's claim still holds its item —
+  by renewing its lease, so the check is one write and a live claim comes out of it with a whole
+  lease. Lost, the block ends with nothing written, as an early end does. It narrows the double-work
+  window of a frozen holder to the moment between the call and the side effect; only an idempotency
+  key closes it. Piles only: a task that loses its claim is written off, never run twice. No cheap
+  `w.held` flag from the renewal thread — it would lag by up to lease/3 just when a frozen process
+  thaws, and `confirm()` covers what it would.
 - **Documented, not changed:** a frozen holder is indistinguishable from a dead one, so a pile item
   can be worked twice (use its `uid` as an idempotency key); a task whose worker died shows `running`
   until a worker of its engine claims next.
