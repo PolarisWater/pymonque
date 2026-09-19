@@ -453,6 +453,21 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
   stored in that engine, whichever function it names.
 - **Decided:** extra fields are data only and do not steer claiming; a priority order can come later.
 
+### After the lease review
+
+- **Work collections are written by majority and read from the primary** (`claims.durable()`), on
+  every task engine, scheduler engine, pile and the worker registry, whatever the app's database was
+  given: a claim a primary alone acknowledged is lost if it fails over, and two workers then hold the
+  same work. Plain collections keep the options they were given: your data, your choice.
+- **Cleanup is a task, not a TTL.** Finished work stays, as the history of what ran — that is what
+  makes a separate task history unnecessary — until `cleanupFinished(days=30)`, a task on `BaseApp`,
+  deletes what ended longer ago than that, on every task engine and pile, with gone workers' records.
+  It runs on a scheduler like any task. It declares its own limits (none), so the app's `taskTimeout`
+  does not apply to it. Engines gained `purge(olderThan, statuses=…)`; a pile's `purge()` took
+  `olderThan` and several statuses; both refuse unfinished work. Chosen over a TTL index because the
+  age is then a decision made in code at run time, one place for every kind, and visible in the
+  task history.
+
 ## Possible additions
 
 ### Kept fields on your own models

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 from pymongo import IndexModel
 from pymongo.collection import Collection
 
-from .claims import Leases, cancelled, claimNext, durable, notStarted
+from .claims import Leases, ageOf, cancelled, claimNext, durable, endedBefore, notStarted
 from .documents import CollectionEngine, Document, UtcDatetime, WorkStatus, utc_now
 from .settings import PileSettings
 
@@ -21,6 +21,8 @@ from .settings import PileSettings
 logger = logging.getLogger("pymonque")
 
 P = TypeVar("P")
+
+FINISHED_ITEM_STATUSES = frozenset({"done", "failed", "canceled"})
 
 
 class Item(Document, Generic[P]):
@@ -443,7 +445,19 @@ class PileEngine(CollectionEngine[Item]):
     def counts(self) -> dict[str, int]:
         return {status: self.count(status=status) for status in ("pending", "running", "done", "failed", "canceled")}
 
-    def purge(self, status: WorkStatus = "done") -> int:
-        """Delete every item of one status."""
+    def purge(self, status: WorkStatus | Iterable[WorkStatus] = "done", olderThan: float | timedelta | None = None) -> int:
+        """Delete finished items of a status, or of several — all of them, or with `olderThan` (seconds,
+        or a timedelta) only those that ended longer ago than that. Returns how many. Only finished
+        items: a waiting or held one is never purged.
+        """
 
-        return self.deleteMany({"status": status})
+        statuses = {status} if isinstance(status, str) else set(status)
+        unfinished = statuses - FINISHED_ITEM_STATUSES
+
+        if unfinished:
+            raise ValueError(f"only finished items are purged, not {', '.join(sorted(unfinished))}")
+
+        if olderThan is not None:
+            return self.deleteMany(endedBefore(statuses, utc_now() - ageOf(olderThan)))
+
+        return self.deleteMany({"status": {"$in": sorted(statuses)}})

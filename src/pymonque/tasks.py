@@ -10,7 +10,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, ClassVar, Literal, Mapping, Self, Sequence, TypeVar
+from typing import Any, Callable, ClassVar, Iterable, Literal, Mapping, Self, Sequence, TypeVar
 
 import bson
 from pydantic import Field, model_validator
@@ -18,7 +18,7 @@ from pymongo import IndexModel
 from pymongo.collection import Collection
 
 from .calls import CallSpec, Functions
-from .claims import Leases, WorkerLoop, abandonHolds, cancelled, claimNext, durable, notStarted, writeClaimed
+from .claims import Leases, WorkerLoop, abandonHolds, ageOf, cancelled, claimNext, durable, endedBefore, notStarted, writeClaimed
 from .distributions import DistributionEngine
 from .documents import CollectionEngine, Document, Duration, UtcDatetime, WorkStatus, utc_now
 from .exceptions import TaskNotFound, TaskStopped, TaskTimeout, TaskValidationError
@@ -628,6 +628,19 @@ class TaskEngine(CollectionEngine[T]):
         oldest = self.collection.find_one(due, sort=[("leaseUntil", 1)])
 
         return count, (now - oldest["leaseUntil"]).total_seconds()
+
+    def purge(self, olderThan: float | timedelta, statuses: Iterable[str] = FINAL_TASK_STATUSES) -> int:
+        """Delete finished tasks that ended more than `olderThan` ago — seconds, or a timedelta. Returns
+        how many. Only finished tasks: `statuses` may narrow them, never reach a waiting or running one.
+        """
+
+        statuses = set(statuses)
+        unfinished = statuses - FINAL_TASK_STATUSES
+
+        if unfinished:
+            raise ValueError(f"only finished tasks are purged, not {', '.join(sorted(unfinished))}")
+
+        return self.collection.delete_many(endedBefore(statuses, utc_now() - ageOf(olderThan))).deleted_count
 
     def flagIncompatible(self) -> int:
         """Mark waiting tasks whose function this engine does not have as incompatible. Returns how many.

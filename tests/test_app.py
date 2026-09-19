@@ -113,7 +113,7 @@ def test_an_app_with_nothing_declared_still_builds(db):
 
     app = Empty(db)
 
-    assert len(app.functions) == 0
+    assert list(app.functions) == ["cleanupFinished"]      # the one task every app has
     assert app.piles == {} and app.collections == {}
     assert set(app.taskEngines) == {"task"} and set(app.schedulerEngines) == {"scheduler"}
 

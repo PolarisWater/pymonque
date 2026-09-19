@@ -17,7 +17,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from pymongo import ReadPreference, ReturnDocument, WriteConcern
 from pymongo.collection import Collection
@@ -118,6 +118,34 @@ def writeClaimed(
         {**(where or {}), "uid": uid, "claimId": claimId},
         {"$set": {**fields, "claimId": None}}
     ).matched_count > 0
+
+
+def ageOf(olderThan: float | timedelta) -> timedelta:
+    """An age given as seconds or a timedelta, refused if it is neither, or negative."""
+
+    if isinstance(olderThan, bool) or not isinstance(olderThan, (int, float, timedelta)):
+        raise TypeError(f"an age is a number of seconds or a timedelta, not {olderThan!r}")
+
+    age = olderThan if isinstance(olderThan, timedelta) else timedelta(seconds=olderThan)
+
+    if age < timedelta(0):
+        raise ValueError(f"an age cannot be negative: {age}")
+
+    return age
+
+
+def endedBefore(statuses: Iterable[str], cutoff: datetime) -> dict[str, Any]:
+    """Matches work that finished, in one of `statuses`, before `cutoff`. Work finished before its end
+    was recorded — a 2.0 document — counts by its createdAt, or failing that its deadline."""
+
+    return {
+        "status": {"$in": sorted(statuses)},
+        "$or": [
+            {"finishedAt": {"$lt": cutoff}},
+            {"finishedAt": None, "createdAt": {"$lt": cutoff}},
+            {"finishedAt": None, "createdAt": None, "deadline": {"$lt": cutoff}},
+        ],
+    }
 
 
 def notStarted() -> dict[str, Any]:

@@ -313,6 +313,7 @@ app.run(taskWorkers={"task": 4, "heavy": 1})
 | `scheduleFromDistribution(work, distribution, factory=None, **fields)` | The same, due one interval from now. |
 | `__call__(functionName, **kwargs)` | A `CallSpec`, the arguments given checked. |
 | `work()` | Claim the most overdue task and see it through; the task as it ended, or `None`. What a worker loops on. |
+| `purge(olderThan, statuses=<every finished status>)` | Delete finished tasks that ended more than `olderThan` (seconds or a timedelta) ago; how many. Never a waiting or running task. |
 | `wait(task, timeout=None, interval=0.1)` | Block until a task has ended, and return it. From any process. `TimeoutError` if it doesn't in time, `TaskNotFound` if there is no such task. |
 | `cancel(uid)` / `cancelMany(where=None)` | Cancel tasks that have not started. |
 | `limits` / `limitsFor(task)` | Every task's resolved `TaskLimits`, and the ones a stored task runs under. |
@@ -737,7 +738,7 @@ means an item whose holder died is given up rather than handed on — nobody kno
 | `renewLease(item)` | Hold an item for another lease. |
 | `cancel(uid)` / `cancelMany(where=None)` | Cancel items nobody is working. |
 | `count(where=None, status=None)` / `counts()` | `counts()` gives every status. |
-| `purge(status="done")` | Delete every item of one status; how many. |
+| `purge(status="done", olderThan=None)` | Delete finished items of a status, or of several — all of them, or only those that ended more than `olderThan` (seconds or a timedelta) ago; how many. Never a waiting or held item. |
 
 `item` may be an `Item` or a uid. **An `Item` stands for the claim that handed it out**: the outcome is
 written only while that claim holds it, and one that never came from `claim()` raises `ValueError`.
@@ -869,6 +870,31 @@ can only change at a restart — the fingerprint sees to that — so it is the o
 `init()` is **version-checked** like `startWorkers()`: it decides what is runnable from this process's
 tasks, so a process with other tasks — a script importing half the app — must not run it beside a
 live deployment.
+
+## Cleaning up
+
+Finished tasks and items **stay**: they are the history of what ran, with its result, error and times,
+queryable like any document. Nothing deletes them on its own. Every app has one task for keeping that
+history in bounds:
+
+```python
+app.scheduler.ensure(
+    "cleanup",
+    App.cleanupFinished(days=30),
+    app.distribution("constant", dailyFrequency=1),
+)
+```
+
+`cleanupFinished(days=30)` deletes what finished more than `days` ago — tasks on every task engine,
+items on every pile — and the records of worker processes gone that long, and returns how many of
+each. It is a task like any other, so it runs on a scheduler, once a day being plenty, or at once as
+`app.cleanupFinished(days=30)`. It carries its own limits (no timeout, no skipAfter), so a short
+`taskTimeout` on the app does not cut a big cleanup short. Being part of `BaseApp`, its name is
+reserved.
+
+For finer choices, per engine and per status: `purge(olderThan, statuses=…)` on a task engine and
+`purge(status, olderThan=…)` on a pile. A task or item that ended before 3.0 recorded `finishedAt`
+counts by when it was created.
 
 ## Not enough workers
 

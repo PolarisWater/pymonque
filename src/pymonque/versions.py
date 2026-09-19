@@ -126,6 +126,12 @@ class Registry:
 
         self.collection.update_one({"uid": self.uid}, {"$set": {"lastSeen": utc_now(), **report}})
 
+    def forgetGone(self, olderThan: timedelta) -> int:
+        """Delete the records of worker processes that stopped checking in more than `olderThan` ago —
+        killed ones; a process that stops cleanly removes its own. Returns how many."""
+
+        return self.collection.delete_many({"lastSeen": {"$lt": utc_now() - olderThan}}).deleted_count
+
     def deregister(self):
         """Free this process's slot at once, rather than waiting for it to go stale."""
 

@@ -25,12 +25,15 @@ import os
 import signal
 import threading
 import time
-from typing import Any, Callable, ClassVar, Mapping, Sequence
+from datetime import timedelta
+from typing import Annotated, Any, Callable, ClassVar, Mapping, Sequence
 
+from pydantic import Field
 from pymongo.database import Database
 
 from .calls import nearestAttributes
 from .declarations import Declaration, collection, declaredOn, pile, schedulers, task, tasks
+from .declarations import task as _task     # `task` is the default task engine inside BaseApp's body
 from .distributions import BaseDistributions, DistributionEngine
 from .documents import CollectionEngine, syncClock, uuid4str
 from .piles import PileEngine
@@ -353,6 +356,27 @@ class BaseApp:
                     "%r: %d waiting task(s) flagged incompatible and %d left running written off, "
                     "their function gone from this app", engine, flagged, stuck
                 )
+
+    # --- keeping the history in bounds ---
+
+    @_task(timeout=None, skipAfter=None)     # its own limits: an app's short taskTimeout must not cut a big cleanup short
+    def cleanupFinished(self, days: Annotated[float, Field(ge=0)] = 30) -> dict[str, int]:
+        """Delete what finished more than `days` ago: tasks on every task engine, items on every pile,
+        and the records of worker processes gone that long. Returns how many of each.
+
+        Finished work stays until then, as the history of what ran. A task like any other, so it runs
+        on a scheduler — once a day is plenty:
+
+            app.scheduler.ensure("cleanup", App.cleanupFinished(days=30), app.distribution("constant", dailyFrequency=1))
+        """
+
+        age = timedelta(days=days)
+
+        return {
+            "tasks":    sum(engine.purge(age) for engine in self.taskEngines.values()),
+            "items":    sum(engine.purge(("done", "failed", "canceled"), olderThan=age) for engine in self.piles.values()),
+            "workers":  self.registry.forgetGone(max(age, timedelta(seconds=self.registry.staleAfter))),
+        }
 
     # --- workers ---
 
