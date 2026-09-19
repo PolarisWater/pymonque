@@ -453,6 +453,34 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
   stored in that engine, whichever function it names.
 - **Decided:** extra fields are data only and do not steer claiming; a priority order can come later.
 
+## Possible additions
+
+### Kept fields on your own models
+
+`_kept` is the engines' own mechanism, but `CollectionEngine` enforces it for any `Document` subclass,
+so it already works on a plain collection's model. Not documented for use, and not promised.
+
+- **What it fits today — fields maintained outside `save()`:** a counter moved with `$inc`, a
+  denormalized total, a timestamp one service writes. With the field in `_kept`, a `save()` of a copy
+  read earlier leaves it as stored instead of writing back the value it read — the lost update kept
+  fields fixed for tasks and items.
+
+      class Account(Document):
+          _kept = frozenset({"balance"})
+          balance: int = 0
+
+      app.accounts.collection.update_one({"uid": uid}, {"$inc": {"balance": 50}})
+      acct.save()     # balance stays as stored
+
+- **What it does not fit — write-once fields,** such as a `tenantId` set at creation and never moved:
+  `_kept` refuses `create()` and `build()` too, so such a field could not be set at all.
+- **What making it official would take:**
+  - a public name (`kept`), documented;
+  - a validated way to write a kept field — e.g. `engine.write(key, **fields)`, checked against the
+    model but past the kept rule — instead of raw `engine.collection` with no validation;
+  - optionally `writeOnce`: allowed at creation, then kept.
+- Not needed for anything yet; add it when a user of the library asks for one of these.
+
 ## On hold
 
 - **Verbs that differ between tasks and items (B4, Matrix 3):** waiting on an item, finishing a
