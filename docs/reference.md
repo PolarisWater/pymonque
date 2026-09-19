@@ -961,6 +961,36 @@ The count spans processes: a process running no workers of its own sees the work
 A bad declaration raises pydantic's `ValidationError`, or `TypeError` for a setting that does not
 exist.
 
+## Changes in 3.1
+
+**Changed — may need a code change:**
+
+- **Fields the engine keeps are refused by `update()`, `build()` and `create()`,** and left as stored by
+  `save()` — a task's or item's `status`, claim, lease, times and outcome, and a scheduler's `uid`,
+  `status`, claim and lease ([Fields the engine keeps](#fields-the-engine-keeps)). `update(uid,
+  status=…)` now raises `TypeError`; use `cancel()`, or `done()` / `fail()` / `release()` on items.
+- **`cleanupFinished` is a task every app has,** so an app can no longer declare its own of that name.
+- **`update(key, /, **fields)` takes its key by position only:** `engine.update("x", name=…)`, not
+  `engine.update(key="x", …)`.
+- **Work collections are written by majority and read from the primary,** whatever the app's database
+  was given. On a single server nothing changes.
+- **Time is the database server's:** `utc_now()` follows the server's clock, measured when an app is
+  built and on every heartbeat.
+
+**Added:**
+
+- `schedule(…, key=…)` — one task per key at a time ([Scheduling under a key](#scheduling-under-a-key)).
+- `cleanupFinished(days=30)`, and `purge(olderThan, …)` on task engines and piles
+  ([Cleaning up](#cleaning-up)).
+- `release(delay=…)` / `w.release(delay=…)`, and `w.confirm()` in a `work()` block
+  ([The work() block](#the-work-block)).
+- `syncClock(db)`; a warning for leases under 10 s; `scripts/test-mongo.sh` for the suite against a real
+  MongoDB.
+
+**Fixed:** a stale copy of a task or item saved with `save()` could put finished work back — a task
+ran again, an item was claimed again; `run()` with no workers returned at once; a timeout's stop could,
+in a narrow race, reach another thread.
+
 ## Upgrading from 2.0
 
 3.0 keeps no compatibility code, so an upgrade is two steps: change the code, then upgrade the data
