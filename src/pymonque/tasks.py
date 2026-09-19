@@ -18,7 +18,7 @@ from pymongo import IndexModel
 from pymongo.collection import Collection
 
 from .calls import CallSpec, Functions
-from .claims import Leases, WorkerLoop, abandonHolds, cancelled, claimNext, notStarted, writeClaimed
+from .claims import Leases, WorkerLoop, abandonHolds, cancelled, claimNext, durable, notStarted, writeClaimed
 from .distributions import DistributionEngine
 from .documents import CollectionEngine, Document, Duration, UtcDatetime, WorkStatus, utc_now
 from .exceptions import TaskNotFound, TaskStopped, TaskTimeout, TaskValidationError
@@ -234,7 +234,7 @@ class TaskEngine(CollectionEngine[T]):
         self.distributions = distributions or DistributionEngine()
         self.factory: TaskFactory = factory or TaskFactory(name="default")
 
-        super().__init__(collection, model, name=name, extraIndexes=extraIndexes)
+        super().__init__(durable(collection), model, name=name, extraIndexes=extraIndexes)
 
         self.leases = Leases(self.collection, settings.leaseSeconds, name=f"task-{name}")
         self.workers = WorkerLoop(self.work, name=f"task-{name}", pollInterval=pollInterval)

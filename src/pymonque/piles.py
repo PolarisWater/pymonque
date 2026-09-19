@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 from pymongo import IndexModel
 from pymongo.collection import Collection
 
-from .claims import Leases, cancelled, claimNext, notStarted
+from .claims import Leases, cancelled, claimNext, durable, notStarted
 from .documents import CollectionEngine, Document, UtcDatetime, WorkStatus, utc_now
 from .settings import PileSettings
 
@@ -201,7 +201,7 @@ class PileEngine(CollectionEngine[Item]):
 
         # a concrete Item whose data is validated against the payload model
         super().__init__(
-            collection,
+            durable(collection),
             Item[model] if model is not None else Item[dict[str, Any]],
             name=name,
             extraIndexes=extraIndexes,

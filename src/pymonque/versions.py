@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable, Mapping
 from pydantic import BaseModel
 from pymongo.collection import Collection
 
+from .claims import durable
 from .documents import utc_now
 from .exceptions import VersionMismatch
 
@@ -71,7 +72,7 @@ class Registry:
     """
 
     def __init__(self, collection: Collection, *, uid: str, fingerprint: str, staleAfter: float = WORKER_STALE_AFTER):
-        self.collection = collection
+        self.collection = durable(collection)     # a version check must not read a stale registry
         self.uid = uid
         self.fingerprint = fingerprint
         self.staleAfter = staleAfter

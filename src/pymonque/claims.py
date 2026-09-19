@@ -19,13 +19,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator, Mapping
 
-from pymongo import ReturnDocument
+from pymongo import ReadPreference, ReturnDocument, WriteConcern
 from pymongo.collection import Collection
 
 from .documents import utc_now, uuid4str
 
 
 logger = logging.getLogger("pymonque")
+
+
+def durable(collection: Collection) -> Collection:
+    """A work collection as claims need it, whatever the app's database was given: writes acknowledged
+    by a majority of the replica set, reads from the primary.
+
+    A claim acknowledged by a primary alone is lost if that primary fails over before replicating it,
+    and two workers then hold the same work; a secondary can show a lease or a status that has since
+    moved. On a single server, majority is that server, and nothing changes.
+    """
+
+    return collection.with_options(write_concern=WriteConcern("majority"), read_preference=ReadPreference.PRIMARY)
 
 
 @dataclass(frozen=True)
