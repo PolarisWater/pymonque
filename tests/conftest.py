@@ -38,6 +38,36 @@ def atomicFindAndModify(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def partialUniqueIndexes(monkeypatch):
+    """Make mongomock build a partial unique index as MongoDB does.
+
+    mongomock checks the documents already there against a new unique index without its
+    partialFilterExpression — though it applies it to every later write — so a collection holding
+    finished tasks, whose activeKey is cleared, could not get the index a task engine creates.
+    """
+
+    original = Collection.create_index
+
+    def create_index(self, keys, **kwargs):
+        partial = kwargs.get("partialFilterExpression")
+
+        if not (kwargs.get("unique") and partial is not None):
+            return original(self, keys, **kwargs)
+
+        store = self._store
+        everything = store._documents
+        covered = {each["_id"] for each in self.find(partial, {"_id": 1})}
+        store._documents = type(everything)((key, doc) for key, doc in everything.items() if key in covered)
+
+        try:
+            return original(self, keys, **kwargs)
+        finally:
+            store._documents = everything
+
+    monkeypatch.setattr(Collection, "create_index", create_index)
+
+
+@pytest.fixture(autouse=True)
 def hostClock(monkeypatch):
     """Every test starts on this host's own clock: the server-clock offset is per process, and a test
     that moves it must not move it for the next."""

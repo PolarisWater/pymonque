@@ -16,6 +16,7 @@ import bson
 from pydantic import Field, model_validator
 from pymongo import IndexModel
 from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError
 
 from .calls import CallSpec, Functions
 from .claims import Leases, WorkerLoop, abandonHolds, ageOf, cancelled, claimNext, durable, endedBefore, notStarted, writeClaimed
@@ -52,6 +53,7 @@ class Task(Document):
     # the task's identity, state, claim and outcome are the engine's to write
     _kept: ClassVar[frozenset[str]] = frozenset({
         "uid", "status", "claimId", "leaseUntil", "claimedAt", "finishedAt", "executionTime", "result", "error",
+        "key", "activeKey",
     })
 
     status:         TaskStatus          = "pending"
@@ -72,6 +74,11 @@ class Task(Document):
     executionTime:  Duration | None     = None
     result:         Any                 = None
     error:          str | None          = None
+
+    # schedule(key=…): the key it was scheduled under, kept for the record; and the same key while it is
+    # unfinished, cleared when it ends — unique among tasks that hold one, so a key queues one task at a time
+    key:            str | None          = None
+    activeKey:      str | None          = None
 
     @model_validator(mode="after")
     def defaultLease(self) -> Self:
@@ -102,7 +109,7 @@ class Task(Document):
 T = TypeVar("T", bound=Task)
 
 # what running a task writes back: its outcome, and nothing a user may have changed meanwhile
-OUTCOME_FIELDS = frozenset({"status", "claimedAt", "finishedAt", "executionTime", "result", "error"})
+OUTCOME_FIELDS = frozenset({"status", "claimedAt", "finishedAt", "executionTime", "result", "error", "activeKey"})
 
 # what schedule() refuses by name, rather than as a field the model lacks
 LIMITS = frozenset({"timeout", "skipAfter"})
@@ -251,6 +258,11 @@ class TaskEngine(CollectionEngine[T]):
         super().createIndexes()
         self.collection.create_index([("status", 1), ("leaseUntil", 1)])    # the claim
 
+        # one unfinished task per key; a finished one clears its activeKey and frees the key
+        self.collection.create_index(
+            [("activeKey", 1)], unique=True, partialFilterExpression={"activeKey": {"$type": "string"}},
+        )
+
     def __call__(self, functionName: str, /, **kwargs: Any) -> CallSpec:
         """A call of the task of this name, the arguments given checked: no unknown names, and each of
         the type the function declares.
@@ -343,27 +355,64 @@ class TaskEngine(CollectionEngine[T]):
             work:       CallSpec,
             deadline:   datetime | None = None,
             factory:    TaskFactory | None = None,
+            *,
+            key:        str | None = None,
             **fields:   Any
         ) -> T:
 
         """Queue one call, due at `deadline` or now. Nothing is stored unless it is valid.
 
         It runs under the limits its task declares; `fields` are the ones this engine's model adds.
+
+        With a `key`, one task per key is queued at a time: while a task of this key is waiting or
+        running, scheduling it again returns that task instead of queueing another — "sync account 42",
+        asked for ten times, runs once. A waiting one is moved up to the earlier deadline if this call
+        asks for one; its call and fields stay as they were. Once it has finished, the key is free, and
+        the next schedule() queues a new task.
         """
 
-        return self.insert(self._newTask(work, deadline, factory, **fields))
+        task = self._newTask(work, deadline, factory, **fields)
+
+        if key is None:
+            return self.insert(task)
+
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"a task key is a non-empty string, not {key!r}")
+
+        task.key = task.activeKey = key
+
+        while True:
+            try:
+                return self.insert(task)
+            except DuplicateKeyError:
+                pass
+
+            existing = self.collection.find_one({"activeKey": key})
+
+            if existing is None:
+                continue    # it finished between the two: the key is free, so this one is queued
+
+            # sooner, if this call asks for sooner; only a waiting task can move
+            self.collection.update_one(
+                {"uid": existing["uid"], "status": "pending", "deadline": {"$gt": task.deadline}},
+                {"$set": {"deadline": task.deadline, "leaseUntil": task.deadline}},
+            )
+
+            return self.get(existing["uid"])
 
     def scheduleFromDistribution(
             self,
             work:           CallSpec,
             distribution:   CallSpec,
             factory:        TaskFactory | None = None,
+            *,
+            key:            str | None = None,
             **fields:       Any
         ) -> T:
 
-        """Queue one call, due an interval drawn from `distribution` from now."""
+        """Queue one call, due an interval drawn from `distribution` from now; `key` as for schedule()."""
 
-        return self.schedule(work, utc_now() + self.distributions.gen(distribution), factory, **fields)
+        return self.schedule(work, utc_now() + self.distributions.gen(distribution), factory, key=key, **fields)
 
     # --- running ---
 
@@ -513,7 +562,10 @@ class TaskEngine(CollectionEngine[T]):
             return sorted(self._abandoned.values(), key=lambda each: each.since)
 
     def _record(self, task: T, fields: frozenset[str] = OUTCOME_FIELDS) -> bool:
-        """Write a task's outcome, if the claim that ran it still holds it."""
+        """Write a task's outcome, if the claim that ran it still holds it. Every outcome is final, so it
+        frees the task's key."""
+
+        task.activeKey = None
 
         recorded = writeClaimed(
             self.collection, task.uid, task.claimId,
@@ -571,14 +623,22 @@ class TaskEngine(CollectionEngine[T]):
         """Cancel a task that has not started. False if there is no such task, or it is running or
         finished — running work cannot be interrupted, only waited out."""
 
-        return self.collection.update_one({"uid": uid, **notStarted()}, cancelled()).matched_count > 0
+        return self.collection.update_one({"uid": uid, **notStarted()}, self._cancelled()).matched_count > 0
 
     def cancelMany(self, where: Mapping[str, Any] | None = None) -> int:
         """Cancel every task matching `where` that has not started. Returns how many were."""
 
         query = {"$and": [dict(where), notStarted()]} if where else notStarted()
 
-        return self.collection.update_many(query, cancelled()).matched_count
+        return self.collection.update_many(query, self._cancelled()).matched_count
+
+    @staticmethod
+    def _cancelled() -> dict[str, Any]:
+        # a cancelled task frees its key, like any task that ends
+        write = cancelled()
+        write["$set"]["activeKey"] = None
+
+        return write
 
     def wait(self, task: Task | str, timeout: float | None = None, interval: float = 0.1) -> T:
         """Block until a task has ended, and return it as it ended.
@@ -655,6 +715,7 @@ class TaskEngine(CollectionEngine[T]):
                 "status": "incompatible",
                 "error": "this app has no task of this name",
                 "finishedAt": utc_now(),
+                "activeKey": None,
             }},
         ).matched_count
 
@@ -671,5 +732,5 @@ class TaskEngine(CollectionEngine[T]):
 
         return self.collection.update_many(
             {"status": "running", "leaseUntil": {"$lte": now}, "work.functionName": {"$nin": list(self.functions)}},
-            {"$set": {"status": "failed", "error": WORKER_DIED, "finishedAt": now, "claimId": None}},
+            {"$set": {"status": "failed", "error": WORKER_DIED, "finishedAt": now, "claimId": None, "activeKey": None}},
         ).matched_count

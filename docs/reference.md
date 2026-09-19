@@ -241,7 +241,7 @@ identity, state, claim and outcome. Each model names them in `_kept`, and a subc
 
 | Model | Kept by the engine |
 |---|---|
-| `Task` | `uid` `status` `claimId` `leaseUntil` `claimedAt` `finishedAt` `executionTime` `result` `error` |
+| `Task` | `uid` `status` `claimId` `leaseUntil` `claimedAt` `finishedAt` `executionTime` `result` `error` `key` `activeKey` |
 | `Item` | `uid` `status` `claimId` `leaseUntil` `claimedAt` `finishedAt` `attempts` `result` `error` |
 | `Scheduler` | `uid` `status` `claimId` `leaseUntil` |
 | `Document` | none: a plain collection's fields are all yours, its key included |
@@ -309,8 +309,8 @@ app.run(taskWorkers={"task": 4, "heavy": 1})
 
 | Method | What |
 |---|---|
-| `schedule(work, deadline=None, factory=None, **fields)` | Store a task, due at `deadline` or now, checked first. `fields` are the ones the engine's model adds. |
-| `scheduleFromDistribution(work, distribution, factory=None, **fields)` | The same, due one interval from now. |
+| `schedule(work, deadline=None, factory=None, *, key=None, **fields)` | Store a task, due at `deadline` or now, checked first. `fields` are the ones the engine's model adds. With a `key`, one task per key at a time — see [Scheduling under a key](#scheduling-under-a-key). |
+| `scheduleFromDistribution(work, distribution, factory=None, *, key=None, **fields)` | The same, due one interval from now. |
 | `__call__(functionName, **kwargs)` | A `CallSpec`, the arguments given checked. |
 | `work()` | Claim the most overdue task and see it through; the task as it ended, or `None`. What a worker loops on. |
 | `purge(olderThan, statuses=<every finished status>)` | Delete finished tasks that ended more than `olderThan` (seconds or a timedelta) ago; how many. Never a waiting or running task. |
@@ -368,6 +368,7 @@ app.task.find({"factory.name": "web-api"})
 | `executionTime` | `timedelta`, stored as seconds |
 | `result` | anything BSON can encode |
 | `error` | the traceback, or why it ended as it did |
+| `key` / `activeKey` | the key it was scheduled under, kept for the record; and the same while it is unfinished, cleared when it ends |
 
 ```
 pending ─→ running ─→ done
@@ -391,6 +392,29 @@ worker.
 **Cancelling.** `cancel(uid)` cancels a task that has not started — waiting, or held by a worker whose
 lease lapsed — and returns whether it did. A running task cannot be interrupted, only waited out.
 `cancelMany(where)` cancels every such task matching `where`, and returns how many.
+
+### Scheduling under a key
+
+```python
+app.task.schedule(App.sync(accountId=42), key="sync-42")
+```
+
+**One task per key at a time.** While a task scheduled under a key is waiting or running, scheduling
+under that key again returns that task instead of queueing another — "sync account 42", asked for ten
+times while one waits, runs once:
+
+- **Sooner wins.** A waiting task is moved up to the earlier deadline when a later call asks for one,
+  its lease with it; a later deadline leaves it where it is. A running task is returned as it is.
+- **The first call wins.** The task keeps the call and fields it was scheduled with; a later call's
+  are not merged in.
+- **Once it has ended** — done, failed, timed out, outdated, cancelled, incompatible, written off — the
+  key is free, and the next `schedule()` queues a new task. The finished one keeps `key` for the record.
+- **Keys are per task engine,** and a non-empty string. Without a key, nothing changes.
+- Processes scheduling under one key at the same moment queue one task: a unique index on
+  `activeKey` settles it.
+
+A key is not an idempotency guarantee for work already done: a request retried after its task
+finished queues it again. Check for that in your own records, where the history of what ran is kept.
 
 ## Limits
 

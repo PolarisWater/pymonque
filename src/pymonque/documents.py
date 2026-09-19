@@ -379,7 +379,7 @@ class CollectionEngine(Generic[M]):
 
         return document
 
-    def update(self, key: Any, **fields: Any) -> M | None:
+    def update(self, key: Any, /, **fields: Any) -> M | None:
         """Merge fields into a stored document and return it, or None if there is no such document.
 
         The fields are validated against the model first, so nothing invalid is written, and only

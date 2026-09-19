@@ -477,6 +477,22 @@ panicked, the container died, and every later test hung — so every test emptie
 the container gets a raised `nofile` limit. Everything else passed as on mongomock, the claim races
 included, where no test lock applies.
 
+### Scheduling under a key
+
+- **One meaning only: a key is taken while its task is unfinished.** "Once, ever" was dropped: its
+  guarantee would only last until cleanup deleted the task, so it would promise more than it keeps.
+- **Sooner wins:** scheduling again under a key moves a waiting task up to the earlier deadline (and its
+  lease); a running task is returned as it is; the first call's work and fields stand.
+- **Stored as two kept fields:** `key`, for the record, and `activeKey`, cleared by every write that
+  ends a task (`_record`, cancels, `flagIncompatible`, `writeOffStuck`), with a unique index filtered
+  on `activeKey` being a string — supported by every MongoDB version pymonque runs on, unlike a filter
+  on status. A duplicate insert finds the task holding the key; one that finished in between leaves
+  the key free, and the insert is tried again.
+- `CollectionEngine.update(key, /, **fields)` took its key positionally only, so a field named `key`
+  can be updated — or, on a task, refused as kept — rather than colliding with the argument.
+- mongomock checks a new partial unique index against the documents already there without its filter;
+  `tests/conftest.py` builds it over the documents the filter covers, as MongoDB does.
+
 ## Possible additions
 
 ### Kept fields on your own models
