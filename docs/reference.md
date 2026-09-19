@@ -643,6 +643,32 @@ carries on and nothing outside sees an exception. `except Exception:` in the blo
 > stored stands and nothing more is written, and a warning says the block kept running; but the code
 > that ran after it has run, and after a release or a fail another worker may already hold the item.
 
+**Draining several items in one task.** Put the block in a loop, one claim per pass; `range` caps how
+many one run takes:
+
+```python
+@task
+def sendBatch(self):
+    for _ in range(100):
+        with self.outbox.work() as w:
+            if w is None:
+                break                   # pile empty: stop early
+            if not ready(w.data):
+                w.release(delay=60)     # this pass ends; the loop goes on to the next item
+            send(w.data)
+```
+
+Each pass ends in its own outcome, and `w.done()`, `w.fail()` and `w.release()` end only that pass.
+An exception fails that item and, re-raised, ends the loop. Three things to know:
+
+- **`continue`, `break` or `return` with an item in hand marks it `done`** — leaving a `with` block
+  that way is reaching its end. To skip an item, say what became of it: `w.release(...)`,
+  `w.fail(...)` or `w.done(...)`. The guard's `break` is safe only because there is no item then.
+- **`w.release()` without a delay spins in a loop:** the item goes back to the front, and the next pass
+  takes it again. In a loop, release with a delay.
+- **`while True:` stops only when the pile is empty,** items added meanwhile included; cap it with
+  `range` if one task should not run for long.
+
 ### Tries
 
 Items have tries because the task holding one can die before it reports back. **A claim uses a
