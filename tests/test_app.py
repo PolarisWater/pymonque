@@ -470,5 +470,5 @@ def test_every_engine_of_an_app_shares_one_repr_pattern(shop):
 
 
 def test_an_app_names_its_class_database_and_version(shop):
-    assert repr(shop) == f"Shop (pymonque_test, {shop.fingerprint})"
+    assert repr(shop) == f"Shop ({shop.db.name}, {shop.fingerprint})"
     assert repr(shop.task.workers) == "WorkerLoop task-task (0 workers, idle)"

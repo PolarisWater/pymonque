@@ -468,6 +468,15 @@ shape the engine's model, collection and indexes: yes, the way `schedulers()` do
   age is then a decision made in code at run time, one place for every kind, and visible in the
   task history.
 
+### Tests against a real MongoDB
+
+`scripts/test-mongo.sh` runs the whole suite against a single-node replica set in Docker (majority
+writes and the server clock as in production); `PYMONQUE_MONGO_URL` switches the `db` fixture. Local
+only, not CI. Found running it: one database per test exhausted the server's open files — WiredTiger
+panicked, the container died, and every later test hung — so every test empties one database, and
+the container gets a raised `nofile` limit. Everything else passed as on mongomock, the claim races
+included, where no test lock applies.
+
 ## Possible additions
 
 ### Kept fields on your own models
@@ -503,6 +512,15 @@ so it already works on a plain collection's model. Not documented for use, and n
 - **A hold duration for pile items,** like a task's `executionTime`. To be designed as something
   modular after several task engines, rather than forced onto items now.
 - ~~Not yet discussed: B6, P1–P4, N1–N7~~ — all decided, in rebuild §5.
+- **A better schedule system than distributions.** Distributions are intervals, which drift and
+  cannot say "every day at 03:00" or "Mondays at 9". A calendar-based next-time rule, with a time
+  zone, computed from the last deadline rather than now, fits schedulers, `missed` and the fixed beat
+  uid. Held: the distribution registry was the simple solution, and a better one wants designing
+  rather than bolting on.
+- **Hooks for monitoring** — a callback when a task or item ends, for metrics, alerts or tracing.
+  Held: logging is the interface for now.
+- **Async.** Every call blocks; an async web app should call `schedule()` and friends through a thread
+  pool. Not planned.
 
 ## Deliberate, not asymmetries
 

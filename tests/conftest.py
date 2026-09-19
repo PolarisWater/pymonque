@@ -4,6 +4,7 @@ Every test gets a fresh in-memory MongoDB, so nothing leaks between tests. The e
 each engine the way an app will, from what the app resolves for it.
 """
 
+import os
 import threading
 
 import pytest
@@ -46,9 +47,37 @@ def hostClock(monkeypatch):
     monkeypatch.setattr(documents, "_serverOffset", documents.timedelta(0))
 
 
+# PYMONQUE_MONGO_URL=mongodb://… runs every test against a real MongoDB instead of mongomock — see
+# scripts/test-mongo.sh, which starts one in Docker. Each test starts on an empty database.
+REAL_MONGO = os.environ.get("PYMONQUE_MONGO_URL")
+
+
+@pytest.fixture(scope="session")
+def realClient():
+    if not REAL_MONGO:
+        yield None
+        return
+
+    import pymongo
+
+    client = pymongo.MongoClient(REAL_MONGO, serverSelectionTimeoutMS=5000)
+    client.admin.command("ping")
+
+    yield client
+
+    client.close()
+
+
 @pytest.fixture
-def db():
-    return MongoClient()["pymonque_test"]
+def db(realClient):
+    if realClient is None:
+        return MongoClient()["pymonque_test"]
+
+    # one database, emptied before each test: a new one per test would open files faster than the
+    # server closes those of the dropped ones
+    realClient.drop_database("pymonque_test")
+
+    return realClient["pymonque_test"]
 
 
 @pytest.fixture

@@ -3,6 +3,7 @@ another, so every process keeps time by the database server's clock, not its own
 enough to be lost without anyone dying is logged."""
 
 import logging
+import os
 from datetime import datetime, timedelta
 
 import pytest
@@ -57,11 +58,15 @@ def test_an_aware_server_time_is_read_as_utc():
     assert abs(syncClock(Aware(timedelta(seconds=30))) - timedelta(seconds=30)) < timedelta(seconds=1)
 
 
-def test_a_server_that_will_not_say_leaves_the_clock_as_it_was(db):
+def test_a_server_that_will_not_say_leaves_the_clock_as_it_was():
     syncClock(ServerAhead(timedelta(minutes=5)))
     before = documents._serverOffset
 
-    assert syncClock(db) is None            # mongomock has no hello
+    class Unanswering(ServerAhead):
+        def command(self, name, *args, **kwargs):
+            raise NotImplementedError(name)     # as mongomock does
+
+    assert syncClock(Unanswering(timedelta(0))) is None
     assert documents._serverOffset == before
 
     class Silent(ServerAhead):
@@ -166,3 +171,11 @@ def test_the_default_lease_is_not_logged(db, caplog):
         App(db, enforceVersion=False)
 
     assert not [r for r in caplog.records if "lease of" in r.getMessage()]
+
+
+@pytest.mark.skipif(not os.environ.get("PYMONQUE_MONGO_URL"), reason="needs a real MongoDB: scripts/test-mongo.sh")
+def test_a_real_server_reports_its_clock(db):
+    offset = syncClock(db)
+
+    # the server runs on this machine, so the two clocks agree to well within a second
+    assert offset is not None and abs(offset) < timedelta(seconds=1)

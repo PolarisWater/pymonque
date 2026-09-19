@@ -146,5 +146,11 @@ Coming from 2.0? 3.0 changes the declarations, the statuses and the stored docum
 ## Tests
 
 ```bash
-uv run pytest
+uv run pytest                   # against mongomock, in memory
+scripts/test-mongo.sh           # the same suite against a real MongoDB replica set, in Docker
 ```
+
+mongomock is fast but not MongoDB: its claims are not atomic across threads (the tests lock them),
+and it has no server clock. `scripts/test-mongo.sh` starts a single-node replica set in Docker, runs
+the suite against it with `PYMONQUE_MONGO_URL`, and removes the container; it takes pytest's
+arguments. It is for your own machine, not CI.
