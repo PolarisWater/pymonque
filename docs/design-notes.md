@@ -493,6 +493,97 @@ included, where no test lock applies.
 - mongomock checks a new partial unique index against the documents already there without its filter;
   `tests/conftest.py` builds it over the documents the filter covers, as MongoDB does.
 
+### Pinning a task to a task engine
+
+Tasks belong to no engine, so any engine claims any of the app's tasks and only the discipline of
+whoever schedules keeps a task out of a pool whose processes are not equipped to run it. Decided,
+from what came up in an app using the library: a task may name the engine it runs on.
+
+    heavy = tasks(leaseSeconds=900)
+
+    @task(timeout=600, runsOn=heavy)    # or runsOn="heavy", for a task declared away from the engine
+    def render(self, jobId: int): ...
+
+- **Declared on the task, not as an allow-list on the engine.** A list on the engine binds only that
+  engine, so the task could still be scheduled into another; named on the task, one line keeps it out
+  of every engine but its own. `runsOn` takes the declaration itself, as `emitsInto` does, or its name,
+  for a task declared in a mixin where the engine is not in scope; it is resolved and checked in
+  `__init_subclass__`, beside `_refuseLostTargets()`.
+- **Each engine resolves `runs`:** every task, minus those pinned elsewhere, plus those pinned to it.
+  Left out — the default — a task runs anywhere, as it does now.
+- **Refused where it is written:** `_newTask()` raises, so `schedule()`, `scheduleFromDistribution()`
+  and a scheduler's emission all refuse with one check; `ensure()` checks the work against its target
+  engine's `runs` when the schedule is stored, rather than leaving a scheduler to fail every beat.
+- **`runs` replaces `functions` in the claim filter and `backlog()`,** so a task left in the wrong
+  collection by an older version is never picked up by a process that cannot run it.
+- **Misplaced tasks are counted and logged by `init()`, not flagged.** They are valid tasks in the
+  wrong collection; a status change would destroy work on a deploy. Unlike `flagIncompatible()`, whose
+  tasks no app has a function for.
+- **In the fingerprint,** per engine: two processes disagreeing about where a task lives is a split
+  brain over one collection, not a local choice.
+- **Not covered: processes of different capability working one engine.** The answer stays
+  `run(taskWorkers={"heavy": 0})` on the unequipped process, and the backlog check already says when
+  an engine has due work and nobody works it. The general form — `@task(requires="gpu")`,
+  `BaseApp(db, provides=[…])` published on the heartbeat — makes the claim filter differ per process,
+  which is what the fingerprint exists to forbid; held until pinning proves insufficient.
+
+### Pools: things borrowed and returned
+
+A pile holds work that is used up. A pool holds a fixed set of things a worker borrows and gives
+back — proxies, accounts, API keys, devices. Decided in shape, not built.
+
+    proxies = pool(Proxy, key="host", leaseSeconds=120)
+
+    with app.proxies.hold() as r:           # None if nothing is free
+        if r is None:
+            return
+        fetch(url, via=r.data)
+        r.release(cooldown=30)              # back in the pool, not claimable for 30s; block ends here
+        r.disable("401 from the provider")  # out of the pool until re-enabled; block ends here
+
+- **Same claim, different ending.** One `leaseUntil` (free-at while free, lease end while held), one
+  atomic `claimNext`, a `claimId` on every hold, `Leases` renewing, `r.confirm()`, and the block's
+  early end as `work()` has it. But nothing is consumed: reaching the end of the block returns the
+  resource, raising returns it and records `lastError`, and a lapsed lease returns it by itself. So a
+  pool has no tries and no `maxAttempts` — only `lapses`, counted for the record; a resource leaves
+  rotation only because something disabled it.
+- **Claim order is longest idle first,** which falls out of sorting by `leaseUntil` once a return sets
+  it to now, and makes `cooldown=` the same mechanism as a pile's `release(delay=…)`.
+- **`Resource`:** `data`, `status` (`free`, `held`, `disabled`), `leaseUntil`, `claimId`, `heldAt`,
+  `releasedAt`, `holds`, `lapses`, `lastError`, `disabledReason`, `disabledAt`, `recheckable`.
+  Everything but `data` is `_kept`.
+- **Rest of the surface:** `add`/`addMany`, `sync(…)` upserting by the declared key from configuration,
+  `enable`/`disable`, `free(uid)` for a lapsed hold, `counts()`, `available()`, `hold(where=…)` for a
+  subset, `hold(wait=…)` to wait rather than take None — an empty pool is ordinary, unlike an empty pile.
+- **A resource dropped from `sync()` is disabled, never deleted:** the pool is a record of what was
+  used, and configuration comes back.
+- **Bad resources are re-checked by a task of yours, on a scheduler** — no new machinery:
+
+      @task(timeout=300)
+      def recheckProxies(self) -> dict[str, int]:
+          return self.proxies.recheck(lambda proxy: ping(proxy.host), disabledFor=3600)
+
+      app.scheduler.ensure("recheck proxies", App.recheckProxies(),
+                           app.distribution("constant", dailyFrequency=24))
+
+  `recheck(test=None, *, disabledFor=…, removeAfter=None)` walks disabled resources older than
+  `disabledFor`, holds each one under the same claim and lease as `hold()` — so two workers never test
+  the same resource — and enables it when `test` returns true, leaving it disabled and recording
+  `lastError` when it returns false or raises. It records `checkedAt` and `checks`, returns counts, and
+  deletes nothing unless `removeAfter` is given.
+- **`test` defaults to a `check()` on the payload model,** the overridable hook `Task.runWork()` and
+  `Scheduler.taskFields()` already are. With it defined, `BaseApp.recheckPools()` — a built-in task
+  like `cleanupFinished`, fanning out over every pool whose model has one — is schedulable with no
+  code at all.
+- **Only what disabled itself is re-checked.** `recheckable` is true when a holder disabled a resource
+  (a transient failure is what a re-check is for) and false when `sync()` dropped it or an operator
+  disabled it by hand: a pool that re-enables what a person turned off, or what configuration removed,
+  is a bug waiting to be found in production.
+- **Cost, and the order to build in:** about 70% of `piles.py` is shared. Extract `_Ended` and the
+  hold–renew–confirm–lost-claim machinery into a base first; writing the second copy and merging later
+  is how the two drift. Pools go into `_surface()`; they stay out of `cleanupFinished()`, having no
+  history to purge.
+
 ## Possible additions
 
 ### Kept fields on your own models
